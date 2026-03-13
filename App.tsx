@@ -9221,8 +9221,15 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
 
     const desiredVoice = _normalizePodcastVoice(ApiKeys.getPodcastVoice());
     if(liveSessionRef.current && desiredVoice!==liveVoiceNameRef.current) {
+      // Voice changed in Profile — bypass reconnectLiveSession's guards/backoff and close directly.
+      // The for-loop below will create a fresh session with the new voice immediately.
       liveSummaryRef.current = buildPodcastContext(messagesRef.current);
-      await reconnectLiveSessionRef.current('voice-changed');
+      _LiveStreamPlayer.stopTurn();
+      TTSEngine.stop().catch(()=>{});
+      setSpeaking(false); speakingRef.current = false;
+      await closeLiveSession();
+      liveReconnectAttemptRef.current = 0; // Reset — intentional change, not error recovery
+      console.warn(`[Podcast] Voice changed: ${liveVoiceNameRef.current} → reconnecting with ${desiredVoice}`);
     }
     let lastErr:any = null;
     for(let attempt=0; attempt<2; attempt++) {
@@ -10040,20 +10047,12 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
     configureIOSVoiceChatSession();
     // Initialize streaming audio player AudioContext during user gesture (required by browsers)
     if(Platform.OS==='web') _LiveStreamPlayer.createContext();
-    // Ensure Android routes audio to speaker with ducking enabled
-    if(Platform.OS==='android') {
-      try {
-        await Audio.setAudioModeAsync({
-          playsInSilentModeIOS: true,
-          allowsRecordingIOS: true,
-          staysActiveInBackground: false,
-          shouldDuckAndroid: true,
-          playThroughEarpieceAndroid: false,
-        });
-      } catch(e) { console.warn('Podcast Android audio session config failed:', e); }
-    }
     // Set up session state IMMEDIATELY so UI transitions to active call
     _podcastSessionActive = true;
+    // Pre-configure audio session for both iOS and Android before first playback.
+    // iOS: ensures playsInSilentModeIOS is true from the start (not just on first playback).
+    // Android: routes audio to speaker with ducking enabled.
+    await activatePlaybackSession();
     setSessionActive(true); setPodcastMessages([]); setDuration(0); setPaused(false);
     loadingRef.current = true;
     setLoading(true);
@@ -10125,6 +10124,7 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
       setLoading(false);
       const fallbackText = `Host, great to be here. I'm Auto, and I'm really passionate about ${selTopic.title}. There is a lot of practical ground we can cover in a way that sticks. What aspect are you most curious about?`;
       setPodcastMessages([{role:'ai',text:fallbackText}]);
+      speakTextRef.current(fallbackText); // Speak the fallback so user hears it (not just text)
     }
     // Start STT-based listening if not using raw mic capture
     if(canUseMic && !useMicCaptureRef.current) {
