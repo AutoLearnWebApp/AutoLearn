@@ -1537,61 +1537,107 @@ const AI = {
 
 
 
-  async callGroq(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=16384):Promise<string> {
+  // Parse Groq's rate-limit reset headers (format: "1m30s", "6s", "2m0s", etc.)
+  _parseResetDuration(val:string):number {
+    if(!val) return 0;
+    let ms = 0;
+    const minMatch = val.match(/([\d.]+)m/);
+    const secMatch = val.match(/([\d.]+)s/);
+    if(minMatch) ms += parseFloat(minMatch[1]) * 60000;
+    if(secMatch) ms += parseFloat(secMatch[1]) * 1000;
+    return ms;
+  },
+
+  // Read remaining budget from Groq response headers and set cooldown if needed.
+  // This PREVENTS 429s by proactively waiting before the next call.
+  _updateCooldownFromHeaders(headers:Headers):void {
+    const remainingTokens = parseInt(headers.get('x-ratelimit-remaining-tokens')||'', 10);
+    const resetTokens = headers.get('x-ratelimit-reset-tokens') || '';
+    // If token budget is low (<4000 — not enough for another big call), wait for reset
+    if(!isNaN(remainingTokens) && remainingTokens < 4000 && resetTokens) {
+      const resetMs = this._parseResetDuration(resetTokens);
+      if(resetMs > 0) {
+        _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + resetMs + 500);
+        console.log(`AI: Groq tokens remaining: ${remainingTokens}, next call will wait ${Math.round(resetMs/1000)}s for budget reset`);
+      }
+    }
+  },
+
+  async callGroq(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=16384):Promise<string> {
     if(!_groqApiKey) { return ''; }
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const canRequest = await UsageTracker.canMakeRequest();
     if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
-    // Route through global queue so only 1 Groq request flies at a time
+    // Route through global queue — only 1 Groq request at a time.
+    // The queue respects _groqCooldownUntil which is set proactively after each
+    // successful call based on remaining token budget. This means we NEVER call
+    // when the budget is exhausted — no 429s, no retries, just works.
     return enqueueGroq(async () => {
-      for(let attempt=0;attempt<=retries;attempt++) {
-        const controller = new AbortController();
-        const abortBySignal = () => controller.abort();
-        let timeout:any = null;
-        try {
-          if(signal) {
-            if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
-            signal.addEventListener('abort', abortBySignal, { once:true });
-          }
-          timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-          const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
-            method:'POST',
-            headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
-            body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
-            signal:controller.signal,
-          });
-          if(r.status===429) {
-            // Read Retry-After header from Groq (seconds until rate limit resets)
-            const retryAfterHeader = r.headers.get('retry-after');
-            const retryAfterSec = retryAfterHeader ? Math.max(parseFloat(retryAfterHeader)||0, 0) : 0;
-            // Use Retry-After if provided, otherwise exponential backoff: 15s, 30s, 60s
-            const backoffMs = retryAfterSec > 0
-              ? Math.min(retryAfterSec * 1000 + 1000, 90000) // +1s buffer, cap at 90s
-              : Math.min(15000 * Math.pow(2, attempt), 60000);
-            // Set global cooldown so queued requests also wait
-            _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + backoffMs);
-            console.warn(`AI: Groq 429 rate-limited, backing off ${Math.round(backoffMs/1000)}s (attempt ${attempt+1}/${retries+1})${retryAfterSec?` [Retry-After: ${retryAfterSec}s]`:''}`);
-            if(attempt<retries) { await new Promise(res=>setTimeout(res, backoffMs)); continue; }
-            return '';
-          }
-          if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-          if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status}`); if(attempt<retries) { await new Promise(res=>setTimeout(res,2000)); continue; } break; }
-          const d = await r.json();
-          const text = d?.choices?.[0]?.message?.content;
-          if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
-          if(attempt<retries) continue;
-          break;
-        } catch(e:any) {
-          if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-          console.warn(`AI: Groq attempt ${attempt}: ${e?.message||'unknown'}`);
-          if(attempt<retries) { await new Promise(res=>setTimeout(res,2000*(attempt+1))); continue; }
-          break;
-        } finally {
-          if(timeout) clearTimeout(timeout);
-          if(signal) signal.removeEventListener('abort', abortBySignal);
+      const controller = new AbortController();
+      const abortBySignal = () => controller.abort();
+      let timeout:any = null;
+      try {
+        if(signal) {
+          if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
+          signal.addEventListener('abort', abortBySignal, { once:true });
         }
+        timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
+        const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
+          body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
+          signal:controller.signal,
+        });
+
+        if(r.status===429) {
+          // Shouldn't happen if proactive cooldown is working, but handle gracefully:
+          // read actual wait time from headers, wait, and try exactly once more.
+          const retryAfter = r.headers.get('retry-after');
+          const resetTokens = r.headers.get('x-ratelimit-reset-tokens') || '';
+          const resetRequests = r.headers.get('x-ratelimit-reset-requests') || '';
+          const retryAfterMs = retryAfter ? Math.max(parseFloat(retryAfter)||0, 0) * 1000 : 0;
+          const waitMs = Math.max(retryAfterMs, this._parseResetDuration(resetTokens), this._parseResetDuration(resetRequests), 60000) + 1000;
+          console.warn(`AI: Groq 429 (unexpected) — waiting ${Math.round(waitMs/1000)}s (retry-after=${retryAfter}, reset-tok=${resetTokens}, reset-req=${resetRequests})`);
+          _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + waitMs);
+          await new Promise(res => setTimeout(res, waitMs));
+          // Single retry after waiting the full duration
+          if(timeout) { clearTimeout(timeout); timeout = null; }
+          const timeout2 = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
+          try {
+            const r2 = await fetch('https://api.groq.com/openai/v1/chat/completions',{
+              method:'POST',
+              headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
+              body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
+              signal:controller.signal,
+            });
+            clearTimeout(timeout2);
+            if(!r2.ok) { console.warn(`AI: Groq retry failed: ${r2.status}`); return ''; }
+            this._updateCooldownFromHeaders(r2.headers);
+            const d2 = await r2.json();
+            const text2 = d2?.choices?.[0]?.message?.content;
+            if(text2 && typeof text2 === 'string' && text2.trim().length > 0) { await UsageTracker.increment(); return text2.trim(); }
+            return '';
+          } catch(_e:any) { clearTimeout(timeout2); return ''; }
+        }
+
+        if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
+        if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status}`); return ''; }
+
+        // SUCCESS — read remaining budget and proactively set cooldown for next call
+        this._updateCooldownFromHeaders(r.headers);
+
+        const d = await r.json();
+        const text = d?.choices?.[0]?.message?.content;
+        if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
+        return '';
+      } catch(e:any) {
+        if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
+        console.warn(`AI: Groq error: ${e?.message||'unknown'}`);
+        return '';
+      } finally {
+        if(timeout) clearTimeout(timeout);
+        if(signal) signal.removeEventListener('abort', abortBySignal);
       }
-      return '';
     });
   },
 
@@ -1732,9 +1778,9 @@ const AI = {
   },
 
   // App-wide text generation is Groq-only. Gemini is reserved for podcast live voice features.
-  async call(prompt:string, retries:number=2):Promise<string> {
+  async call(prompt:string, retries:number=2, maxTokens:number=4096):Promise<string> {
     if(_groqApiKey) {
-      const result = await this.callGroq(prompt, retries);
+      const result = await this.callGroq(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
     if(!_groqApiKey) {
@@ -1889,7 +1935,7 @@ Be concise and natural:`;
       return this._buildSourceBackedCurriculum(topicInput, sourceContent, 'strict');
     }
     const sourceBlock = sourceContent
-      ? `\nSOURCE NOTES (student uploaded this content):\n${sourceContent.substring(0,14000)}\n`
+      ? `\nSOURCE NOTES (student uploaded this content):\n${sourceContent.substring(0,6000)}\n`
       : '';
     const sourceModeInstruction = sourceContent
       ? (sourceMode==='strict'
@@ -1918,7 +1964,7 @@ Example of a GOOD concept description: "The fundamental principles of photosynth
 Return ONLY valid JSON:
 {"title":"Clear, specific topic title","description":"2-3 sentence overview of what the student will learn and be able to do after completing this curriculum","plan":"A 3-4 sentence roadmap explaining the learning journey — what they'll start with, how concepts build on each other, and what mastery looks like","sections":[{"title":"Descriptive Section Name","description":"2-3 sentences about what this section covers and what the student will understand after completing it","estimatedMinutes":30,"concepts":[{"name":"Specific Concept Name","description":"3-4 sentences: What this concept IS, WHY it matters, and WHAT specifically needs to be understood. Be concrete and detailed.","difficulty":"easy|medium|hard"}]}]}`;
     // Single API call to minimize rate-limit impact. If it fails, fall back to deterministic.
-    const r = await this.call(basePrompt, 0);
+    const r = await this.call(basePrompt, 0, 2048);
     if(r) {
       try {
         const parsed = this._parseJsonObject(r);
@@ -2061,7 +2107,7 @@ HOW TO USE: These notes cover the topics but may lack full explanations. Use the
       sourceBlock = `
 STUDENT'S UPLOADED MATERIAL:
 """
-${cleanedSource.substring(0,10000)}
+${cleanedSource.substring(0,6000)}
 """
 
 ${sourceGuidance}
@@ -2101,7 +2147,7 @@ Return ONLY valid JSON (no markdown, no extra text):
 {"lesson":"...","keyPrinciples":["...","...","...","...","..."],"keyTerms":["Term: def","Term: def","Term: def","Term: def","Term: def"],"practicalApplications":["...","...","..."],"commonMisconceptions":["...","...","..."],"summary":"..."}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 4096);
+    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 3000);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -4077,18 +4123,18 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     setTopicInput(''); setClarifyMsgs([]); setClarifyInput(''); setUploadedNotes(null); setExtractionReport(null); setCreating(false); setClarifyLoading(false);
     // Ask familiarity level first — this may update the topic's unlock/medal state
 	    askFamiliarity(newTopic);
-	    // Auto-generate Section 1 overview in background after a short delay
-	    // (gives Groq rate limit headroom after curriculum generation API calls)
+	    // Auto-generate Section 1 overview in background
+	    // (proactive cooldown from curriculum call handles rate-limit timing automatically)
 	    if(sections.length>0){
 	      const sec1 = sections[0];
         const sectionReqId = ++sectionOverviewReqSeqRef.current;
         sectionOverviewReqRef.current[sec1.id] = sectionReqId;
-	      (async()=>{ await new Promise(r=>setTimeout(r,2000)); return AI.generateSectionOverview(
+	      AI.generateSectionOverview(
 	        sec1,
 	        curr.title||baseTitle,
 	        isFileTopic?sourceContent:undefined,
 	        'expand'
-	      ); })().then(overview=>{
+	      ).then(overview=>{
           if(sectionOverviewReqRef.current[sec1.id]!==sectionReqId) return;
 	        const current = selTopicRef.current;
 	        if(current && current.id===newTopic.id){
