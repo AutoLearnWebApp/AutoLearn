@@ -699,7 +699,7 @@ const AI = {
       // Check for near-duplicate against all kept paragraphs
       const isDuplicate = trimmed.length >= 60 && deduped.some(kept => {
         if(kept.length < 60) return false;
-        return this._overlapSimilarity(kept, trimmed) >= 0.65;
+        return this._overlapSimilarity(kept, trimmed) >= 0.80;
       });
       if(isDuplicate) continue;
       deduped.push(trimmed);
@@ -721,17 +721,17 @@ const AI = {
       if(/\b(learning objectives?|today'?s plan|looking ahead|quiz|assignment|due|deadline|guest speaker|office hours)\b/i.test(clean)) continue;
       if(/^[A-Z][a-z]+\s+[A-Z][a-z]+:\s*[“"]/i.test(clean)) continue;
       const wc = this._wordCount(clean);
-      if(wc<5) continue;
+      if(wc<3) continue;
       if(mode==='generic') {
-        if(wc<6) continue;
+        if(wc<4) continue;
       }
       if(mode==='application') {
-        if(wc<8) continue;
+        if(wc<5) continue;
         if(/\b(misconception|common mistake)\b/i.test(clean)) continue;
         // Accept the AI's application text as-is — it was prompted to generate actionable content
       }
       if(mode==='misconception') {
-        if(wc<6) continue;
+        if(wc<4) continue;
         // Accept the AI's misconception text as-is — it was prompted to generate specific misconceptions
       }
       const sig = this._lineSignature(clean);
@@ -1553,11 +1553,11 @@ const AI = {
   _updateCooldownFromHeaders(headers:Headers):void {
     const remainingTokens = parseInt(headers.get('x-ratelimit-remaining-tokens')||'', 10);
     const resetTokens = headers.get('x-ratelimit-reset-tokens') || '';
-    // If token budget is low (<4000 — not enough for another big call), wait for reset
-    if(!isNaN(remainingTokens) && remainingTokens < 4000 && resetTokens) {
+    // If token budget is low (<6000 — not enough for another big call), wait for reset
+    if(!isNaN(remainingTokens) && remainingTokens < 6000 && resetTokens) {
       const resetMs = this._parseResetDuration(resetTokens);
       if(resetMs > 0) {
-        _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + resetMs + 500);
+        _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + resetMs + 2000);
         console.log(`AI: Groq tokens remaining: ${remainingTokens}, next call will wait ${Math.round(resetMs/1000)}s for budget reset`);
       }
     }
@@ -1935,7 +1935,7 @@ Be concise and natural:`;
       return this._buildSourceBackedCurriculum(topicInput, sourceContent, 'strict');
     }
     const sourceBlock = sourceContent
-      ? `\nSOURCE NOTES (student uploaded this content):\n${sourceContent.substring(0,6000)}\n`
+      ? `\nSOURCE NOTES (student uploaded this content):\n${(() => { const s = sourceContent.substring(0,6000); if(s.length < 6000) return s; const tail = s.substring(5800); const m = tail.search(/[.!?][\s"')\]]*(?:\s|$)/); return m >= 0 ? s.substring(0, 5800 + m + 1) : s; })()}\n`
       : '';
     const sourceModeInstruction = sourceContent
       ? (sourceMode==='strict'
@@ -2107,7 +2107,7 @@ HOW TO USE: These notes cover the topics but may lack full explanations. Use the
       sourceBlock = `
 STUDENT'S UPLOADED MATERIAL:
 """
-${cleanedSource.substring(0,6000)}
+${(() => { const s = cleanedSource.substring(0,6000); if(s.length < 6000) return s; const tail = s.substring(5800); const m = tail.search(/[.!?][\s"')\]]*(?:\s|$)/); return m >= 0 ? s.substring(0, 5800 + m + 1) : s; })()}
 """
 
 ${sourceGuidance}
@@ -2127,28 +2127,22 @@ ${sourceBlock}
 Concepts to teach (cover ALL of these):
 ${conceptList}
 
-CRITICAL LENGTH REQUIREMENT: The "lesson" field MUST be 800-1200 words. This is a HARD requirement — not a suggestion. Count your words. A lesson under 400 words is unacceptable. Write thorough, detailed explanations with specific examples for each concept.
+LENGTH REQUIREMENT: Write at least 2-3 full paragraphs (each 80-120 words) for EACH concept listed above. If there are 4 concepts, that means at least 8 paragraphs. The "lesson" field MUST total 800-1200 words. A lesson under 600 words will be rejected.
 
-FORMAT:
+FORMAT RULES:
 - Use subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
-- For each concept: define it, explain how/why it works, give a concrete real-world example.
-- Write 2-3 paragraphs per concept. Separate paragraphs with \\n\\n.
-- No introductions, conclusions, or summaries at the end. End after the last concept.
-- No meta-commentary ("In this section we will...", "To summarize...").
-- Never repeat information — every paragraph must contain new content.
+- For each concept: (a) define it clearly, (b) explain how/why it works with detail, (c) give a concrete real-world example with specifics.
+- Separate paragraphs with \\n\\n.
+- No introductions, conclusions, or recap paragraphs. End after the last concept.
+- No meta-commentary ("In this section...", "To summarize...", "Let us explore...").
+- Never repeat information — every paragraph must be entirely new content.
 
-Return ONLY valid JSON with these fields:
-{
-  "lesson": "(800-1200 word lesson with concept subheadings, \\n\\n between paragraphs)",
-  "keyPrinciples": ["(5-7 specific factual takeaways, not vague platitudes)"],
-  "keyTerms": ["Term: clear plain-language definition", "(5-8 terms)"],
-  "practicalApplications": ["(3 specific actions: what to do, how, expected outcome)"],
-  "commonMisconceptions": ["(3 specific wrong beliefs and what is actually true)"],
-  "summary": "(2-3 sentences of key takeaways)"
-}`;
+Return ONLY valid JSON. Here is an example of the expected format and depth (your actual content must be about the topic above, not this example):
+
+{"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\n[...continues with Concept 2, Concept 3, etc. for 800-1200 words total...]","keyPrinciples":["Prices are determined by the intersection of supply and demand curves, not set arbitrarily by sellers","A shortage occurs when quantity demanded exceeds quantity supplied at the current price, pushing prices upward","Market equilibrium is self-correcting: deviations create pressures that restore balance over time","External shocks shift supply or demand curves, establishing a new equilibrium price and quantity","Price elasticity determines how dramatically quantity changes in response to a price shift"],"keyTerms":["Equilibrium price: the price at which quantity demanded equals quantity supplied, so there is no surplus or shortage","Shortage: a market condition where quantity demanded exceeds quantity supplied at the current price","Supply curve: a graph showing the relationship between a product's price and the quantity producers are willing to sell","Price elasticity: a measure of how sensitive quantity demanded or supplied is to a change in price"],"practicalApplications":["Track competitor pricing and your own inventory levels weekly to identify whether your product is priced above or below equilibrium — if inventory accumulates, your price is too high","Before launching a new product, survey 50-100 potential customers on their willingness to pay at three price points to estimate where your demand curve sits","Monitor commodity input costs monthly and adjust your pricing model within 2 weeks of significant supply shocks to maintain margins"],"commonMisconceptions":["Many believe companies set prices however they want, but in competitive markets prices are constrained by supply and demand — charging above equilibrium leads to unsold inventory","Students often think equilibrium means prices never change, when in reality equilibrium shifts constantly as supply and demand conditions evolve","A common error is assuming higher demand always means higher prices, but if supply increases proportionally, the equilibrium price can remain stable or even fall"],"summary":"Supply and demand is the core mechanism determining prices in market economies. Prices converge toward equilibrium where quantity supplied matches quantity demanded, and external shocks continuously shift this balance point."}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 4096);
+    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.35, 4096);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -2163,7 +2157,7 @@ Return ONLY valid JSON with these fields:
       };
       // Hard reject: lesson must have meaningful content
       const wordCount = this._wordCount(normalized.lesson);
-      if(wordCount < 300) { console.warn(`AI overview: lesson too short (${wordCount} words, need 300+)`); throw new Error('AI_GENERATION_FAILED'); }
+      if(wordCount < 500) { console.warn(`AI overview: lesson too short (${wordCount} words, need 500+)`); throw new Error('AI_GENERATION_FAILED'); }
       if(wordCount > 4000) { throw new Error('AI_GENERATION_FAILED'); }
       // Accept output with graceful degradation — use what we have even if supplementary fields are thin
       if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
@@ -4143,7 +4137,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 	          const updTopic = {...current,sections:updSections};
 	          setSelTopic(updTopic); selTopicRef.current=updTopic; onUpdateTopic(updTopic);
 	        }
-	      }).catch((e:any)=>{ console.warn('Auto-generate section overview failed:', e?.message||e); }).finally(()=>{
+	      }).catch((e:any)=>{ console.warn('Auto-generate section overview failed:', e?.message||e); Alert.alert('Lesson Generation','Could not auto-generate the first lesson. Tap a section and press "Generate Lesson" to try again.'); }).finally(()=>{
           if(sectionOverviewReqRef.current[sec1.id]===sectionReqId) {
             delete sectionOverviewReqRef.current[sec1.id];
           }
@@ -4910,7 +4904,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const hasWeakOverview = (section:Section):boolean => {
     if(!section.overview?.loaded) return false;
     const lesson = safeStr(section.overview.lesson||'').trim();
-    return !lesson || AI._wordCount(lesson) < 100;
+    return !lesson || AI._wordCount(lesson) < 300;
   };
 
   const renderExtractionReportCard = () => {
