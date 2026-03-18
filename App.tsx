@@ -2053,14 +2053,14 @@ Return ONLY valid JSON (no markdown, no extra text):
 {"lesson":"...","keyPrinciples":["...","...","...","...","..."],"keyTerms":["Term: def","Term: def","Term: def","Term: def","Term: def"],"practicalApplications":["...","...","..."],"commonMisconceptions":["...","...","..."],"summary":"..."}`;
 
     // --- Step 4: AI generation with 3 attempts ---
+    let bestCandidate:{lesson:string;keyPrinciples:string[];keyTerms:string[];practicalApplications:string[];commonMisconceptions:string[];summary:string}|null = null;
+    let bestWordCount = 0;
     for(let attempt=0; attempt<3; attempt++){
       try {
-        const r = await this.call(prompt, 1);
-        if(!r) continue;
+        const r = await this.callGroq(prompt, 1, undefined, 60000);
+        if(!r) { console.warn(`AI overview attempt ${attempt+1}: empty response from Groq`); continue; }
         const parsed = this._parseJsonObject(r);
-        if(!parsed || !parsed.lesson) continue;
-        // Don't pre-clean arrays here — _polishSectionOverview handles all cleaning.
-        // Double-cleaning was mangling content (e.g., adding "Apply this by..." prefix twice).
+        if(!parsed || !parsed.lesson) { console.warn(`AI overview attempt ${attempt+1}: failed to parse JSON or no lesson field`); continue; }
         const normalized = {
           lesson: safeStr(parsed.lesson||'').trim(),
           keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
@@ -2069,45 +2069,32 @@ Return ONLY valid JSON (no markdown, no extra text):
           commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
           summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
         };
-        // Quality checks
+        // Hard reject: lesson must have meaningful content
         const wordCount = this._wordCount(normalized.lesson);
-        if(wordCount < 100) continue;
-        if(wordCount > 3000) continue;
-        // Reject if too few supplementary fields survived (AI returned empty/weak arrays)
-        const hasSubstance = normalized.keyPrinciples.length >= 2 &&
-          normalized.keyTerms.length >= 2 &&
-          normalized.practicalApplications.length >= 1 &&
-          normalized.commonMisconceptions.length >= 1;
-        if(!hasSubstance) continue;
-        // Reject if lesson is excessively repetitive (paragraphs repeat the same ideas)
-        const paragraphs = normalized.lesson
-          .split(/\n{2,}/)
-          .map((p:string)=>p.replace(/\s+/g,' ').trim())
-          .filter((p:string)=>p.length>=60);
-        if(paragraphs.length>=4) {
-          let repPairs = 0;
-          let repComps = 0;
-          for(let i=0;i<paragraphs.length;i++) {
-            for(let j=i+1;j<paragraphs.length;j++) {
-              repComps++;
-              if(this._overlapSimilarity(paragraphs[i], paragraphs[j]) >= 0.55) repPairs++;
-            }
-          }
-          if(repComps>0 && repPairs >= Math.max(2, Math.floor(repComps * 0.25))) continue; // too repetitive, retry
+        if(wordCount < 80) { console.warn(`AI overview attempt ${attempt+1}: lesson too short (${wordCount} words)`); continue; }
+        if(wordCount > 4000) { console.warn(`AI overview attempt ${attempt+1}: lesson too long (${wordCount} words)`); continue; }
+        // Track the best candidate in case no attempt passes all soft checks
+        if(wordCount > bestWordCount) {
+          bestCandidate = normalized;
+          bestWordCount = wordCount;
         }
-        return this._polishSectionOverview({
-          lesson: normalized.lesson,
-          keyPrinciples: normalized.keyPrinciples,
-          keyTerms: normalized.keyTerms,
-          practicalApplications: normalized.practicalApplications,
-          commonMisconceptions: normalized.commonMisconceptions,
-          summary: normalized.summary,
-          loaded: true,
-        });
-      } catch(_){ continue; }
+        // Soft checks: warn but still return the best result if these fail
+        if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
+          console.warn(`AI overview attempt ${attempt+1}: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — retrying for better output`);
+          continue;
+        }
+        // Passed all checks
+        return this._polishSectionOverview({ ...normalized, loaded: true });
+      } catch(e:any) { console.warn(`AI overview attempt ${attempt+1}: exception: ${e?.message||e}`); continue; }
     }
 
-    // --- Step 5: All AI attempts failed — throw so UI shows retry ---
+    // --- Step 5: If we have a candidate that passed hard checks but failed soft checks, use it ---
+    if(bestCandidate) {
+      console.warn('AI overview: using best candidate (passed hard checks, failed some soft checks)');
+      return this._polishSectionOverview({ ...bestCandidate, loaded: true });
+    }
+
+    // --- Step 6: All AI attempts truly failed (no parseable response at all) ---
     throw new Error('AI_GENERATION_FAILED');
   },
 
@@ -4074,8 +4061,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           if(sectionOverviewReqRef.current[sec1.id]!==sectionReqId) return;
 	        const current = selTopicRef.current;
 	        if(current && current.id===newTopic.id){
-            const polished = AI._polishSectionOverview(overview);
-	          const updSections = current.sections.map((s,i)=>s.id===sec1.id?{...s,overview:polished}:s);
+	          const updSections = current.sections.map((s,i)=>s.id===sec1.id?{...s,overview}:s);
 	          const updTopic = {...current,sections:updSections};
 	          setSelTopic(updTopic); selTopicRef.current=updTopic; onUpdateTopic(updTopic);
 	        }
@@ -4696,9 +4682,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     beginSectionOverviewLoad();
     try {
       const sourceContent = selTopicRef.current.source==='file' ? cleanStoredSourceForAI(selTopicRef.current.originalContent) : undefined;
-      const generatedOverview = await AI.generateSectionOverview(section, selTopicRef.current.title, sourceContent, 'expand');
+      const overview = await AI.generateSectionOverview(section, selTopicRef.current.title, sourceContent, 'expand');
       if(sectionOverviewReqRef.current[section.id]!==requestId) return;
-      const overview = AI._polishSectionOverview(generatedOverview);
       const topic = selTopicRef.current;
       if(topic){
         const uSections = topic.sections.map(s=>s.id===section.id?{...s,overview}:s);
