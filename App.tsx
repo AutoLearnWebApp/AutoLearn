@@ -432,7 +432,7 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'; // 30K TPM (vs 12K on llama-3.3-70b)
 const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
