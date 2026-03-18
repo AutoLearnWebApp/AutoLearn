@@ -56,7 +56,6 @@ const { width: SW, height: SH } = Dimensions.get('window');
 // ========== PER-USER API KEYS (stored locally on device) ==========
 let _groqApiKey = '';
 let _geminiApiKey = '';
-let _cerebrasApiKey = '';
 let _selectedVoiceName = 'Zephyr';
 let _podcastVoiceName = 'Puck';       // Gemini Live voice for podcast
 let _audiobookVoiceName = 'diana';    // Groq Orpheus TTS voice for audiobook
@@ -268,7 +267,7 @@ const I = {
 };
 
 // ========== STORAGE ==========
-const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', GROQ_KEY:'@al_groq_key', GEMINI_KEY:'@al_gemini_key', CEREBRAS_KEY:'@al_cerebras_key', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice' };
+const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', GROQ_KEY:'@al_groq_key', GEMINI_KEY:'@al_gemini_key', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice' };
 type GeminiVoiceOption = { name:string; label:string; gender:'male'|'female'|'neutral'; style:string; };
 const GEMINI_TTS_VOICE_OPTIONS:GeminiVoiceOption[] = [
   { name:'Zephyr', label:'Zephyr - Bright', gender:'male', style:'bright and articulate' },
@@ -384,7 +383,6 @@ const ApiKeys = {
   async loadAll():Promise<void> {
     try { _groqApiKey = _cleanStored(await SecretStore.getItem(SK.GROQ_KEY)); } catch(_){ _groqApiKey=''; }
     try { _geminiApiKey = _cleanStored(await SecretStore.getItem(SK.GEMINI_KEY)); } catch(_){ _geminiApiKey=''; }
-    try { _cerebrasApiKey = _cleanStored(await SecretStore.getItem(SK.CEREBRAS_KEY)); } catch(_){ _cerebrasApiKey=''; }
     try { _selectedVoiceName = _normalizeVoiceName(await SecretStore.getItem(SK.VOICE)); } catch(_){ _selectedVoiceName=GEMINI_TTS_DEFAULT_VOICE; }
     try { _podcastVoiceName = _normalizePodcastVoice(await SecretStore.getItem(SK.PODCAST_VOICE)); } catch(_){ _podcastVoiceName=PODCAST_DEFAULT_VOICE; }
     try { _audiobookVoiceName = _normalizeGroqVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=GROQ_TTS_DEFAULT_VOICE; }
@@ -398,11 +396,6 @@ const ApiKeys = {
     _geminiApiKey = key.trim();
     await SecretStore.setItem(SK.GEMINI_KEY, _geminiApiKey);
     delete _missingKeyAlerted['gemini'];
-  },
-  async saveCerebrasKey(key:string):Promise<void> {
-    _cerebrasApiKey = key.trim();
-    await SecretStore.setItem(SK.CEREBRAS_KEY, _cerebrasApiKey);
-    delete _missingKeyAlerted['cerebras'];
   },
   async saveVoice(voiceName:string):Promise<void> {
     const nextVoice = _normalizeVoiceName(voiceName);
@@ -420,11 +413,9 @@ const ApiKeys = {
     _audiobookVoiceName = next;
     await SecretStore.setItem(SK.AUDIOBOOK_VOICE, next);
   },
-  getGroqKey:()=>_groqApiKey, getGeminiKey:()=>_geminiApiKey, getCerebrasKey:()=>_cerebrasApiKey,
-  getVoiceName:()=>_selectedVoiceName,
+  getGroqKey:()=>_groqApiKey, getGeminiKey:()=>_geminiApiKey, getVoiceName:()=>_selectedVoiceName,
   getPodcastVoice:()=>_podcastVoiceName, getAudiobookVoice:()=>_audiobookVoiceName,
   hasGroqKey:()=>_groqApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
-  hasCerebrasKey:()=>_cerebrasApiKey.length>0,
   hasLikelyGeminiKey:()=>_looksLikeGeminiKey(_geminiApiKey),
 };
 
@@ -441,8 +432,7 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-const CEREBRAS_MODEL = 'qwen-3-235b-a22b-instruct-2507'; // 235B params, 60K TPM, 1M TPD — primary for lessons
-const GROQ_MODEL = 'llama-3.3-70b-versatile'; // 70B quality — fallback for lessons, primary for TTS
+const GROQ_MODEL = 'llama-3.3-70b-versatile'; // 70B quality + 12K TPM (fits with trimmed prompts)
 const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
@@ -501,11 +491,11 @@ function enqueueGroq<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 const AI = {
-  _showMissingKeyAlert(provider:'groq'|'gemini'|'cerebras'):void {
+  _showMissingKeyAlert(provider:'groq'|'gemini'):void {
     if(_missingKeyAlerted[provider]) return;
     _missingKeyAlerted[provider]=true;
-    const name = provider==='groq'?'Groq':provider==='cerebras'?'Cerebras':'Gemini';
-    const url = provider==='groq'?'console.groq.com':provider==='cerebras'?'cloud.cerebras.ai':'aistudio.google.com';
+    const name = provider==='groq'?'Groq':'Gemini';
+    const url = provider==='groq'?'console.groq.com':'aistudio.google.com';
     Alert.alert(`${name} API Key Required`,`Add your ${name} API key in Profile > API Keys.\n\nGet a free key at ${url}`,[{text:'OK'}]);
   },
 
@@ -1651,49 +1641,6 @@ const AI = {
     });
   },
 
-  // Cerebras text generation — primary provider for lessons (1M TPD, 60K TPM)
-  // OpenAI-compatible API. No queue needed — rate limits are 10x more generous than Groq.
-  async callCerebras(prompt:string, signal?:AbortSignal, timeoutMs:number=60000, temperature:number=0.35, maxTokens:number=4096):Promise<string> {
-    if(!_cerebrasApiKey) return '';
-    if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-    const canRequest = await UsageTracker.canMakeRequest();
-    if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
-    const controller = new AbortController();
-    const abortBySignal = () => controller.abort();
-    let timeout:any = null;
-    try {
-      if(signal) {
-        if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
-        signal.addEventListener('abort', abortBySignal, { once:true });
-      }
-      timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-      const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':`Bearer ${_cerebrasApiKey}`},
-        body:JSON.stringify({model:CEREBRAS_MODEL,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:maxTokens}),
-        signal:controller.signal,
-      });
-      if(r.status===429) {
-        // Cerebras has generous limits (60K TPM) — 429 is rare, just log and return empty
-        console.warn(`AI: Cerebras 429 rate-limited`);
-        return '';
-      }
-      if(r.status===401) { this._safeAlert('Invalid Cerebras Key','Your Cerebras API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-      if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status}`); return ''; }
-      const d = await r.json();
-      const text = d?.choices?.[0]?.message?.content;
-      if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
-      return '';
-    } catch(e:any) {
-      if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-      console.warn(`AI: Cerebras error: ${e?.message||'unknown'}`);
-      return '';
-    } finally {
-      if(timeout) clearTimeout(timeout);
-      if(signal) signal.removeEventListener('abort', abortBySignal);
-    }
-  },
-
   // Groq Orpheus TTS — used for audiobook narration in the Learn tab (saves Gemini quota)
   async synthesizeGroqSpeech(
     text:string,
@@ -1830,21 +1777,14 @@ const AI = {
     return '';
   },
 
-  // App-wide text generation: tries Cerebras first (1M TPD, 60K TPM), falls back to Groq.
-  // Gemini is reserved for podcast live voice features.
+  // App-wide text generation is Groq-only. Gemini is reserved for podcast live voice features.
   async call(prompt:string, retries:number=2, maxTokens:number=4096):Promise<string> {
-    // Try Cerebras first — much more generous rate limits
-    if(_cerebrasApiKey) {
-      const result = await this.callCerebras(prompt, undefined, 30000, 0.4, maxTokens);
-      if(result && result.trim().length > 0) return result;
-    }
-    // Fall back to Groq
     if(_groqApiKey) {
       const result = await this.callGroq(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
-    if(!_cerebrasApiKey && !_groqApiKey) {
-      this._showMissingKeyAlert('cerebras');
+    if(!_groqApiKey) {
+      this._showMissingKeyAlert('groq');
     }
     return '';
   },
@@ -2202,14 +2142,7 @@ Return ONLY valid JSON. Here is an example of the expected format and depth (you
 {"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\n[...continues with Concept 2, Concept 3, etc. for 800-1200 words total...]","keyPrinciples":["Prices are determined by the intersection of supply and demand curves, not set arbitrarily by sellers","A shortage occurs when quantity demanded exceeds quantity supplied at the current price, pushing prices upward","Market equilibrium is self-correcting: deviations create pressures that restore balance over time","External shocks shift supply or demand curves, establishing a new equilibrium price and quantity","Price elasticity determines how dramatically quantity changes in response to a price shift"],"keyTerms":["Equilibrium price: the price at which quantity demanded equals quantity supplied, so there is no surplus or shortage","Shortage: a market condition where quantity demanded exceeds quantity supplied at the current price","Supply curve: a graph showing the relationship between a product's price and the quantity producers are willing to sell","Price elasticity: a measure of how sensitive quantity demanded or supplied is to a change in price"],"practicalApplications":["Track competitor pricing and your own inventory levels weekly to identify whether your product is priced above or below equilibrium — if inventory accumulates, your price is too high","Before launching a new product, survey 50-100 potential customers on their willingness to pay at three price points to estimate where your demand curve sits","Monitor commodity input costs monthly and adjust your pricing model within 2 weeks of significant supply shocks to maintain margins"],"commonMisconceptions":["Many believe companies set prices however they want, but in competitive markets prices are constrained by supply and demand — charging above equilibrium leads to unsold inventory","Students often think equilibrium means prices never change, when in reality equilibrium shifts constantly as supply and demand conditions evolve","A common error is assuming higher demand always means higher prices, but if supply increases proportionally, the equilibrium price can remain stable or even fall"],"summary":"Supply and demand is the core mechanism determining prices in market economies. Prices converge toward equilibrium where quantity supplied matches quantity demanded, and external shocks continuously shift this balance point."}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    // Try Cerebras first (1M TPD, 60K TPM), fall back to Groq (100K TPD, 12K TPM)
-    let r = '';
-    if(_cerebrasApiKey) {
-      r = await this.callCerebras(prompt, undefined, 60000, 0.35, 4096);
-    }
-    if(!r && _groqApiKey) {
-      r = await this.callGroq(prompt, 0, undefined, 60000, 0.35, 4096);
-    }
+    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.35, 4096);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -10456,7 +10389,6 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   const [showApiKeys,setShowApiKeys] = useState(false);
   const [groqKey,setGroqKey] = useState('');
   const [geminiKey,setGeminiKey] = useState('');
-  const [cerebrasKey,setCerebrasKey] = useState('');
   // Voice state
   const [showVoicePicker,setShowVoicePicker] = useState(false);
   const [selectedVoice,setSelectedVoice] = useState(_podcastVoiceName);
@@ -10471,7 +10403,6 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
     (async()=>{
       try { const g = await SecretStore.getItem(SK.GROQ_KEY); setGroqKey(_cleanStored(g)); } catch(_){ setGroqKey(''); }
       try { const m = await SecretStore.getItem(SK.GEMINI_KEY); setGeminiKey(_cleanStored(m)); } catch(_){ setGeminiKey(''); }
-      try { const cb = await SecretStore.getItem(SK.CEREBRAS_KEY); setCerebrasKey(_cleanStored(cb)); } catch(_){ setCerebrasKey(''); }
       try { const v = await SecretStore.getItem(SK.PODCAST_VOICE); setSelectedVoice(_normalizePodcastVoice(v||_podcastVoiceName)); } catch(_){ setSelectedVoice(_podcastVoiceName); }
       try { const av = await SecretStore.getItem(SK.AUDIOBOOK_VOICE); setSelectedAudiobookVoice(_normalizeGroqVoice(av||_audiobookVoiceName)); } catch(_){ setSelectedAudiobookVoice(_audiobookVoiceName); }
     })();
@@ -10785,8 +10716,8 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           <Text style={{fontSize:20}}>🔑</Text>
           <View style={{flex:1}}>
             <Text style={{color:theme.text,fontSize:15}}>Manage API Keys</Text>
-            <Text style={{color:ApiKeys.hasCerebrasKey()||ApiKeys.hasGroqKey()?'#10B981':'#EF4444',fontSize:12,marginTop:2}}>
-              Cerebras: {ApiKeys.hasCerebrasKey()?'✓ Set':'✗ Not set'}  ·  Groq: {ApiKeys.hasGroqKey()?'✓ Set':'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}
+            <Text style={{color:ApiKeys.hasGroqKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasGroqKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
+              Groq: {ApiKeys.hasGroqKey()?'✓ Set':'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}
             </Text>
           </View>
           <I.Right s={20} c="#64748B"/>
@@ -10918,15 +10849,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>API Keys</Text>
             <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>Stored securely on your device</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Cerebras API Key <Text style={{color:'#10B981'}}>(recommended — best limits)</Text></Text>
-            <TextInput
-              style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
-              placeholder="csk-..." placeholderTextColor="#475569"
-              value={cerebrasKey} onChangeText={setCerebrasKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
-            />
-            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at cloud.cerebras.ai → API Keys → Create. 1M tokens/day, 60K tokens/min.</Text>
-
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Groq API Key <Text style={{color:'#F59E0B'}}>(fallback + audiobook voice)</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Groq API Key <Text style={{color:'#EF4444'}}>(required)</Text></Text>
             <TextInput
               style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
               placeholder="gsk_..." placeholderTextColor="#475569"
@@ -10934,7 +10857,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             />
             <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at console.groq.com → API Keys → Create</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#64748B'}}>(podcast live voice only)</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#F59E0B'}}>(for podcast live voice chat only)</Text></Text>
             <TextInput
               style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
               placeholder="AIzaSy..." placeholderTextColor="#475569"
@@ -10947,7 +10870,6 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
                 <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={async()=>{
-                await ApiKeys.saveCerebrasKey(cerebrasKey);
                 await ApiKeys.saveGroqKey(groqKey);
                 await ApiKeys.saveGeminiKey(geminiKey);
                 Alert.alert('Saved','API keys updated. They are stored securely on your device.');
@@ -11013,7 +10935,7 @@ const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void
   const [step,setStep] = useState(0);
   const steps = [
     {e:'📚',t:'Welcome to Auto Learn!',d:'Learn without feeling like you\'re studying. Upload notes, take quizzes, play games, or chat with an AI expert!'},
-    {e:'🔑',t:'Set Up AI Access',d:'To use Auto Learn, you\'ll need free API keys. Go to Profile > API Keys after this tutorial to add them:\n\n• Cerebras (recommended: best rate limits for lessons) — cloud.cerebras.ai\n• Groq (fallback + audiobook voice) — console.groq.com\n• Gemini (podcast live voice only) — aistudio.google.com\n\nAll are free! You can set them up later.'},
+    {e:'🔑',t:'Set Up AI Access',d:'To use Auto Learn, you\'ll need free API keys. Go to Profile > API Keys after this tutorial to add them:\n\n• Groq (required: text generation + audiobook/preview voice) — console.groq.com\n• Gemini (podcast live voice chat only) — aistudio.google.com\n\nBoth are free! You can set them up later.'},
     {e:'📖',t:'Learn Tab',d:'Upload PDF/TXT notes, or type what you want to learn. Set study session goals and the AI tracks your progress.'},
     {e:'✍️',t:'Quiz Tab',d:'Fully customizable quizzes - multiple choice, fill-in-blank, short response, scenario questions. Control question types and count!'},
     {e:'🎮',t:'Games Tab',d:'Pop Scholar, Brain Blocks, Lexicon - fun games with AI learning interruptions. Wrong answers end your run!'},
