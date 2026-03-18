@@ -626,7 +626,8 @@ const AI = {
     if(!out) return '';
     out = out
       // Fix OCR artifacts where punctuation splits a phrase mid-sentence.
-      .replace(/\b([A-Za-z]{3,})\.\s+(and|or|to|of|for|with|in|on|at|by|from|as|that|which|who|whom|whose|if|when|while|where|because|so)\b/gi,'$1 $2')
+      // Only match lowercase words after period (uppercase = real sentence break, leave it alone).
+      .replace(/\b([A-Za-z]{3,})\.\s+(and|or|to|of|for|with|in|on|at|by|from|as|that|which|who|whom|whose|if|when|while|where|because|so)\b/g,'$1 $2')
       .replace(/\b([A-Za-z]{2,})\s+([’'][A-Za-z]{1,})\b/g,'$1$2')
       .replace(/\s*([,:;!?])\s*/g,'$1 ')
       .replace(/\s*\.\s*/g,'. ')
@@ -686,30 +687,15 @@ const AI = {
       if(wc<5) continue;
       if(mode==='generic') {
         if(wc<6) continue;
-        if(/\b(common mistake|apply this by)\b/i.test(clean)) continue;
       }
       if(mode==='application') {
         if(wc<8) continue;
         if(/\b(misconception|common mistake)\b/i.test(clean)) continue;
-        const actionable = /\b(apply|use|build|analyze|compare|test|evaluate|map|create|draft|measure|run|design|simulate|diagnose|prioritize|choose|justify|audit|plan|predict|practice)\b/i.test(clean);
-        if(!actionable) {
-          const lowered = clean.charAt(0).toLowerCase() + clean.slice(1);
-          clean = this._normalizeReadableText(`Apply this by ${lowered}`, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24});
-        }
-        if(!/\b(measure|metric|outcome|result|impact|improve|increase|decrease|compare|predict)\b/i.test(clean)) {
-          clean = this._normalizeReadableText(`${clean.replace(/[.!?]+$/,'')}. Include one measurable outcome to verify the result`, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:26});
-        }
+        // Accept the AI's application text as-is — it was prompted to generate actionable content
       }
       if(mode==='misconception') {
         if(wc<6) continue;
-        const hasMisconceptionCue = /\b(misconception|mistake|assuming|assume|confusing|confuse|believing|believe|ignoring|ignore|treating|treat|overlooking|overlook)\b/i.test(clean);
-        if(!hasMisconceptionCue) {
-          const lowered = clean.charAt(0).toLowerCase() + clean.slice(1);
-          clean = this._normalizeReadableText(`Common mistake: ${lowered}`, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24});
-        }
-        if(!/\b(instead|to avoid this|better approach|correct approach)\b/i.test(clean)) {
-          clean = this._normalizeReadableText(`${clean.replace(/[.!?]+$/,'')}. Instead, validate your answer with direct evidence from the lesson`, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:26});
-        }
+        // Accept the AI's misconception text as-is — it was prompted to generate specific misconceptions
       }
       const sig = this._lineSignature(clean);
       if(!sig || seen.has(sig)) continue;
@@ -719,91 +705,6 @@ const AI = {
     return out;
   },
 
-  _fillSectionLinesFromLesson(
-    existing:any,
-    lesson:string,
-    mode:'generic'|'application'|'misconception',
-    minCount:number,
-    maxCount:number
-  ):string[] {
-    const out = this._cleanSectionLines(existing||[], mode).slice(0, maxCount);
-    if(out.length>=minCount) return out.slice(0, maxCount);
-    const seen = new Set(out.map(x=>this._lineSignature(x)));
-    const lessonSentences = this._splitIntoSentences(lesson, 280)
-      .map(s=>this._normalizeReadableText(s, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24}))
-      .filter(Boolean)
-      .filter(s=>!this._isLowValueSummarySentence(s))
-      .map(sentence=>{
-        const lower = sentence.toLowerCase();
-        let score = 0;
-        const wc = this._wordCount(sentence);
-        if(wc>=8 && wc<=32) score += 1.4;
-        if(/\b(\d{4}|%|\$|million|billion|revenue|cost|profit|users?|customers?|market)\b/i.test(sentence)) score += 1.1;
-        if(/\b(because|therefore|however|instead|despite|after|before|led to|resulted)\b/i.test(lower)) score += 0.9;
-        if(mode==='application') {
-          if(/\b(apply|use|build|analyze|compare|test|evaluate|map|create|draft|measure|run|design|simulate|diagnose|prioritize|choose|justify|audit|plan|predict|practice)\b/i.test(lower)) score += 2;
-          if(/\b(measure|metric|outcome|result|impact|improve|increase|decrease|compare|predict)\b/i.test(lower)) score += 1.2;
-        }
-        if(mode==='misconception') {
-          if(/\b(misconception|mistake|assuming|assume|confusing|confuse|believing|believe|ignoring|ignore|treating|treat|overlooking|overlook)\b/i.test(lower)) score += 2.2;
-          if(/\b(instead|avoid|wrong|incorrect|correct)\b/i.test(lower)) score += 1;
-        }
-        if(mode==='generic') {
-          if(/\b(learning objectives?|today'?s plan|assignment|quiz|deadline|office hours)\b/i.test(lower)) score -= 3;
-        }
-        return {sentence, score};
-      })
-      .sort((a,b)=>b.score-a.score)
-      .map(row=>row.sentence);
-    for(const sentence of lessonSentences) {
-      if(out.length>=minCount) break;
-      const normalizedSource = safeStr(sentence||'').trim();
-      if(!normalizedSource) continue;
-      let seeded = normalizedSource;
-      if(mode==='application') {
-        const lowered = normalizedSource.charAt(0).toLowerCase()+normalizedSource.slice(1);
-        seeded = `Apply this by ${lowered}`;
-      } else if(mode==='misconception') {
-        const lowered = normalizedSource.charAt(0).toLowerCase()+normalizedSource.slice(1);
-        seeded = `Common mistake: ${lowered}`;
-      }
-      const cleaned = this._cleanSectionLines([seeded], mode)[0];
-      if(!cleaned) continue;
-      const sig = this._lineSignature(cleaned);
-      if(!sig || seen.has(sig)) continue;
-      seen.add(sig);
-      out.push(cleaned);
-      if(out.length>=maxCount) break;
-    }
-    const fallbackTemplates = mode==='application'
-      ? [
-          'Apply one key concept to a concrete case, predict the outcome, and explain which evidence supports your prediction.',
-          'Use the lesson to design one decision checklist with measurable criteria for success.',
-          'Compare two options from the section and justify the better choice using specific evidence.',
-        ]
-      : mode==='misconception'
-        ? [
-            'Common mistake: memorizing terms without checking the evidence that supports them. Instead, cite one supporting detail before concluding.',
-            'Common mistake: treating each concept in isolation. Instead, explain how at least two concepts connect before answering.',
-            'Common mistake: ignoring numeric or outcome data. Instead, include at least one measurable fact in your explanation.',
-          ]
-        : [
-            'Focus on the central claim of the section and back it with one specific piece of evidence.',
-            'Explain how the most important concept connects to at least one other concept in the lesson.',
-            'Prioritize causal links: identify what changes, why it changes, and what outcome follows.',
-            'Separate core ideas from administrative details and keep only the information that supports understanding.',
-          ];
-    for(const template of fallbackTemplates) {
-      if(out.length>=minCount || out.length>=maxCount) break;
-      const cleaned = this._cleanSectionLines([template], mode)[0];
-      if(!cleaned) continue;
-      const sig = this._lineSignature(cleaned);
-      if(!sig || seen.has(sig)) continue;
-      seen.add(sig);
-      out.push(cleaned);
-    }
-    return out.slice(0, maxCount);
-  },
 
   _splitKeyTermEntry(text:string):{term:string;definition:string} {
     const line = this._repairHyphenatedWordBreaks(
@@ -898,39 +799,6 @@ const AI = {
     return false;
   },
 
-  _extractTermDefinitionFromSentence(sentence:string):{term:string;definition:string}|null {
-    const cleanSentence = this._normalizeReadableText(sentence, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24});
-    if(!cleanSentence) return null;
-    if(/[“”"]/.test(cleanSentence) && /—/.test(cleanSentence)) return null;
-
-    const tryPair = (rawTerm:string, rawDefinition:string):{term:string;definition:string}|null => {
-      const term = this._normalizeKeyTermLabel(rawTerm);
-      if(!term || this._isLowValueKeyTermCandidate(term)) return null;
-      let definition = this._compactDefinition(rawDefinition, 22);
-      if(!definition) return null;
-      definition = definition
-        .replace(new RegExp(`^${this._escapeRegExp(term)}\\s*[:\\-–—]?\\s*`, 'i'),'')
-        .replace(/^(is|are|means|refers to|describes|represents|involves|defines)\s+/i,'')
-        .trim();
-      definition = this._compactDefinition(definition, 22);
-      if(this._isWeakKeyTermDefinition(definition)) return null;
-      return {term, definition};
-    };
-
-    const colonMatch = cleanSentence.match(/^([A-Za-z][A-Za-z0-9/&'() -]{1,48}?)\s*[:\-–—]\s+(.+)$/);
-    if(colonMatch?.[1] && colonMatch?.[2]) {
-      const pair = tryPair(colonMatch[1], colonMatch[2]);
-      if(pair) return pair;
-    }
-
-    const verbMatch = cleanSentence.match(/^([A-Za-z][A-Za-z0-9/&'() -]{1,48}?)\s+(?:is|are|means|refers to|describes|represents|involves|defines|is the process of|is the practice of)\s+(.+)$/i);
-    if(verbMatch?.[1] && verbMatch?.[2]) {
-      const pair = tryPair(verbMatch[1], verbMatch[2]);
-      if(pair) return pair;
-    }
-
-    return null;
-  },
 
   _isLowValueKeyTermCandidate(term:string):boolean {
     const t = safeStr(term||'').toLowerCase().replace(/\s+/g,' ').trim();
@@ -982,90 +850,7 @@ const AI = {
     return out;
   },
 
-  _extractFallbackKeyTermsFromLesson(lesson:string, maxTerms:number=8):string[] {
-    const out:string[] = [];
-    const seen = new Set<string>();
-    const sentences = this._splitIntoSentences(lesson, 260)
-      .map(s=>this._normalizeReadableText(s, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24}))
-      .filter(Boolean)
-      .filter(s=>!this._isLowValueSummarySentence(s));
-    for(const sentence of sentences) {
-      if(out.length>=maxTerms) break;
-      const pair = this._extractTermDefinitionFromSentence(sentence);
-      if(!pair) continue;
-      const sig = this._lineSignature(pair.term);
-      if(!sig || seen.has(sig)) continue;
-      seen.add(sig);
-      out.push(`${pair.term}: ${pair.definition}`);
-    }
-    if(out.length<maxTerms) {
-      for(const sentence of sentences) {
-        if(out.length>=maxTerms) break;
-        const inlineMatch = sentence.match(/\b([A-Za-z][A-Za-z0-9/&'() -]{2,38}?)\s+(?:is|are|means|refers to|describes|represents|involves|defines)\s+([^.!?]{18,240})/i);
-        if(!inlineMatch?.[1] || !inlineMatch?.[2]) continue;
-        const pair = this._extractTermDefinitionFromSentence(`${inlineMatch[1]}: ${inlineMatch[2]}`);
-        if(!pair) continue;
-        const sig = this._lineSignature(pair.term);
-        if(!sig || seen.has(sig)) continue;
-        seen.add(sig);
-        out.push(`${pair.term}: ${pair.definition}`);
-      }
-    }
-    return this._cleanKeyTerms(out, maxTerms);
-  },
 
-  _extractKeyTermsFromConceptHeadings(lesson:string, maxTerms:number=6):string[] {
-    const out:string[] = [];
-    const seen = new Set<string>();
-    const blocks = safeStr(lesson||'')
-      .split(/\n{2,}/)
-      .map(block=>block.trim())
-      .filter(Boolean);
-    for(const block of blocks) {
-      if(out.length>=maxTerms) break;
-      const headingMatch = block.match(/^Concept\s+\d+\s*:\s*([^\n.]{2,80})/i);
-      if(!headingMatch?.[1]) continue;
-      const term = this._normalizeKeyTermLabel(headingMatch[1]);
-      if(!term || this._isLowValueKeyTermCandidate(term)) continue;
-      const sig = this._lineSignature(term);
-      if(!sig || seen.has(sig)) continue;
-      const body = block
-        .replace(/^Concept\s+\d+\s*:\s*[^\n]+/i,'')
-        .trim();
-      const sentences = this._splitIntoSentences(body, 12)
-        .map(s=>this._normalizeReadableText(s, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24}))
-        .filter(Boolean);
-      let definition = '';
-      for(const sentence of sentences) {
-        if(/\b(learning objectives?|today'?s plan|looking ahead|assignment|quiz|due|deadline|guest speaker)\b/i.test(sentence)) continue;
-        definition = this._compactDefinition(sentence, 22);
-        if(!this._isWeakKeyTermDefinition(definition)) break;
-        definition = '';
-      }
-      if(!definition) continue;
-      seen.add(sig);
-      out.push(`${term}: ${definition}`);
-    }
-    return this._cleanKeyTerms(out, maxTerms);
-  },
-
-  _mergeKeyTerms(primary:any, secondary:any, maxTerms:number=8):string[] {
-    const out:string[] = [];
-    const seen = new Set<string>();
-    const add = (items:any) => {
-      for(const item of this._cleanKeyTerms(items||[], maxTerms*2)) {
-        const term = safeStr(item.split(':')[0]||'').trim();
-        const sig = this._lineSignature(term);
-        if(!sig || seen.has(sig)) continue;
-        seen.add(sig);
-        out.push(item);
-        if(out.length>=maxTerms) break;
-      }
-    };
-    add(primary);
-    if(out.length<maxTerms) add(secondary);
-    return out.slice(0, maxTerms);
-  },
 
   _lineSignature(text:string):string {
     return safeStr(text||'')
@@ -1080,50 +865,18 @@ const AI = {
 
   _polishSectionOverview(overview:SectionOverview):SectionOverview {
     const lesson = this._normalizeLessonText(overview.lesson);
-    const keyPrinciples = this._fillSectionLinesFromLesson(overview.keyPrinciples||[], lesson, 'generic', 4, 8);
-    const practicalApplications = this._fillSectionLinesFromLesson(overview.practicalApplications||[], lesson, 'application', 3, 3);
-    const commonMisconceptions = this._fillSectionLinesFromLesson(overview.commonMisconceptions||[], lesson, 'misconception', 2, 3);
-    const keyTermsBase = this._cleanKeyTerms(overview.keyTerms||[], 10);
-    const keyTermsFallback = this._extractFallbackKeyTermsFromLesson(lesson, 8);
-    const keyTermsFromHeadings = this._extractKeyTermsFromConceptHeadings(lesson, 6);
-    const mergedKeyTerms = this._mergeKeyTerms(keyTermsBase, keyTermsFallback, 10);
-    const keyTerms = this._mergeKeyTerms(mergedKeyTerms, keyTermsFromHeadings, 10);
+    // Clean existing arrays — don't try to fill from lesson extraction or merge derived terms
+    const keyPrinciples = this._cleanSectionLines(overview.keyPrinciples||[]).slice(0, 8);
+    const practicalApplications = this._cleanSectionLines(overview.practicalApplications||[], 'application').slice(0, 3);
+    const commonMisconceptions = this._cleanSectionLines(overview.commonMisconceptions||[], 'misconception').slice(0, 3);
+    const keyTerms = this._cleanKeyTerms(overview.keyTerms||[], 10);
 
-    const ensuredPrinciples = [...keyPrinciples];
-    while(ensuredPrinciples.length<4) {
-      const fallback = this._cleanSectionLines([
-        'Focus on the core claim of this section and connect it to one concrete supporting detail.',
-      ], 'generic')[0];
-      if(!fallback) break;
-      if(ensuredPrinciples.some(line=>this._lineSignature(line)===this._lineSignature(fallback))) break;
-      ensuredPrinciples.push(fallback);
-    }
-
-    const ensuredApplications = [...practicalApplications];
-    while(ensuredApplications.length<3) {
-      const fallback = this._cleanSectionLines([
-        'Apply one lesson concept to a real scenario, then measure the result to verify your conclusion.',
-      ], 'application')[0];
-      if(!fallback) break;
-      if(ensuredApplications.some(line=>this._lineSignature(line)===this._lineSignature(fallback))) break;
-      ensuredApplications.push(fallback);
-    }
-
-    const ensuredMisconceptions = [...commonMisconceptions];
-    while(ensuredMisconceptions.length<2) {
-      const fallback = this._cleanSectionLines([
-        'Common mistake: answering from memory alone. Instead, use direct lesson evidence before finalizing your answer.',
-      ], 'misconception')[0];
-      if(!fallback) break;
-      if(ensuredMisconceptions.some(line=>this._lineSignature(line)===this._lineSignature(fallback))) break;
-      ensuredMisconceptions.push(fallback);
-    }
     return {
       lesson,
-      keyPrinciples: ensuredPrinciples.slice(0, 8),
+      keyPrinciples,
       keyTerms,
-      practicalApplications: ensuredApplications.slice(0, 3),
-      commonMisconceptions: ensuredMisconceptions.slice(0, 3),
+      practicalApplications,
+      commonMisconceptions,
       summary: this._normalizeReadableText(overview.summary, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:22}),
       loaded:true,
     };
@@ -1396,23 +1149,6 @@ const AI = {
     return shared / Math.max(1, Math.min(ta.size, tb.size));
   },
 
-  _hasExcessiveLessonRepetition(lesson:string):boolean {
-    const paragraphs = safeStr(lesson||'')
-      .split(/\n{2,}/)
-      .map(p=>p.replace(/\s+/g,' ').trim())
-      .filter(p=>p.length>=70);
-    if(paragraphs.length<4) return false;
-    let comparisons = 0;
-    let similarPairs = 0;
-    for(let i=0;i<paragraphs.length;i++) {
-      for(let j=i+1;j<paragraphs.length;j++) {
-        comparisons += 1;
-        if(this._overlapSimilarity(paragraphs[i], paragraphs[j]) >= 0.82) similarPairs += 1;
-      }
-    }
-    if(comparisons===0) return false;
-    return similarPairs >= Math.max(2, Math.floor(comparisons * 0.28));
-  },
 
   _extractSourceTerms(text:string, maxTerms:number=18):string[] {
     const src = safeStr(text||'').trim();
@@ -1458,101 +1194,6 @@ const AI = {
     return safeStr(value||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
   },
 
-  _deriveKeyTerms(
-    section:{title:string;description:string;concepts:{name:string;description:string}[]},
-    sourceContent:string,
-    lessonText:string,
-    maxTerms:number=8
-  ):string[] {
-    const source = this._stripIrrelevantDocumentNoise(safeStr(sourceContent||'')) || safeStr(sourceContent||'');
-    const lesson = safeStr(lessonText||'');
-    const sentencePool = this._splitIntoSentences(`${source}\n${lesson}`, 1800)
-      .map(s=>this._normalizeReadableText(s, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24}))
-      .filter(Boolean)
-      .filter(s=>!this._isLowValueSummarySentence(s));
-    const derivedPairs = sentencePool
-      .map(sentence=>this._extractTermDefinitionFromSentence(sentence))
-      .filter((pair): pair is {term:string;definition:string} => !!pair);
-    const out:string[] = [];
-    const seenTerms = new Set<string>();
-    const findDefinitionForTerm = (term:string):string => {
-      const normalizedTerm = this._normalizeKeyTermLabel(term);
-      if(!normalizedTerm) return '';
-      const termLower = normalizedTerm.toLowerCase();
-      const escaped = this._escapeRegExp(normalizedTerm);
-      const termPattern = new RegExp(`\\b${escaped}\\b`, 'i');
-      const cuePattern = new RegExp(`\\b${escaped}\\b\\s*(?:[:\\-–—]|is|are|means|refers to|describes|represents|involves|defines)\\b`, 'i');
-      const candidates = sentencePool
-        .filter(s=>termPattern.test(s))
-        .filter(s=>!/\b(learning objectives?|chapter|today'?s plan|looking ahead|quiz|assignment|due|deadline|guest speaker)\b/i.test(s))
-        .map(sentence=>{
-          let score = 0;
-          const wc = this._wordCount(sentence);
-          if(cuePattern.test(sentence)) score += 3;
-          if(/\b(is|are|means|refers to|describes|represents|involves|defines)\b/i.test(sentence)) score += 1.4;
-          if(wc>=7 && wc<=26) score += 1.2;
-          if(/\b(\d{4}|%|\$|million|billion|revenue|cost|users?|customers?)\b/i.test(sentence)) score += 0.5;
-          if(sentence.toLowerCase().startsWith(termLower)) score += 0.8;
-          return {sentence, score};
-        })
-        .sort((a,b)=>b.score-a.score);
-      if(candidates[0]?.sentence) return candidates[0].sentence;
-      const matchedPair = derivedPairs.find(pair=>this._lineSignature(pair.term)===this._lineSignature(normalizedTerm));
-      return matchedPair ? `${matchedPair.term}: ${matchedPair.definition}` : '';
-    };
-    const pushTerm = (rawTerm:string, rawDefinition:string) => {
-      const term = this._normalizeKeyTermLabel(rawTerm);
-      if(!term || this._isLowValueKeyTermCandidate(term)) return;
-      const termSig = term.toLowerCase();
-      if(seenTerms.has(termSig)) return;
-      const parsedPair = this._extractTermDefinitionFromSentence(`${term}: ${rawDefinition}`);
-      let definition = parsedPair?.definition || this._compactDefinition(rawDefinition, 22);
-      if(!definition) return;
-      const leadingTerm = new RegExp(`^${this._escapeRegExp(term)}\\s*[:\\-–—]?\\s*`, 'i');
-      definition = definition.replace(leadingTerm,'').trim();
-      definition = definition.replace(/^(is|are|means|refers to|describes|represents|involves|defines)\s+/i,'').trim();
-      definition = this._compactDefinition(definition, 22);
-      if(this._isWeakKeyTermDefinition(definition)) return;
-      out.push(`${term}: ${definition}`);
-      seenTerms.add(termSig);
-    };
-
-    const concepts = Array.isArray(section?.concepts) ? section.concepts : [];
-    for(const c of concepts) {
-      const conceptName = safeStr(c?.name||'').trim();
-      if(!conceptName) continue;
-      const conceptDesc = safeStr(c?.description||'').trim();
-      const sourceSentence = findDefinitionForTerm(conceptName);
-      const conceptDefinition = sourceSentence || (!this._isWeakKeyTermDefinition(conceptDesc) ? conceptDesc : '');
-      if(conceptDefinition) pushTerm(conceptName, conceptDefinition);
-      if(out.length>=maxTerms) break;
-    }
-
-    if(out.length<maxTerms) {
-      for(const pair of derivedPairs) {
-        if(out.length>=maxTerms) break;
-        pushTerm(pair.term, pair.definition);
-      }
-    }
-
-    if(out.length<maxTerms) {
-      const candidates = this._extractSourceTerms(
-        `${safeStr(section?.title||'')} ${safeStr(section?.description||'')} ${source}`,
-        Math.max(maxTerms*3, 18)
-      );
-      for(const term of candidates) {
-        if(out.length>=maxTerms) break;
-        if(this._isLowValueKeyTermCandidate(term)) continue;
-        const termLabel = this._normalizeKeyTermLabel(term);
-        if(!termLabel) continue;
-        const sourceSentence = findDefinitionForTerm(termLabel);
-        if(!sourceSentence) continue;
-        pushTerm(termLabel, sourceSentence);
-      }
-    }
-
-    return this._cleanKeyTerms(out, maxTerms);
-  },
 
   _stripIrrelevantDocumentNoise(text:string):string {
     const raw = safeStr(text||'').replace(/\r/g,'\n').trim();
@@ -1591,155 +1232,6 @@ const AI = {
     return this._titleFromTerm(clean);
   },
 
-  _isLowValueSummarySentence(sentence:string):boolean {
-    const s = safeStr(sentence||'').replace(/\s+/g,' ').trim();
-    if(!s) return true;
-    const wc = this._wordCount(s);
-    if(wc<6) return true;
-    if(wc>65) return true;
-    if(/^\d+\s*\/\s*\d+$/.test(s)) return true;
-    if(/^page\s+\d+(\s+of\s+\d+)?$/i.test(s)) return true;
-    if(/^(table|figure|exhibit)\s+\d+/i.test(s)) return true;
-    if(/\b(all rights reserved|copyright|isbn|published by|references?|bibliography|appendix|table of contents)\b/i.test(s)) return true;
-    if(/\b(treat this as|strict summary|cite exact lines|keep the wording aligned|uploaded segment)\b/i.test(s)) return true;
-    const letters = s.replace(/[^A-Za-z]/g,'').length;
-    const digitRatio = (s.match(/[0-9]/g)||[]).length / Math.max(1,s.length);
-    if(letters<Math.max(14,Math.floor(s.length*0.32))) return true;
-    if(digitRatio>0.38) return true;
-    return false;
-  },
-
-  _scoreSummarySentence(sentence:string, focusTerms:string[]):number {
-    const s = safeStr(sentence||'').replace(/\s+/g,' ').trim();
-    const lower = s.toLowerCase();
-    const wc = this._wordCount(s);
-    let score = Math.min(2.6, wc / 16);
-    const hits = focusTerms.reduce((sum,term)=>sum + (lower.includes(term) ? 1 : 0), 0);
-    score += hits * 1.25;
-    if(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,}/.test(s)) score += 0.55;
-    if(/\b(\d{4}|%|\$|million|billion|funding|revenue|cost|growth|launched|pilot|beta|rejected|approved|market|users?|customers?)\b/i.test(s)) score += 1.05;
-    if(/\b(because|therefore|however|instead|despite|although|after|before|resulted|led to)\b/i.test(lower)) score += 0.4;
-    return score;
-  },
-
-  _extractImportantSummarySentences(source:string, focusTerms:string[], maxSentences:number):string[] {
-    const sentences = this._splitIntoSentences(source, 1200)
-      .map(s=>safeStr(s||'').replace(/\s+/g,' ').trim())
-      .filter(Boolean)
-      .filter(s=>!this._isLowValueSummarySentence(s));
-    if(!sentences.length) return [];
-    const ranked = sentences.map((sentence,index)=>({
-      sentence,
-      index,
-      score:this._scoreSummarySentence(sentence, focusTerms),
-      sig:this._lineSignature(sentence),
-    })).sort((a,b)=>b.score-a.score || a.index-b.index);
-    const chosen:{sentence:string;index:number;sig:string}[] = [];
-    for(const row of ranked) {
-      if(chosen.length>=maxSentences) break;
-      if(!row.sig) continue;
-      const duplicate = chosen.some(c=>c.sig===row.sig || this._overlapSimilarity(c.sentence, row.sentence)>=0.86);
-      if(duplicate) continue;
-      chosen.push({sentence:row.sentence,index:row.index,sig:row.sig});
-    }
-    return chosen.sort((a,b)=>a.index-b.index).map(c=>c.sentence);
-  },
-
-  _extractCoverageDrivenSentences(source:string, focusTerms:string[], maxSentences:number):string[] {
-    const sentences = this._splitIntoSentences(source, 1400)
-      .map(s=>safeStr(s||'').replace(/\s+/g,' ').trim())
-      .filter(Boolean)
-      .filter(s=>!this._isLowValueSummarySentence(s));
-    if(!sentences.length) return [];
-    const rows = sentences.map((sentence,index)=>({
-      sentence,
-      index,
-      sig:this._lineSignature(sentence),
-      score:this._scoreSummarySentence(sentence, focusTerms),
-    }));
-    const selected:{sentence:string;index:number;sig:string}[] = [];
-    const addRow = (row:{sentence:string;index:number;sig:string}) => {
-      if(!row.sig) return;
-      const duplicate = selected.some(s=>s.sig===row.sig || this._overlapSimilarity(s.sentence, row.sentence)>=0.86);
-      if(duplicate) return;
-      selected.push(row);
-    };
-    const ranked = [...rows].sort((a,b)=>b.score-a.score || a.index-b.index);
-    const seedTarget = Math.max(2, Math.min(maxSentences, Math.ceil(maxSentences * 0.55)));
-    for(const row of ranked) {
-      if(selected.length>=seedTarget) break;
-      addRow(row);
-    }
-    const categoryPatterns = [
-      /\b(\d{4}|%|\$|million|billion|thousand|revenue|cost|profit|loss|users?|customers?|market share|valuation)\b/i,
-      /\b(decided|decision|launched|built|founded|funded|raised|rejected|approved|pivot|partnered|acquired|hired)\b/i,
-      /\b(challenge|constraint|risk|problem|limited|competition|pressure|deadline|barrier|uncertainty)\b/i,
-      /\b(resulted|led to|therefore|however|despite|outcome|impact|grew|declined|improved|worsened|because)\b/i,
-    ];
-    for(const pattern of categoryPatterns) {
-      if(selected.length>=maxSentences) break;
-      const candidate = [...rows]
-        .filter(r=>pattern.test(r.sentence))
-        .sort((a,b)=>b.score-a.score || a.index-b.index)[0];
-      if(candidate) addRow(candidate);
-    }
-    const windowCount = Math.max(2, Math.min(4, Math.ceil(rows.length / 8)));
-    const windowSize = Math.max(1, Math.ceil(rows.length / windowCount));
-    for(let w=0; w<windowCount && selected.length<maxSentences; w++) {
-      const start = w * windowSize;
-      const slice = rows.slice(start, start + windowSize);
-      if(!slice.length) continue;
-      const best = [...slice].sort((a,b)=>b.score-a.score || a.index-b.index)[0];
-      if(best) addRow(best);
-    }
-    for(const row of ranked) {
-      if(selected.length>=maxSentences) break;
-      addRow(row);
-    }
-    return selected
-      .sort((a,b)=>a.index-b.index)
-      .slice(0, maxSentences)
-      .map(r=>r.sentence);
-  },
-
-  _sourceTermCoverageRatio(text:string, sourceTerms:string[]):number {
-    const terms = (sourceTerms||[]).map(t=>safeStr(t||'').toLowerCase().trim()).filter(Boolean);
-    if(!terms.length) return 1;
-    const lower = safeStr(text||'').toLowerCase();
-    if(!lower) return 0;
-    const matched = terms.filter(t=>lower.includes(t)).length;
-    return matched / terms.length;
-  },
-
-  _passesStrictOverviewEvidence(lesson:string, source:string, conceptNames:string[]):boolean {
-    const lessonText = safeStr(lesson||'').replace(/\s+/g,' ').trim();
-    const sourceText = safeStr(source||'').replace(/\s+/g,' ').trim();
-    if(!lessonText || !sourceText) return false;
-    const lessonLower = lessonText.toLowerCase();
-    const concepts = (conceptNames||[])
-      .map(c=>safeStr(c||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim())
-      .filter(Boolean);
-    if(concepts.length>=2) {
-      const hits = concepts.filter(name=>lessonLower.includes(name)).length;
-      if((hits / concepts.length) < 0.72) return false;
-    }
-    const evidenceCategories = [
-      {source:/\b(\d{2,4}|%|\$|million|billion|thousand|revenue|cost|users?|customers?)\b/i, lesson:/\b(\d{2,4}|%|\$|million|billion|thousand|revenue|cost|users?|customers?)\b/i},
-      {source:/\b(decided|decision|launched|built|founded|funded|raised|rejected|approved|pivot|partnered|acquired|hired)\b/i, lesson:/\b(decided|decision|launched|built|founded|funded|raised|rejected|approved|pivot|partnered|acquired|hired)\b/i},
-      {source:/\b(challenge|constraint|risk|problem|limited|competition|pressure|deadline|barrier|uncertainty)\b/i, lesson:/\b(challenge|constraint|risk|problem|limited|competition|pressure|deadline|barrier|uncertainty)\b/i},
-      {source:/\b(resulted|led to|therefore|however|despite|outcome|impact|grew|declined|improved|worsened|because)\b/i, lesson:/\b(resulted|led to|therefore|however|despite|outcome|impact|grew|declined|improved|worsened|because)\b/i},
-    ];
-    let required = 0;
-    let covered = 0;
-    for(const cat of evidenceCategories) {
-      if(cat.source.test(sourceText)) {
-        required += 1;
-        if(cat.lesson.test(lessonText)) covered += 1;
-      }
-    }
-    if(required>0 && covered < Math.max(1, Math.ceil(required * 0.75))) return false;
-    return true;
-  },
 
   _pickBestSentenceForTerm(sentences:string[], term:string, used:Set<number>):string {
     const cleanTerm = safeStr(term||'').toLowerCase().trim();
@@ -2006,298 +1498,7 @@ const AI = {
     };
   },
 
-  _buildSourceBackedSectionOverview(
-    section:{title:string;description:string;concepts:{name:string;description:string}[]},
-    topicTitle:string,
-    sourceContent:string,
-    sourceMode:'expand'|'strict'
-  ):SectionOverview {
-    const rawSource = safeStr(sourceContent||'').trim();
-    const cleanedSource = this._stripIrrelevantDocumentNoise(rawSource) || rawSource;
-    const strictStrategy = sourceMode==='strict' ? this._strictSourceStrategy(cleanedSource) : 'segment_summary';
-    const baseConcepts = Array.isArray(section.concepts) ? section.concepts : [];
-    if(sourceMode==='strict' && strictStrategy==='verbatim') {
-      const conceptVerbatim = baseConcepts
-        .map(c=>safeStr(c?.description||'').trim())
-        .filter(Boolean)
-        .join('\n\n')
-        .trim();
-      const rawVerbatim = safeStr(conceptVerbatim || this._resolveSectionSourceSlice(section, cleanedSource) || cleanedSource).trim();
-      const exactText = this._stripIrrelevantDocumentNoise(rawVerbatim) || rawVerbatim;
-      const verbatimSentences = this._splitIntoSentences(exactText, 120);
-      const pickVerbatim = (count:number, start:number):string[] => {
-        const out:string[] = [];
-        const seen = new Set<string>();
-        for(let i=start;i<verbatimSentences.length && out.length<count;i++) {
-          const line = safeStr(verbatimSentences[i]||'').trim();
-          if(!line) continue;
-          const sig = this._lineSignature(line);
-          if(!sig || seen.has(sig)) continue;
-          seen.add(sig);
-          out.push(line);
-        }
-        return out;
-      };
-      const keyPrinciples = pickVerbatim(5, 0);
-      const practicalApplications = pickVerbatim(3, keyPrinciples.length);
-      const commonMisconceptions = pickVerbatim(2, keyPrinciples.length + practicalApplications.length);
-      while(keyPrinciples.length<4) {
-        const fallback = safeStr(verbatimSentences[keyPrinciples.length] || verbatimSentences[0] || exactText).trim();
-        if(!fallback) break;
-        keyPrinciples.push(fallback);
-      }
-      while(practicalApplications.length<3) {
-        const idx = (keyPrinciples.length + practicalApplications.length) % Math.max(1, verbatimSentences.length);
-        const fallback = safeStr(verbatimSentences[idx] || exactText).trim();
-        if(!fallback) break;
-        practicalApplications.push(fallback);
-      }
-      while(commonMisconceptions.length<2) {
-        const idx = (keyPrinciples.length + practicalApplications.length + commonMisconceptions.length) % Math.max(1, verbatimSentences.length);
-        const fallback = safeStr(verbatimSentences[idx] || exactText).trim();
-        if(!fallback) break;
-        commonMisconceptions.push(fallback);
-      }
-      const summary = safeStr(verbatimSentences.slice(0,2).join(' ') || exactText).trim();
-      const keyTerms = this._deriveKeyTerms(section, exactText, exactText, 8);
-      return this._polishSectionOverview({
-        lesson: exactText,
-        keyPrinciples: keyPrinciples.slice(0,7),
-        keyTerms,
-        practicalApplications: practicalApplications.slice(0,3),
-        commonMisconceptions: commonMisconceptions.slice(0,3),
-        summary,
-        loaded:true,
-      });
-    }
-    if(sourceMode==='strict' && strictStrategy==='segment_summary') {
-      const scopedSource = this._stripIrrelevantDocumentNoise(this._resolveSectionSourceSlice(section, cleanedSource) || cleanedSource) || cleanedSource;
-      const headingLabels = this._extractHeadingLinesFromText(scopedSource, 7)
-        .map(h=>this._normalizeConceptLabel(h))
-        .filter(Boolean);
-      const sectionLabels = baseConcepts
-        .map(c=>this._normalizeConceptLabel(c?.name||''))
-        .filter(Boolean);
-      const termLabels = this._extractSourceTerms(scopedSource, 10)
-        .map(t=>this._normalizeConceptLabel(t))
-        .filter(Boolean);
-      const allLabels = [...headingLabels, ...sectionLabels, ...termLabels];
-      const dedupedLabels:string[] = [];
-      const seenLabelSigs = new Set<string>();
-      for(const label of allLabels) {
-        const sig = this._lineSignature(label);
-        if(!label || !sig || seenLabelSigs.has(sig)) continue;
-        seenLabelSigs.add(sig);
-        dedupedLabels.push(label);
-        if(dedupedLabels.length>=5) break;
-      }
-      const conceptCount = Math.max(2, Math.min(4, dedupedLabels.length || 3));
-      const conceptLabels = dedupedLabels.length
-        ? dedupedLabels.slice(0, conceptCount)
-        : Array.from({length:conceptCount},(_,i)=>`Key Segment Point ${i+1}`);
-      const focusTerms = this._extractSourceTerms(
-        `${safeStr(section?.title||'')} ${safeStr(section?.description||'')} ${conceptLabels.join(' ')}`,
-        18
-      );
-      const targetSentenceCount = Math.max(10, Math.min(18, Math.ceil(this._wordCount(scopedSource) / 95)));
-      let keySentences = this._extractCoverageDrivenSentences(scopedSource, focusTerms, targetSentenceCount);
-      if(!keySentences.length) {
-        keySentences = this._extractImportantSummarySentences(scopedSource, focusTerms, targetSentenceCount);
-      }
-      if(!keySentences.length) {
-        keySentences = this._splitIntoSentences(scopedSource, targetSentenceCount + 4).slice(0, targetSentenceCount);
-      }
-      const lessonParts:string[] = [];
-      const perConcept = Math.max(2, Math.ceil(Math.max(1, keySentences.length) / conceptLabels.length));
-      for(let i=0;i<conceptLabels.length;i++) {
-        const start = i * perConcept;
-        const block = keySentences.slice(start, start + perConcept);
-        const backup = keySentences[i] ? [keySentences[i]] : [];
-        const body = [...(block.length ? block : backup)]
-          .join(' ')
-          .replace(/\s+/g,' ')
-          .trim();
-        if(!body) continue;
-        lessonParts.push(`Concept ${i+1}: ${conceptLabels[i]}.\n\n${body}`);
-      }
-      if(!lessonParts.length) {
-        const fallbackBody = safeStr(keySentences.slice(0,4).join(' ') || scopedSource).replace(/\s+/g,' ').trim();
-        lessonParts.push(`Concept 1: Segment Overview.\n\n${fallbackBody}`);
-      }
-      const keyPrinciples = this._cleanSectionLines(
-        keySentences.slice(0,7).map(s=>safeStr(s).replace(/\s+/g,' ').trim())
-      ).slice(0,7);
-      const practicalCandidates = keySentences.filter(s=>/\b(launched|used|tested|built|sold|priced|funded|rejected|approved|market|customer|users?|revenue|cost|pilot|beta|strategy|decision)\b/i.test(s));
-      const practicalApplications = this._cleanSectionLines(practicalCandidates, 'application').slice(0,3);
-      for(let i=0; practicalApplications.length<3 && i<keySentences.length; i++) {
-        const candidate = safeStr(keySentences[i]||'').trim();
-        if(!candidate) continue;
-        if(practicalApplications.some(existing=>this._lineSignature(existing)===this._lineSignature(candidate))) continue;
-        const cleaned = this._cleanSectionLines([candidate], 'application')[0];
-        if(!cleaned) continue;
-        practicalApplications.push(cleaned);
-      }
-      const summary = safeStr(keySentences.slice(0,2).join(' ') || keySentences[0] || scopedSource).replace(/\s+/g,' ').trim();
-      const keyTerms = this._deriveKeyTerms(section, scopedSource, lessonParts.join('\n\n'), 8);
-      return this._polishSectionOverview({
-        lesson: lessonParts.join('\n\n'),
-        keyPrinciples: keyPrinciples.length ? keyPrinciples : conceptLabels.map(l=>`${l}: anchor your answer to evidence from this segment.`).slice(0,4),
-        keyTerms,
-        practicalApplications: practicalApplications.length ? practicalApplications.slice(0,3) : ['Apply this section by referencing specific evidence and outcomes from the segment.'],
-        commonMisconceptions: [
-          'Mixing details from other sections can distort this segment\'s conclusions.',
-          'Ignoring timeline, numeric outcomes, or decision constraints weakens interpretation.',
-          'Answering from memory instead of this segment\'s evidence reduces strict-mode accuracy.',
-        ],
-        summary,
-        loaded:true,
-      });
-    }
-    const scopedSource = sourceMode==='strict'
-      ? (this._stripIrrelevantDocumentNoise(this._resolveSectionSourceSlice(section, cleanedSource) || cleanedSource) || cleanedSource)
-      : cleanedSource;
-    const sentences = this._splitIntoSentences(scopedSource, 480);
-    const used = new Set<number>();
-    const lessonParts:string[] = [];
-    const principles:string[] = [];
-    const applications:string[] = [];
-    const misconceptions:string[] = [];
-    const fallbackConcepts = this._extractSourceTerms(
-      `${safeStr(section.title||'')}\n${safeStr(section.description||'')}\n${scopedSource}`,
-      6
-    ).map(t=>({name:this._titleFromTerm(t),description:''})).filter(c=>this._wordCount(c.name)>=2);
-    const concepts = (baseConcepts.length ? baseConcepts : fallbackConcepts).slice(0, 6);
-    if(!concepts.length) {
-      concepts.push({
-        name: 'Core Ideas',
-        description: safeStr(section.description||'').trim() || safeStr(this._splitIntoSentences(scopedSource, 24)[0]||'').trim(),
-      });
-    }
-    const cleanConceptDescription = (text:string):string => safeStr(text||'')
-      .replace(/^from your notes:\s*/i,'')
-      .replace(/keep this concept[^.]*\./gi,'')
-      .replace(/expand it[^.]*\./gi,'')
-      .replace(/\s+/g,' ')
-      .trim();
-    for(let i=0;i<concepts.length;i++) {
-      const c = concepts[i];
-      const conceptName = safeStr(c?.name||`Concept ${i+1}`).trim();
-      const conceptDesc = cleanConceptDescription(c?.description||'');
-      const evidenceLines = this._collectEvidenceSentences(
-        sentences,
-        conceptName,
-        conceptDesc || safeStr(section.title||''),
-        used,
-        3
-      );
-      const firstEvidence = evidenceLines.slice(0,2).join(' ').replace(/\s+/g,' ').trim();
-      const extraEvidence = safeStr(evidenceLines[2]||'').replace(/\s+/g,' ').trim();
-      const lead = firstEvidence || conceptDesc || `${conceptName} is one of the core ideas in this chapter segment.`;
-      const relatedConcept = concepts[(i+1)%concepts.length]?.name;
-      const relationLine = relatedConcept && relatedConcept!==conceptName
-        ? `${conceptName} links closely with ${relatedConcept}, so they should be reviewed together rather than in isolation.`
-        : `${conceptName} should be reviewed with nearby ideas so the logic stays connected.`;
-      const studyLine = sourceMode==='strict'
-        ? 'Treat this as a strict summary of this uploaded segment, and cite exact lines from your notes when answering questions.'
-        : 'After grounding in the notes, add one short real-world example and predict a measurable outcome to deepen understanding.';
-      lessonParts.push(
-        `Concept ${i+1}: ${conceptName}.\n\n` +
-        `${lead}\n\n` +
-        `${extraEvidence ? `${extraEvidence} ` : ''}${relationLine} ${studyLine}`.replace(/\s+/g,' ').trim()
-      );
-      principles.push(`${conceptName}: ${(firstEvidence || conceptDesc || lead).substring(0,180).trim()}`);
-      applications.push(sourceMode==='strict'
-        ? `Use one direct line from your notes about "${conceptName}", then explain what decision or conclusion that line supports.`
-        : `Apply "${conceptName}" to a fresh scenario, predict one measurable change, and compare it with evidence from your notes.`);
-      misconceptions.push(sourceMode==='strict'
-        ? `Describing "${conceptName}" from memory without citing the exact note evidence behind it.`
-        : `Adding outside ideas about "${conceptName}" without first anchoring the explanation in your uploaded notes.`);
-    }
-    while(principles.length<4) {
-      principles.push(
-        principles.length===3
-          ? `Cross-concept links: explain how ${concepts[0]?.name||'the first idea'} and ${concepts[1]?.name||'the next idea'} reinforce each other in the chapter.`
-          : 'Evidence trace: tie every major claim back to one exact sentence in the uploaded material.'
-      );
-    }
-    while(applications.length<3) {
-      applications.push(
-        sourceMode==='strict'
-          ? 'Build a mini-quiz from your notes and answer each item using direct citations from the uploaded chapter.'
-          : 'Create one scenario that combines at least two concepts, then check whether your predicted outcome matches the notes.'
-      );
-    }
-    while(misconceptions.length<2) {
-      misconceptions.push('Skipping concept connections and memorizing isolated facts usually causes weak quiz performance.');
-    }
-    const conceptNames = concepts.map(c=>safeStr(c.name||'').trim()).filter(Boolean);
-    const keyTerms = this._deriveKeyTerms(section, scopedSource, lessonParts.join('\n\n'), 8);
-    return this._polishSectionOverview({
-      lesson: lessonParts.join('\n\n'),
-      keyPrinciples: principles.slice(0,7),
-      keyTerms,
-      practicalApplications: applications.slice(0,3),
-      commonMisconceptions: misconceptions.slice(0,3),
-      summary: sourceMode==='strict'
-        ? `This overview is a strict summary of the ${section.title} segment from your uploaded notes: ${conceptNames.slice(0,4).join(', ')}.`
-        : `This overview starts from your notes for ${section.title} and adds targeted explanation so each concept is easier to apply in quiz, games, and podcast practice.`,
-      loaded:true,
-    });
-  },
 
-  _isWeakSectionOverview(
-    data:{lesson:string;keyPrinciples:string[];keyTerms?:string[];practicalApplications:string[];commonMisconceptions:string[];summary:string},
-    section:{title:string;description:string;concepts:{name:string;description:string}[]}
-  ):boolean {
-    const lesson = safeStr(data.lesson||'').replace(/\s+/g,' ').trim();
-    const summary = safeStr(data.summary||'').replace(/\s+/g,' ').trim();
-    const principles = this._cleanSectionLines(data.keyPrinciples||[]);
-    const keyTerms = this._cleanKeyTerms(data.keyTerms||[], 10);
-    const applications = this._cleanSectionLines(data.practicalApplications||[], 'application');
-    const misconceptions = this._cleanSectionLines(data.commonMisconceptions||[], 'misconception');
-    if(this._wordCount(lesson) < 220) return true;
-    if(this._wordCount(lesson) > 1700) return true;
-    if(this._wordCount(summary) < 14) return true;
-    if(principles.length < 4 || applications.length < 3 || misconceptions.length < 2) return true;
-    const requiredKeyTerms = Math.min(4, Math.max(2, (section.concepts||[]).length || 2));
-    if(keyTerms.length < requiredKeyTerms) return true;
-    const principleUniq = new Set(principles.map(x=>this._lineSignature(x))).size;
-    const keyTermUniq = new Set(keyTerms.map(x=>this._lineSignature(x))).size;
-    const appUniq = new Set(applications.map(x=>this._lineSignature(x))).size;
-    if(principleUniq < Math.max(3, Math.ceil(principles.length * 0.7))) return true;
-    if(keyTermUniq < Math.max(2, Math.ceil(keyTerms.length * 0.7))) return true;
-    if(appUniq < Math.max(2, Math.ceil(applications.length * 0.7))) return true;
-    const metaPattern = /\b(in this section|this section covers|we will explore|we will discuss|we're going to discuss|let's explore|i will explain|the following lesson)\b/i;
-    if(metaPattern.test(lesson) && this._wordCount(lesson) < 300) return true;
-    const genericAppPattern = /\b(apply these concepts|real[- ]world situations|daily life|look for examples)\b/i;
-    const genericAppCount = applications.filter(x=>genericAppPattern.test(x)).length;
-    if(genericAppCount >= 2) return true;
-    const sourceFailurePattern = /\b(source material does not contain|no readable text|appears to be .*binary|i can still provide a general outline|provided source material)\b/i;
-    if(sourceFailurePattern.test(lesson) || sourceFailurePattern.test(summary)) return true;
-    const rigidTemplatePattern = /\b(what it is:|why it matters:|apply it:|evidence from your notes:)\b/i;
-    if(rigidTemplatePattern.test(lesson)) return true;
-    const repeatedTemplateCount = (lesson.match(/A practical way to study it is/gi)||[]).length;
-    if(repeatedTemplateCount>=2) return true;
-    const repeatedImpactCount = (lesson.match(/directly affects how decisions are made and how outcomes are measured/gi)||[]).length;
-    if(repeatedImpactCount>=2) return true;
-    const repeatedMattersCount = (lesson.match(/This concept matters because/gi)||[]).length;
-    if(repeatedMattersCount>=2) return true;
-    if(this._hasExcessiveLessonRepetition(lesson)) return true;
-
-    const lessonLower = lesson.toLowerCase();
-    const conceptNames = (section.concepts||[]).map(c=>safeStr(c.name||'').toLowerCase().trim()).filter(Boolean);
-    if(conceptNames.length>0) {
-      let hits = 0;
-      for(const name of conceptNames) {
-        const base = name.replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();
-        if(!base) continue;
-        if(lessonLower.includes(base)) hits += 1;
-      }
-      const coverage = hits / conceptNames.length;
-      if(coverage < 0.6) return true;
-    }
-    return false;
-  },
 
   async callGroq(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000):Promise<string> {
     if(!_groqApiKey) { return ''; } // silent fail — call() handles missing key alerts
@@ -2748,156 +1949,151 @@ Return ONLY valid JSON:
     sourceContent?:string,
     sourceMode:'expand'|'strict'='expand'
   ):Promise<SectionOverview> {
-    if(sourceContent && sourceMode==='strict') {
-      const rawSource = safeStr(sourceContent||'').trim();
-      const cleanedSource = this._stripIrrelevantDocumentNoise(rawSource) || rawSource;
-      const strictStrategy = this._strictSourceStrategy(cleanedSource);
-      if(strictStrategy==='verbatim' || !_groqApiKey) {
-        // Verbatim strict mode and no-key mode stay deterministic and source-locked.
-        return this._buildSourceBackedSectionOverview(section, topicTitle, sourceContent, 'strict');
+    // --- Step 1: Clean source content ONCE (OCR repair, noise removal) ---
+    let cleanedSource = '';
+    if(sourceContent) {
+      const raw = safeStr(sourceContent||'').trim();
+      // Strip document noise (copyright, watermarks, course labels)
+      const stripped = this._stripIrrelevantDocumentNoise(raw) || raw;
+      // Repair common OCR/PDF split-word artifacts
+      cleanedSource = stripped
+        .replace(/(\w)\s*-\s*\n\s*(\w)/g, '$1$2')           // hyphenated line breaks: "infor-\nmation" → "information"
+        .replace(/(\w)\s+-\s+(\w)/g, (m,p1,p2) => {         // spaced hyphens: "infor - mation" → "information"
+          const joined = p1+p2;
+          if(/^[a-z]+$/i.test(joined) && joined.length>=4) return joined;
+          return m;
+        })
+        .replace(/([a-z])([A-Z])/g, '$1 $2')                // camelCase splits: "businessAnd" → "business And"
+        .replace(/([a-z])([\.\,\;\:])([A-Za-z])/g, '$1$2 $3') // missing space after punctuation
+        .replace(/\.\s*\d{1,2}\s+([A-Z])/g, '. $1')         // footnote numbers in text: ". 1 Revenue" → ". Revenue"
+        .replace(/^\s*\d{1,3}\s*$/gm, '')                    // standalone page/footnote numbers
+        .replace(/\s{2,}/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      // Scope to relevant section slice for long documents
+      if(this._wordCount(cleanedSource) > 1500) {
+        const scoped = this._resolveSectionSourceSlice(section, cleanedSource);
+        if(scoped && this._wordCount(scoped) >= 200) {
+          cleanedSource = this._stripIrrelevantDocumentNoise(scoped) || scoped;
+        }
       }
-      const scopedStrictSource = this._stripIrrelevantDocumentNoise(this._resolveSectionSourceSlice(section, cleanedSource) || cleanedSource) || cleanedSource;
-      const conceptNames = (section.concepts||[])
-        .map(c=>safeStr(c?.name||'').trim())
-        .filter(Boolean)
-        .slice(0,5);
-      const conceptList = conceptNames.length
-        ? conceptNames.map((name,i)=>`${i+1}. ${name}`).join('\n')
-        : '1. Segment Overview';
-      const strictPromptBase = `You are creating a STRICT section overview from the student's uploaded document segment.
+    }
 
-TOPIC: "${topicTitle}"
+    // --- Step 2: Require API key ---
+    if(!_groqApiKey) {
+      throw new Error('GROQ_API_KEY_MISSING');
+    }
+
+    // --- Step 3: Build the prompt ---
+    const concepts = (section.concepts||[]).slice(0, 6);
+    const conceptList = concepts.map((c,i)=>`${i+1}. "${c.name}" — ${c.description}`).join('\n');
+
+    // --- Step 3: Detect source content type and build adaptive prompt ---
+    let sourceBlock = '';
+    let sourceGuidance = '';
+    if(cleanedSource) {
+      const srcWordCount = this._wordCount(cleanedSource);
+      const lineCount = cleanedSource.split('\n').filter((l:string)=>l.trim().length>0).length;
+      const avgWordsPerLine = lineCount > 0 ? srcWordCount / lineCount : 0;
+      // Detect source density: sparse (slides/bullet notes), moderate (partial notes), rich (textbook/detailed)
+      const isSparse = srcWordCount < 300 || avgWordsPerLine < 8;
+      const isRich = srcWordCount > 800 && avgWordsPerLine > 15;
+
+      if(isSparse) {
+        sourceGuidance = `SOURCE TYPE: Brief notes or slide bullets (sparse content).
+HOW TO USE: These are outlines or key points — not full explanations. Use them to identify the topics and terminology to teach, then SIGNIFICANTLY EXPAND with your own expertise. Add thorough explanations, definitions, context, examples, and connections that the brief notes only hint at. You must stay within the subject matter indicated by the notes, but you should add depth and detail far beyond what appears here.`;
+      } else if(isRich) {
+        sourceGuidance = `SOURCE TYPE: Detailed notes or textbook content (rich content).
+HOW TO USE: This material is substantive. Study it, understand the key arguments and facts, then teach it in your own clean prose. Do not copy verbatim — reorganize and clarify. You may add better examples or clearer explanations, but keep the lesson grounded in what this material covers. Do not introduce entirely new topics outside the scope of the source.`;
+      } else {
+        sourceGuidance = `SOURCE TYPE: Partial notes with some detail (moderate content).
+HOW TO USE: These notes cover the topics but may lack full explanations. Use them as your foundation — teach every point they raise, but expand with clearer definitions, deeper explanations, and concrete examples wherever the notes are thin. Stay within the subject matter of the notes but add the depth needed for a complete lesson.`;
+      }
+
+      sourceBlock = `
+STUDENT'S UPLOADED MATERIAL:
+"""
+${cleanedSource.substring(0,10000)}
+"""
+
+${sourceGuidance}
+
+CRITICAL RULES FOR SOURCE MATERIAL:
+- The material above may contain OCR errors, formatting artifacts, or fragmented text. READ past the formatting — understand the IDEAS, then teach them in polished prose.
+- Write as a professor who studied this material and is now explaining it from memory — never copy-paste.
+- Do NOT output broken words, random numbers, slide formatting, or OCR artifacts.
+`;
+    }
+
+    const prompt = `You are an expert professor writing a textbook lesson on "${topicTitle}".
+
 SECTION: "${section.title}" — ${section.description}
-
-CONCEPTS (ALL must be explicitly explained):
+${sourceBlock}
+CONCEPTS TO COVER (teach every one thoroughly):
 ${conceptList}
 
-SOURCE SEGMENT (authoritative; summarize this segment only):
-${scopedStrictSource.substring(0,12000)}
+LESSON WRITING RULES:
+1. Write 800-1200 words of polished, flowing textbook prose that sounds excellent read aloud.
+2. Use concept subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
+3. For each concept: (a) define it clearly, (b) explain how it works, (c) explain why it matters, (d) give a specific, concrete example.
+4. Show connections between concepts where relevant.
+5. Every sentence must teach something. No filler. No meta-commentary ("In this section we will discuss...").
+6. NEVER repeat information. Each paragraph must present NEW ideas. Once you explain something, move forward.
+7. End every sentence with proper punctuation. Never run sentences together.
+8. Use \\n\\n between paragraphs.
 
-Task:
-- Summarize every part of this segment and include all important information in the overview.
-- Keep only topic-relevant information from this segment.
-- Ignore administrative/watermark/distribution text (for example: "authorized for use only", course/semester labels, and copyright boilerplate).
-- Preserve evidence: named people/organizations, timeline events, decisions, constraints, numeric facts/metrics, outcomes, and cause-effect links.
-- Do not invent facts and do not introduce external topics outside this segment.
-- Write concise, professional prose for study use.
-- Repair OCR/PDF artifacts and grammar issues (for example: "infor - mation" => "information", "cur - rent" => "current").
-- Never output split words, broken punctuation, or malformed sentence fragments.
+SUPPLEMENTARY FIELDS — each must be specific and substantive:
+- keyPrinciples: 5-7 concrete takeaways. Each states a specific fact or rule (e.g., "Entrepreneurs should validate assumptions with data before investing resources" — NOT vague filler like "Make adjustments").
+- keyTerms: 5-8 terms, each formatted as "Term: clear definition in plain language."
+- practicalApplications: 3 specific real-world actions a student could take. Each describes what to do, how, and what outcome to expect.
+- commonMisconceptions: 3 specific wrong beliefs students hold, each stating what is incorrect and what is actually true.
+- summary: 2-3 sentences capturing the most important takeaways.
 
-Output requirements:
-- Use concept subheadings exactly as "Concept 1: ...", "Concept 2: ...".
-- lesson must be 650-1000 words and evidence-dense (no filler).
-- keyPrinciples: 6-8 evidence-based points.
-- keyTerms: 6-10 entries formatted as "Term: definition" with concise, plain-language definitions grounded in the segment.
-- practicalApplications: 3 actionable applications grounded in this segment.
-- commonMisconceptions: 3 realistic mistakes tied to this segment.
-- summary: 2-3 sentences capturing the segment's most important conclusions.
+Return ONLY valid JSON (no markdown, no extra text):
+{"lesson":"...","keyPrinciples":["...","...","...","...","..."],"keyTerms":["Term: def","Term: def","Term: def","Term: def","Term: def"],"practicalApplications":["...","...","..."],"commonMisconceptions":["...","...","..."],"summary":"..."}`;
 
-Return ONLY valid JSON:
-{"lesson":"...","keyPrinciples":["..."],"keyTerms":["Term: definition"],"practicalApplications":["..."],"commonMisconceptions":["..."],"summary":"..."}`;
-      const strictRetryDirective = `\n\nFINAL VALIDATION BEFORE RESPONDING:
-- Every listed concept is explicitly explained in the lesson
-- Include concrete evidence details (numbers, outcomes, or named entities) whenever present in the source
-- Remove generic study advice and meta setup text
-- Grammar is clean and readable with no split words or OCR artifacts`;
-      const strictPrompts = [strictPromptBase, `${strictPromptBase}${strictRetryDirective}`];
-      for(const prompt of strictPrompts) {
+    // --- Step 4: AI generation with 3 attempts ---
+    for(let attempt=0; attempt<3; attempt++){
+      try {
         const r = await this.call(prompt, 1);
         if(!r) continue;
-        try {
-          const parsed = this._parseJsonObject(r);
-          if(!parsed) continue;
-          const normalized = {
-            lesson: safeStr(parsed.lesson||'').trim(),
-            keyPrinciples: this._cleanSectionLines(parsed.keyPrinciples||[]),
-            keyTerms: this._cleanKeyTerms(parsed.keyTerms||[], 10),
-            practicalApplications: this._cleanSectionLines(parsed.practicalApplications||[], 'application'),
-            commonMisconceptions: this._cleanSectionLines(parsed.commonMisconceptions||[], 'misconception'),
-            summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
-          };
-          const derivedKeyTerms = this._deriveKeyTerms(section, scopedStrictSource, normalized.lesson, 8);
-          normalized.keyTerms = this._mergeKeyTerms(derivedKeyTerms, normalized.keyTerms, 8);
-          if(this._isWeakSectionOverview(normalized, section)) continue;
-          const sourceTerms = this._extractSourceTerms(scopedStrictSource, 18);
-          const combined = `${normalized.lesson}\n${normalized.keyPrinciples.join('\n')}\n${normalized.keyTerms.join('\n')}\n${normalized.practicalApplications.join('\n')}\n${normalized.summary}`;
-          const coverageRatio = this._sourceTermCoverageRatio(combined, sourceTerms);
-          const minCoverage = sourceTerms.length>=8 ? 0.38 : (sourceTerms.length>=4 ? 0.32 : 0.26);
-          if(sourceTerms.length && coverageRatio < minCoverage) continue;
-          if(!this._passesStrictOverviewEvidence(normalized.lesson, scopedStrictSource, conceptNames)) continue;
-          return this._polishSectionOverview({
-            lesson: normalized.lesson,
-            keyPrinciples: normalized.keyPrinciples,
-            keyTerms: normalized.keyTerms,
-            practicalApplications: normalized.practicalApplications,
-            commonMisconceptions: normalized.commonMisconceptions,
-            summary: normalized.summary,
-            loaded:true,
-          });
-        } catch(_){}
-      }
-      // Deterministic strict fallback keeps section generation reliable when model output is weak.
-      return this._buildSourceBackedSectionOverview(section, topicTitle, sourceContent, 'strict');
-    }
-    const conceptList = section.concepts.map((c,i)=>`${i+1}. "${c.name}" — ${c.description}`).join('\n');
-    const sourceCtx = sourceContent ? `\nSOURCE MATERIAL (the student's own notes/document — use this as the PRIMARY basis for the lesson, teach what's in here):\n${sourceContent.substring(0,11000)}\n` : '';
-    const sourceModeCtx = sourceContent
-      ? (sourceMode==='strict'
-          ? `\nSOURCE MODE: STRICT NOTES.\nStay tightly constrained to the uploaded notes for this lesson. Avoid adding external subtopics that are not represented in the notes.\nFor EACH concept, include note-grounded evidence (specific terms, assumptions, metrics, examples, or results from the source).\n`
-          : `\nSOURCE MODE: EXPAND NOTES.\nUse the notes as the base, then expand missing clarity, definitions, and examples to improve learning quality.\nFor EACH concept, first restate note evidence, then add concise expansion for deeper understanding.\n`)
-      : '';
-    const basePrompt = `Expert professor teaching "${topicTitle}". Write a COMPLETE LESSON for this section:
-
-SECTION: "${section.title}" — ${section.description}
-${sourceCtx}
-${sourceModeCtx}
-CONCEPTS TO COVER (ALL must be taught in depth):
-${conceptList}
-
-This is the student's actual learning material — not a summary. After reading, they should understand every concept well enough to explain it.${sourceContent ? ' IMPORTANT: Base the lesson primarily on the SOURCE MATERIAL provided — it contains the student\'s own notes or textbook content. Teach from that material, expanding with your knowledge where needed.' : ''}
-
-Write 800-1200 words. Be concise but thorough — every sentence should teach something. No filler, no generic statements. Use specific facts, concrete examples, and clear explanations. Teach each concept in natural prose (no rigid label template like "What it is" / "Why it matters"), explain how it works, and include one concrete example. Show how concepts connect. Use \\n\\n between paragraphs.
-Grammar and readability are mandatory: fix OCR/PDF artifacts, remove split words, and avoid broken punctuation or sentence fragments.
-Format the lesson with concept subheadings exactly in this style: "Concept 1: ...", "Concept 2: ...". You may end each concept block with one short "Quick check:" question.
-
-Return ONLY valid JSON:
-{"lesson":"800-1200 word lesson","keyPrinciples":["5-7 specific, actionable principles"],"keyTerms":["Term: definition"],"practicalApplications":["3 specific real-world scenarios with details"],"commonMisconceptions":["3 common mistakes and why they're wrong"],"summary":"2-3 sentence recap"}`;
-    const retryDirective = `\n\nCRITICAL QUALITY GATE:
-- Do NOT write meta setup text like "in this section we will..."
-- Do NOT provide high-level plans or broad placeholders
-- Every paragraph must include concrete, factual teaching details
-- Mention each concept by name and explain it deeply
-- keyPrinciples, keyTerms, and practicalApplications must be specific, not generic
-- Avoid repeated template phrases such as "This concept matters because..." or "A practical way to study it is..."
-- Output clean grammar with no split words like "infor - mation" or "info mation"`;
-    const prompts = [basePrompt, `${basePrompt}${retryDirective}`, `${basePrompt}${retryDirective}`];
-    for(let attempt=0;attempt<prompts.length;attempt++){
-      const r = await this.call(prompts[attempt]);
-      if(!r) continue;
-      try {
         const parsed = this._parseJsonObject(r);
-        if(!parsed) continue;
+        if(!parsed || !parsed.lesson) continue;
+        // Don't pre-clean arrays here — _polishSectionOverview handles all cleaning.
+        // Double-cleaning was mangling content (e.g., adding "Apply this by..." prefix twice).
         const normalized = {
           lesson: safeStr(parsed.lesson||'').trim(),
-          keyPrinciples: this._cleanSectionLines(parsed.keyPrinciples||[]),
-          keyTerms: this._cleanKeyTerms(parsed.keyTerms||[], 10),
-          practicalApplications: this._cleanSectionLines(parsed.practicalApplications||[], 'application'),
-          commonMisconceptions: this._cleanSectionLines(parsed.commonMisconceptions||[], 'misconception'),
+          keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          keyTerms: Array.isArray(parsed.keyTerms) ? parsed.keyTerms.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          practicalApplications: Array.isArray(parsed.practicalApplications) ? parsed.practicalApplications.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
           summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
         };
-        const derivedKeyTerms = this._deriveKeyTerms(section, sourceContent||'', normalized.lesson, 8);
-        normalized.keyTerms = this._mergeKeyTerms(derivedKeyTerms, normalized.keyTerms, 8);
-        if(this._isWeakSectionOverview(normalized, section)) continue;
-        if(sourceContent) {
-          const sourceTerms = this._extractSourceTerms(sourceContent, 14);
-          if(sourceTerms.length>=4) {
-            const joined = `${normalized.lesson}\n${normalized.keyPrinciples.join('\n')}\n${normalized.keyTerms.join('\n')}\n${normalized.practicalApplications.join('\n')}`.toLowerCase();
-            const matched = sourceTerms.filter(t=>joined.includes(t)).length;
-            const required = sourceMode==='strict'
-              ? Math.min(6, Math.max(3, Math.floor(sourceTerms.length * 0.35)))
-              : Math.min(5, Math.max(2, Math.floor(sourceTerms.length * 0.22)));
-            if(matched < required) continue;
+        // Quality checks
+        const wordCount = this._wordCount(normalized.lesson);
+        if(wordCount < 100) continue;
+        if(wordCount > 3000) continue;
+        // Reject if too few supplementary fields survived (AI returned empty/weak arrays)
+        const hasSubstance = normalized.keyPrinciples.length >= 2 &&
+          normalized.keyTerms.length >= 2 &&
+          normalized.practicalApplications.length >= 1 &&
+          normalized.commonMisconceptions.length >= 1;
+        if(!hasSubstance) continue;
+        // Reject if lesson is excessively repetitive (paragraphs repeat the same ideas)
+        const paragraphs = normalized.lesson
+          .split(/\n{2,}/)
+          .map((p:string)=>p.replace(/\s+/g,' ').trim())
+          .filter((p:string)=>p.length>=60);
+        if(paragraphs.length>=4) {
+          let repPairs = 0;
+          let repComps = 0;
+          for(let i=0;i<paragraphs.length;i++) {
+            for(let j=i+1;j<paragraphs.length;j++) {
+              repComps++;
+              if(this._overlapSimilarity(paragraphs[i], paragraphs[j]) >= 0.55) repPairs++;
+            }
           }
+          if(repComps>0 && repPairs >= Math.max(2, Math.floor(repComps * 0.25))) continue; // too repetitive, retry
         }
         return this._polishSectionOverview({
           lesson: normalized.lesson,
@@ -2906,37 +2102,13 @@ Return ONLY valid JSON:
           practicalApplications: normalized.practicalApplications,
           commonMisconceptions: normalized.commonMisconceptions,
           summary: normalized.summary,
-          loaded:true
+          loaded: true,
         });
-      } catch(e){ continue; }
+      } catch(_){ continue; }
     }
-    if(sourceContent) {
-      return this._buildSourceBackedSectionOverview(section, topicTitle, sourceContent, sourceMode);
-    }
-    // Fallback when no source notes are available: still deliver concrete teaching detail
-    const fallbackLesson = section.concepts.map((c,i)=>(
-      `Concept ${i+1}: ${c.name}.\n\n` +
-      `${c.description} This concept matters in ${topicTitle} because it directly affects how decisions are made and how outcomes are measured. ` +
-      `A practical way to study it is to define the concept clearly, identify one real process where it appears, and then explain why that process changes when the concept changes.`
-    )).join('\n\n');
-    const fallbackPrinciples = section.concepts.map(c=>`${c.name}: focus on precise definitions, causal relationships, and measurable outcomes.`);
-    const fallbackApps = section.concepts.slice(0,3).map(c=>`Use "${c.name}" to analyze one real case from ${topicTitle}, explain what happened, and justify one improvement.`);
-    const fallbackMisconceptions = [
-      `Treating ${section.concepts[0]?.name||'the first concept'} as isolated instead of connected to the rest of the system.`,
-      `Using memorized terms without explaining how concepts change real outcomes.`,
-      `Skipping examples and trying to learn only from definitions.`,
-    ];
-    const fallbackKeyTerms = this._deriveKeyTerms(section, sourceContent||'', fallbackLesson, 8);
-    const fallbackSummary = `This section taught ${section.concepts.map(c=>c.name).join(', ')} with concrete definitions, relationships, and practical use cases to build applied understanding.`;
-    return this._polishSectionOverview({
-      lesson:fallbackLesson,
-      keyPrinciples:fallbackPrinciples,
-      keyTerms:fallbackKeyTerms,
-      practicalApplications:fallbackApps.length?fallbackApps:['Apply each concept to one concrete case and justify your reasoning.'],
-      commonMisconceptions:fallbackMisconceptions,
-      summary:fallbackSummary,
-      loaded:true
-    });
+
+    // --- Step 5: All AI attempts failed — throw so UI shows retry ---
+    throw new Error('AI_GENERATION_FAILED');
   },
 
   async answerQuestion(question:string, concept:Concept|null, topicTitle:string, recentChat:ChatMessage[], sectionContext?:string):Promise<string> {
@@ -3930,6 +3102,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
   // Section overview loading state
   const [sectionOverviewLoading,setSectionOverviewLoading] = useState(false);
+  const [sectionOverviewError,setSectionOverviewError] = useState<string|null>(null);
   const beginSectionOverviewLoad = () => {
     sectionOverviewPendingRef.current += 1;
     if(sectionOverviewPendingRef.current===1) setSectionOverviewLoading(true);
@@ -4906,7 +4079,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 	          const updTopic = {...current,sections:updSections};
 	          setSelTopic(updTopic); selTopicRef.current=updTopic; onUpdateTopic(updTopic);
 	        }
-	      }).catch(()=>{}).finally(()=>{
+	      }).catch((e:any)=>{ console.warn('Auto-generate section overview failed:', e?.message||e); }).finally(()=>{
           if(sectionOverviewReqRef.current[sec1.id]===sectionReqId) {
             delete sectionOverviewReqRef.current[sec1.id];
           }
@@ -5519,6 +4692,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     if(((section.overview?.loaded && !force && !weakLoaded))||!selTopicRef.current) return;
     const requestId = ++sectionOverviewReqSeqRef.current;
     sectionOverviewReqRef.current[section.id] = requestId;
+    setSectionOverviewError(null);
     beginSectionOverviewLoad();
     try {
       const sourceContent = selTopicRef.current.source==='file' ? cleanStoredSourceForAI(selTopicRef.current.originalContent) : undefined;
@@ -5536,36 +4710,10 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           setSelSection(updatedSection);
         }
       }
-    } catch(e) {
+    } catch(e:any) {
       if(sectionOverviewReqRef.current[section.id]!==requestId) return;
-      const fallback:SectionOverview = {
-        lesson: section.concepts.map((c,i)=>(
-          `Concept ${i+1}: ${c.name}\n\n` +
-          `${c.description} In ${section.title}, this concept should be understood by defining it clearly, ` +
-          `explaining how it affects the system, and connecting it to one concrete real scenario.`
-        )).join('\n\n'),
-        keyPrinciples: section.concepts.map(c=>`${c.name}: understand the definition, mechanism, and impact on outcomes.`),
-        keyTerms: section.concepts.map(c=>`${c.name}: ${safeStr(c.description||'').replace(/\s+/g,' ').trim() || `A core term in ${section.title}.`}`).slice(0,8),
-        practicalApplications: section.concepts.slice(0,3).map(c=>`Apply "${c.name}" to one real case and explain why that choice improves results.`),
-        commonMisconceptions:[
-          `Treating ${section.concepts[0]?.name||'the core concept'} as isolated from the rest of the section.`,
-          `Memorizing terms without explaining cause-and-effect relationships.`,
-          `Skipping concrete examples and relying only on abstract definitions.`,
-        ],
-        summary:`This section explained ${section.concepts.map(c=>c.name).join(', ')} with concrete definitions and practical use cases to build real understanding.`,
-        loaded:true,
-      };
-      const polishedFallback = AI._polishSectionOverview(fallback);
-      const topic = selTopicRef.current;
-      if(topic){
-        const uSections = topic.sections.map(s=>s.id===section.id?{...s,overview:polishedFallback}:s);
-        const ut = {...topic,sections:uSections};
-        setSelTopic(ut); selTopicRef.current=ut; onUpdateTopic(ut);
-        if(selSection?.id===section.id) {
-          const updatedSection = uSections.find(s=>s.id===section.id) || {...section,overview:polishedFallback};
-          setSelSection(updatedSection);
-        }
-      }
+      const errMsg = String(e?.message||'');
+      setSectionOverviewError(errMsg.includes('API_KEY_MISSING') ? 'no_api_key' : 'generation_failed');
     } finally {
       if(sectionOverviewReqRef.current[section.id]===requestId) {
         delete sectionOverviewReqRef.current[section.id];
@@ -5698,19 +4846,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
   const hasWeakOverview = (section:Section):boolean => {
     if(!section.overview?.loaded) return false;
-    try {
-      const polished = AI._polishSectionOverview(section.overview);
-      return AI._isWeakSectionOverview({
-        lesson: safeStr(polished.lesson),
-        keyPrinciples: polished.keyPrinciples||[],
-        keyTerms: polished.keyTerms||[],
-        practicalApplications: polished.practicalApplications||[],
-        commonMisconceptions: polished.commonMisconceptions||[],
-        summary: safeStr(polished.summary),
-      }, section);
-    } catch(_) {
-      return false;
-    }
+    const lesson = safeStr(section.overview.lesson||'').trim();
+    return !lesson || AI._wordCount(lesson) < 100;
   };
 
   const renderExtractionReportCard = () => {
@@ -6054,8 +5191,26 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           <LoadingCard message="Generating your lesson..." sub="Creating a comprehensive overview of this section" theme={theme}/>
         )}
 
+        {/* Error state — AI generation failed */}
+        {sectionOverviewError&&!sectionOverviewLoading&&!overview?.loaded&&(
+          <View style={[st.card,{backgroundColor:theme.card,alignItems:'center',paddingVertical:28}]}>
+            <Text style={{fontSize:32,marginBottom:12}}>{sectionOverviewError==='no_api_key' ? '🔑' : '⚠️'}</Text>
+            <Text style={{color:theme.text,fontSize:16,fontWeight:'600',marginBottom:6,textAlign:'center'}}>
+              {sectionOverviewError==='no_api_key' ? 'API Key Required' : 'Generation Failed'}
+            </Text>
+            <Text style={{color:'#94A3B8',fontSize:14,textAlign:'center',marginBottom:16}}>
+              {sectionOverviewError==='no_api_key'
+                ? 'Add your Groq API key in Profile > API Keys to generate lessons.'
+                : 'The AI could not generate this lesson. Check your connection and try again.'}
+            </Text>
+            <TouchableOpacity onPress={()=>{setSectionOverviewError(null);loadSectionOverview(selSection,true);}} style={{backgroundColor:theme.primary,paddingHorizontal:28,paddingVertical:12,borderRadius:12}}>
+              <Text style={{color:'white',fontWeight:'700',fontSize:15}}>Retry</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {/* Not loaded and not loading — show generate button */}
-        {!sectionOverviewLoading&&!overview?.loaded&&(
+        {!sectionOverviewLoading&&!overview?.loaded&&!sectionOverviewError&&(
           <View style={[st.card,{backgroundColor:theme.card,alignItems:'center',paddingVertical:28}]}>
             <Text style={{fontSize:32,marginBottom:12}}>📖</Text>
             <Text style={{color:theme.text,fontSize:16,fontWeight:'600',marginBottom:6,textAlign:'center'}}>Ready to generate your lesson</Text>

@@ -39,3 +39,14 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# build output variants
+dist-*/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Claude
+.claude/
