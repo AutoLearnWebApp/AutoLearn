@@ -469,6 +469,27 @@ const UsageTracker = {
   },
 };
 
+// ── Global Groq API request queue ──────────────────────────────────────────
+// Serializes all Groq requests to prevent 429 rate-limit storms.
+// Only 1 request flies at a time; others wait in a FIFO queue.
+// Global cooldown: after ANY 429, ALL queued requests wait until the window resets.
+let _groqQueue: Promise<void> = Promise.resolve();
+let _groqCooldownUntil: number = 0; // timestamp (ms) — no requests before this time
+function enqueueGroq<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    _groqQueue = _groqQueue.then(async () => {
+      // Wait for global cooldown before attempting
+      const waitMs = _groqCooldownUntil - Date.now();
+      if (waitMs > 0) {
+        console.warn(`AI: Groq queue waiting ${Math.round(waitMs/1000)}s for rate-limit cooldown`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      try { resolve(await fn()); }
+      catch (e) { reject(e); }
+    });
+  });
+}
+
 const AI = {
   _showMissingKeyAlert(provider:'groq'|'gemini'):void {
     if(_missingKeyAlerted[provider]) return;
@@ -662,12 +683,28 @@ const AI = {
         normalized.push(this._sentenceCase(heading));
         continue;
       }
+      // Strip meta-commentary filler lines
+      if(/^(in the next section|in this section|we will (explore|discuss|examine|learn|cover)|this concludes|to summarize this section|let us now)/i.test(line)) continue;
       normalized.push(this._normalizeReadableText(line, {ensureSentenceEnd:true, maxWordsWithoutPunctuation:28}));
     }
-    return normalized
-      .join('\n')
-      .replace(/\n{3,}/g,'\n\n')
-      .trim();
+    // Deduplicate paragraphs: remove paragraphs that are too similar to earlier ones
+    const joined = normalized.join('\n').replace(/\n{3,}/g,'\n\n').trim();
+    const paragraphs = joined.split(/\n\n/);
+    const deduped:string[] = [];
+    for(const para of paragraphs) {
+      const trimmed = para.trim();
+      if(!trimmed) continue;
+      // Keep headings always
+      if(/^concept\s+\d+\s*:/i.test(trimmed)) { deduped.push(trimmed); continue; }
+      // Check for near-duplicate against all kept paragraphs
+      const isDuplicate = trimmed.length >= 60 && deduped.some(kept => {
+        if(kept.length < 60) return false;
+        return this._overlapSimilarity(kept, trimmed) >= 0.65;
+      });
+      if(isDuplicate) continue;
+      deduped.push(trimmed);
+    }
+    return deduped.join('\n\n').trim();
   },
 
   _cleanSectionLines(lines:any, mode:'generic'|'application'|'misconception'='generic'):string[] {
@@ -1500,49 +1537,62 @@ const AI = {
 
 
 
-  async callGroq(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000):Promise<string> {
-    if(!_groqApiKey) { return ''; } // silent fail — call() handles missing key alerts
+  async callGroq(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=16384):Promise<string> {
+    if(!_groqApiKey) { return ''; }
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const canRequest = await UsageTracker.canMakeRequest();
     if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
-    for(let attempt=0;attempt<=retries;attempt++) {
-      const controller = new AbortController();
-      const abortBySignal = () => controller.abort();
-      let timeout:any = null;
-      try {
-        if(signal) {
-          if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
-          signal.addEventListener('abort', abortBySignal, { once:true });
+    // Route through global queue so only 1 Groq request flies at a time
+    return enqueueGroq(async () => {
+      for(let attempt=0;attempt<=retries;attempt++) {
+        const controller = new AbortController();
+        const abortBySignal = () => controller.abort();
+        let timeout:any = null;
+        try {
+          if(signal) {
+            if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
+            signal.addEventListener('abort', abortBySignal, { once:true });
+          }
+          timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
+          const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
+            method:'POST',
+            headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
+            body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
+            signal:controller.signal,
+          });
+          if(r.status===429) {
+            // Read Retry-After header from Groq (seconds until rate limit resets)
+            const retryAfterHeader = r.headers.get('retry-after');
+            const retryAfterSec = retryAfterHeader ? Math.max(parseFloat(retryAfterHeader)||0, 0) : 0;
+            // Use Retry-After if provided, otherwise exponential backoff: 15s, 30s, 60s
+            const backoffMs = retryAfterSec > 0
+              ? Math.min(retryAfterSec * 1000 + 1000, 90000) // +1s buffer, cap at 90s
+              : Math.min(15000 * Math.pow(2, attempt), 60000);
+            // Set global cooldown so queued requests also wait
+            _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + backoffMs);
+            console.warn(`AI: Groq 429 rate-limited, backing off ${Math.round(backoffMs/1000)}s (attempt ${attempt+1}/${retries+1})${retryAfterSec?` [Retry-After: ${retryAfterSec}s]`:''}`);
+            if(attempt<retries) { await new Promise(res=>setTimeout(res, backoffMs)); continue; }
+            return '';
+          }
+          if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
+          if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status}`); if(attempt<retries) { await new Promise(res=>setTimeout(res,2000)); continue; } break; }
+          const d = await r.json();
+          const text = d?.choices?.[0]?.message?.content;
+          if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
+          if(attempt<retries) continue;
+          break;
+        } catch(e:any) {
+          if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
+          console.warn(`AI: Groq attempt ${attempt}: ${e?.message||'unknown'}`);
+          if(attempt<retries) { await new Promise(res=>setTimeout(res,2000*(attempt+1))); continue; }
+          break;
+        } finally {
+          if(timeout) clearTimeout(timeout);
+          if(signal) signal.removeEventListener('abort', abortBySignal);
         }
-        timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
-          method:'POST',
-          headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
-          body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature:0.4,max_tokens:16384}),
-          signal:controller.signal,
-        });
-        if(r.status===429) {
-          if(attempt<retries) { await new Promise(res=>setTimeout(res,Math.min((attempt+1)*3000,10000))); continue; }
-          return ''; // silent — let fallback handle it
-        }
-        if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-        if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status}`); if(attempt<retries) { await new Promise(res=>setTimeout(res,2000)); continue; } break; }
-        const d = await r.json();
-        const text = d?.choices?.[0]?.message?.content;
-        if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
-        if(attempt<retries) continue;
-        break;
-      } catch(e:any) {
-        if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-        console.warn(`AI: Groq attempt ${attempt}: ${e?.message||'unknown'}`);
-        if(attempt<retries) { await new Promise(res=>setTimeout(res,2000*(attempt+1))); continue; }
-        break;
-      } finally {
-        if(timeout) clearTimeout(timeout);
-        if(signal) signal.removeEventListener('abort', abortBySignal);
       }
-    }
-    return '';
+      return '';
+    });
   },
 
   // Groq Orpheus TTS — used for audiobook narration in the Learn tab (saves Gemini quota)
@@ -1867,36 +1917,34 @@ Example of a GOOD concept description: "The fundamental principles of photosynth
 
 Return ONLY valid JSON:
 {"title":"Clear, specific topic title","description":"2-3 sentence overview of what the student will learn and be able to do after completing this curriculum","plan":"A 3-4 sentence roadmap explaining the learning journey — what they'll start with, how concepts build on each other, and what mastery looks like","sections":[{"title":"Descriptive Section Name","description":"2-3 sentences about what this section covers and what the student will understand after completing it","estimatedMinutes":30,"concepts":[{"name":"Specific Concept Name","description":"3-4 sentences: What this concept IS, WHY it matters, and WHAT specifically needs to be understood. Be concrete and detailed.","difficulty":"easy|medium|hard"}]}]}`;
-    const retryDirective = `\n\nFINAL CHECK BEFORE RESPONDING:
-- Reject generic output
-- If SOURCE MODE is STRICT, keep every section tied directly to note evidence
-- If SOURCE MODE is EXPAND, add clarity and structure without drifting off-topic`;
-    const prompts = [basePrompt, `${basePrompt}${retryDirective}`];
-    for(const prompt of prompts) {
-      const r = await this.call(prompt);
-      if(!r) continue;
+    // Single API call to minimize rate-limit impact. If it fails, fall back to deterministic.
+    const r = await this.call(basePrompt, 0);
+    if(r) {
       try {
         const parsed = this._parseJsonObject(r);
-        if(!parsed || !Array.isArray(parsed.sections) || parsed.sections.length===0) continue;
-        const normalized = {
-          title: safeStr(parsed.title||topicInput).trim() || topicInput,
-          description: safeStr(parsed.description||`Comprehensive study of ${topicInput}`).replace(/\s+/g,' ').trim(),
-          plan: safeStr(parsed.plan||`A structured learning journey through ${topicInput}.`).replace(/\s+/g,' ').trim(),
-          sections: (parsed.sections||[]).slice(0,6).map((s:any)=>({
-            title: safeStr(s?.title||'').trim(),
-            description: safeStr(s?.description||'').replace(/\s+/g,' ').trim(),
-            estimatedMinutes: Number(s?.estimatedMinutes)||30,
-            concepts: (Array.isArray(s?.concepts)?s.concepts:[]).slice(0,5).map((c:any)=>({
-              name: safeStr(c?.name||'').trim(),
-              description: safeStr(c?.description||'').replace(/\s+/g,' ').trim(),
-              difficulty: (c?.difficulty==='easy'||c?.difficulty==='hard'||c?.difficulty==='medium') ? c.difficulty : 'medium',
+        if(parsed && Array.isArray(parsed.sections) && parsed.sections.length > 0) {
+          const normalized = {
+            title: safeStr(parsed.title||topicInput).trim() || topicInput,
+            description: safeStr(parsed.description||`Comprehensive study of ${topicInput}`).replace(/\s+/g,' ').trim(),
+            plan: safeStr(parsed.plan||`A structured learning journey through ${topicInput}.`).replace(/\s+/g,' ').trim(),
+            sections: (parsed.sections||[]).slice(0,6).map((s:any)=>({
+              title: safeStr(s?.title||'').trim(),
+              description: safeStr(s?.description||'').replace(/\s+/g,' ').trim(),
+              estimatedMinutes: Number(s?.estimatedMinutes)||30,
+              concepts: (Array.isArray(s?.concepts)?s.concepts:[]).slice(0,5).map((c:any)=>({
+                name: safeStr(c?.name||'').trim(),
+                description: safeStr(c?.description||'').replace(/\s+/g,' ').trim(),
+                difficulty: (c?.difficulty==='easy'||c?.difficulty==='hard'||c?.difficulty==='medium') ? c.difficulty : 'medium',
+              })),
             })),
-          })),
-        };
-        if(this._isWeakCurriculum(normalized, sourceContent, sourceMode)) continue;
-        return normalized;
+          };
+          if(!this._isWeakCurriculum(normalized, sourceContent, sourceMode)) {
+            return normalized;
+          }
+        }
       } catch(_){}
     }
+    // Fallback to deterministic curriculum
     if(sourceContent) {
       return this._buildSourceBackedCurriculum(topicInput, sourceContent, sourceMode);
     }
@@ -2033,14 +2081,14 @@ CONCEPTS TO COVER (teach every one thoroughly):
 ${conceptList}
 
 LESSON WRITING RULES:
-1. Write 800-1200 words of polished, flowing textbook prose that sounds excellent read aloud.
+1. Write EXACTLY 800-1200 words. Not more, not less. Do NOT write conclusions, summaries, or recap paragraphs at the end — the lesson ends after the last concept is taught.
 2. Use concept subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
 3. For each concept: (a) define it clearly, (b) explain how it works, (c) explain why it matters, (d) give a specific, concrete example.
 4. Show connections between concepts where relevant.
-5. Every sentence must teach something. No filler. No meta-commentary ("In this section we will discuss...").
-6. NEVER repeat information. Each paragraph must present NEW ideas. Once you explain something, move forward.
+5. Every sentence must teach something. No filler. NEVER write meta-commentary like "In this section we will discuss...", "In the next section...", "In conclusion...", "To summarize...", "The key takeaways are...", or "By following these principles...".
+6. ABSOLUTE RULE: NEVER repeat any idea, phrase, or sentence. Each paragraph must contain ENTIRELY NEW information not stated anywhere else in the lesson. If you catch yourself restating something, STOP and write something new instead.
 7. End every sentence with proper punctuation. Never run sentences together.
-8. Use \\n\\n between paragraphs.
+8. Use \\n\\n between paragraphs. Write 2-3 paragraphs per concept, then MOVE ON to the next concept.
 
 SUPPLEMENTARY FIELDS — each must be specific and substantive:
 - keyPrinciples: 5-7 concrete takeaways. Each states a specific fact or rule (e.g., "Entrepreneurs should validate assumptions with data before investing resources" — NOT vague filler like "Make adjustments").
@@ -2052,50 +2100,32 @@ SUPPLEMENTARY FIELDS — each must be specific and substantive:
 Return ONLY valid JSON (no markdown, no extra text):
 {"lesson":"...","keyPrinciples":["...","...","...","...","..."],"keyTerms":["Term: def","Term: def","Term: def","Term: def","Term: def"],"practicalApplications":["...","...","..."],"commonMisconceptions":["...","...","..."],"summary":"..."}`;
 
-    // --- Step 4: AI generation with 3 attempts ---
-    let bestCandidate:{lesson:string;keyPrinciples:string[];keyTerms:string[];practicalApplications:string[];commonMisconceptions:string[];summary:string}|null = null;
-    let bestWordCount = 0;
-    for(let attempt=0; attempt<3; attempt++){
-      try {
-        const r = await this.callGroq(prompt, 1, undefined, 60000);
-        if(!r) { console.warn(`AI overview attempt ${attempt+1}: empty response from Groq`); continue; }
-        const parsed = this._parseJsonObject(r);
-        if(!parsed || !parsed.lesson) { console.warn(`AI overview attempt ${attempt+1}: failed to parse JSON or no lesson field`); continue; }
-        const normalized = {
-          lesson: safeStr(parsed.lesson||'').trim(),
-          keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-          keyTerms: Array.isArray(parsed.keyTerms) ? parsed.keyTerms.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-          practicalApplications: Array.isArray(parsed.practicalApplications) ? parsed.practicalApplications.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-          commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-          summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
-        };
-        // Hard reject: lesson must have meaningful content
-        const wordCount = this._wordCount(normalized.lesson);
-        if(wordCount < 80) { console.warn(`AI overview attempt ${attempt+1}: lesson too short (${wordCount} words)`); continue; }
-        if(wordCount > 4000) { console.warn(`AI overview attempt ${attempt+1}: lesson too long (${wordCount} words)`); continue; }
-        // Track the best candidate in case no attempt passes all soft checks
-        if(wordCount > bestWordCount) {
-          bestCandidate = normalized;
-          bestWordCount = wordCount;
-        }
-        // Soft checks: warn but still return the best result if these fail
-        if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
-          console.warn(`AI overview attempt ${attempt+1}: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — retrying for better output`);
-          continue;
-        }
-        // Passed all checks
-        return this._polishSectionOverview({ ...normalized, loaded: true });
-      } catch(e:any) { console.warn(`AI overview attempt ${attempt+1}: exception: ${e?.message||e}`); continue; }
+    // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
+    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 4096);
+    if(!r) { throw new Error('AI_GENERATION_FAILED'); }
+    try {
+      const parsed = this._parseJsonObject(r);
+      if(!parsed || !parsed.lesson) { throw new Error('AI_GENERATION_FAILED'); }
+      const normalized = {
+        lesson: safeStr(parsed.lesson||'').trim(),
+        keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+        keyTerms: Array.isArray(parsed.keyTerms) ? parsed.keyTerms.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+        practicalApplications: Array.isArray(parsed.practicalApplications) ? parsed.practicalApplications.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+        commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+        summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
+      };
+      // Hard reject: lesson must have meaningful content
+      const wordCount = this._wordCount(normalized.lesson);
+      if(wordCount < 80) { throw new Error('AI_GENERATION_FAILED'); }
+      if(wordCount > 4000) { throw new Error('AI_GENERATION_FAILED'); }
+      // Accept output with graceful degradation — use what we have even if supplementary fields are thin
+      if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
+        console.warn(`AI overview: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — using as-is`);
+      }
+      return this._polishSectionOverview({ ...normalized, loaded: true });
+    } catch(e:any) {
+      throw new Error('AI_GENERATION_FAILED');
     }
-
-    // --- Step 5: If we have a candidate that passed hard checks but failed soft checks, use it ---
-    if(bestCandidate) {
-      console.warn('AI overview: using best candidate (passed hard checks, failed some soft checks)');
-      return this._polishSectionOverview({ ...bestCandidate, loaded: true });
-    }
-
-    // --- Step 6: All AI attempts truly failed (no parseable response at all) ---
-    throw new Error('AI_GENERATION_FAILED');
   },
 
   async answerQuestion(question:string, concept:Concept|null, topicTitle:string, recentChat:ChatMessage[], sectionContext?:string):Promise<string> {
@@ -4047,17 +4077,18 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     setTopicInput(''); setClarifyMsgs([]); setClarifyInput(''); setUploadedNotes(null); setExtractionReport(null); setCreating(false); setClarifyLoading(false);
     // Ask familiarity level first — this may update the topic's unlock/medal state
 	    askFamiliarity(newTopic);
-	    // Auto-generate Section 1 overview in background (reads from ref to get latest state)
+	    // Auto-generate Section 1 overview in background after a short delay
+	    // (gives Groq rate limit headroom after curriculum generation API calls)
 	    if(sections.length>0){
 	      const sec1 = sections[0];
         const sectionReqId = ++sectionOverviewReqSeqRef.current;
         sectionOverviewReqRef.current[sec1.id] = sectionReqId;
-	      AI.generateSectionOverview(
+	      (async()=>{ await new Promise(r=>setTimeout(r,2000)); return AI.generateSectionOverview(
 	        sec1,
 	        curr.title||baseTitle,
 	        isFileTopic?sourceContent:undefined,
 	        'expand'
-	      ).then(overview=>{
+	      ); })().then(overview=>{
           if(sectionOverviewReqRef.current[sec1.id]!==sectionReqId) return;
 	        const current = selTopicRef.current;
 	        if(current && current.id===newTopic.id){
