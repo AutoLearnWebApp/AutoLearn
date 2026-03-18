@@ -432,7 +432,7 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-const GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'; // 30K TPM (vs 12K on llama-3.3-70b)
+const GROQ_MODEL = 'llama-3.3-70b-versatile'; // 70B quality + 12K TPM (fits with trimmed prompts)
 const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
@@ -2119,35 +2119,36 @@ CRITICAL RULES FOR SOURCE MATERIAL:
 `;
     }
 
-    const prompt = `You are an expert professor writing a textbook lesson on "${topicTitle}".
+    const prompt = `You are a professor writing a detailed textbook chapter section.
 
-SECTION: "${section.title}" — ${section.description}
+Topic: "${topicTitle}"
+Section: "${section.title}" — ${section.description}
 ${sourceBlock}
-CONCEPTS TO COVER (teach every one thoroughly):
+Concepts to teach (cover ALL of these):
 ${conceptList}
 
-LESSON WRITING RULES:
-1. Write EXACTLY 800-1200 words. Not more, not less. Do NOT write conclusions, summaries, or recap paragraphs at the end — the lesson ends after the last concept is taught.
-2. Use concept subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
-3. For each concept: (a) define it clearly, (b) explain how it works, (c) explain why it matters, (d) give a specific, concrete example.
-4. Show connections between concepts where relevant.
-5. Every sentence must teach something. No filler. NEVER write meta-commentary like "In this section we will discuss...", "In the next section...", "In conclusion...", "To summarize...", "The key takeaways are...", or "By following these principles...".
-6. ABSOLUTE RULE: NEVER repeat any idea, phrase, or sentence. Each paragraph must contain ENTIRELY NEW information not stated anywhere else in the lesson. If you catch yourself restating something, STOP and write something new instead.
-7. End every sentence with proper punctuation. Never run sentences together.
-8. Use \\n\\n between paragraphs. Write 2-3 paragraphs per concept, then MOVE ON to the next concept.
+CRITICAL LENGTH REQUIREMENT: The "lesson" field MUST be 800-1200 words. This is a HARD requirement — not a suggestion. Count your words. A lesson under 400 words is unacceptable. Write thorough, detailed explanations with specific examples for each concept.
 
-SUPPLEMENTARY FIELDS — each must be specific and substantive:
-- keyPrinciples: 5-7 concrete takeaways. Each states a specific fact or rule (e.g., "Entrepreneurs should validate assumptions with data before investing resources" — NOT vague filler like "Make adjustments").
-- keyTerms: 5-8 terms, each formatted as "Term: clear definition in plain language."
-- practicalApplications: 3 specific real-world actions a student could take. Each describes what to do, how, and what outcome to expect.
-- commonMisconceptions: 3 specific wrong beliefs students hold, each stating what is incorrect and what is actually true.
-- summary: 2-3 sentences capturing the most important takeaways.
+FORMAT:
+- Use subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
+- For each concept: define it, explain how/why it works, give a concrete real-world example.
+- Write 2-3 paragraphs per concept. Separate paragraphs with \\n\\n.
+- No introductions, conclusions, or summaries at the end. End after the last concept.
+- No meta-commentary ("In this section we will...", "To summarize...").
+- Never repeat information — every paragraph must contain new content.
 
-Return ONLY valid JSON (no markdown, no extra text):
-{"lesson":"...","keyPrinciples":["...","...","...","...","..."],"keyTerms":["Term: def","Term: def","Term: def","Term: def","Term: def"],"practicalApplications":["...","...","..."],"commonMisconceptions":["...","...","..."],"summary":"..."}`;
+Return ONLY valid JSON with these fields:
+{
+  "lesson": "(800-1200 word lesson with concept subheadings, \\n\\n between paragraphs)",
+  "keyPrinciples": ["(5-7 specific factual takeaways, not vague platitudes)"],
+  "keyTerms": ["Term: clear plain-language definition", "(5-8 terms)"],
+  "practicalApplications": ["(3 specific actions: what to do, how, expected outcome)"],
+  "commonMisconceptions": ["(3 specific wrong beliefs and what is actually true)"],
+  "summary": "(2-3 sentences of key takeaways)"
+}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 3000);
+    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.6, 4096);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -2162,7 +2163,7 @@ Return ONLY valid JSON (no markdown, no extra text):
       };
       // Hard reject: lesson must have meaningful content
       const wordCount = this._wordCount(normalized.lesson);
-      if(wordCount < 80) { throw new Error('AI_GENERATION_FAILED'); }
+      if(wordCount < 300) { console.warn(`AI overview: lesson too short (${wordCount} words, need 300+)`); throw new Error('AI_GENERATION_FAILED'); }
       if(wordCount > 4000) { throw new Error('AI_GENERATION_FAILED'); }
       // Accept output with graceful degradation — use what we have even if supplementary fields are thin
       if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
