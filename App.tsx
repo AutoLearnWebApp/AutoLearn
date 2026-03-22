@@ -2135,11 +2135,20 @@ FORMAT RULES:
 - Separate paragraphs with \\n\\n.
 - No introductions, conclusions, or recap paragraphs. End after the last concept.
 - No meta-commentary ("In this section...", "To summarize...", "Let us explore...").
-- Never repeat information — every paragraph must be entirely new content.
+- AVOID REPETITION: Never repeat the same phrase, definition, or example across concepts. Each concept must have unique content. Use varied language — do not repeat "the concept of X" for multiple concepts.
+- Each concept must be DISTINCT and cannot reuse definitions, explanations, or examples from other concepts.
+- If a concept name appears in examples, it should only appear once, then use pronouns or different phrasing.
 
-Return ONLY valid JSON. Here is an example of the expected format and depth (your actual content must be about the topic above, not this example):
+SUPPLEMENTARY FIELDS REQUIREMENTS:
+- keyPrinciples (5-7 items): Core truths or laws that govern the topic. Each must be complete, actionable, and non-obvious. Format: "Statement of principle: explanation of why."
+- keyTerms (5-8 items): Critical vocabulary with definitions. Format: "Term: concise definition that explains the concept in 1-2 sentences."
+- practicalApplications (3-5 items): Real-world HOW-TO actions. Each must include: (1) what to do, (2) how to do it, (3) expected outcome or benefit. Be specific with numbers/timelines.
+- commonMisconceptions (3-5 items): Highlight a WRONG belief and correct it. Format: "WRONG: [incorrect belief]. CORRECT: [accurate explanation]." Do NOT just negate — explain the actual correct principle.
+- summary: 1-2 sentences capturing the core insight and why it matters.
 
-{"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\n[...continues with Concept 2, Concept 3, etc. for 800-1200 words total...]","keyPrinciples":["Prices are determined by the intersection of supply and demand curves, not set arbitrarily by sellers","A shortage occurs when quantity demanded exceeds quantity supplied at the current price, pushing prices upward","Market equilibrium is self-correcting: deviations create pressures that restore balance over time","External shocks shift supply or demand curves, establishing a new equilibrium price and quantity","Price elasticity determines how dramatically quantity changes in response to a price shift"],"keyTerms":["Equilibrium price: the price at which quantity demanded equals quantity supplied, so there is no surplus or shortage","Shortage: a market condition where quantity demanded exceeds quantity supplied at the current price","Supply curve: a graph showing the relationship between a product's price and the quantity producers are willing to sell","Price elasticity: a measure of how sensitive quantity demanded or supplied is to a change in price"],"practicalApplications":["Track competitor pricing and your own inventory levels weekly to identify whether your product is priced above or below equilibrium — if inventory accumulates, your price is too high","Before launching a new product, survey 50-100 potential customers on their willingness to pay at three price points to estimate where your demand curve sits","Monitor commodity input costs monthly and adjust your pricing model within 2 weeks of significant supply shocks to maintain margins"],"commonMisconceptions":["Many believe companies set prices however they want, but in competitive markets prices are constrained by supply and demand — charging above equilibrium leads to unsold inventory","Students often think equilibrium means prices never change, when in reality equilibrium shifts constantly as supply and demand conditions evolve","A common error is assuming higher demand always means higher prices, but if supply increases proportionally, the equilibrium price can remain stable or even fall"],"summary":"Supply and demand is the core mechanism determining prices in market economies. Prices converge toward equilibrium where quantity supplied matches quantity demanded, and external shocks continuously shift this balance point."}`;
+Return ONLY valid JSON. Here is an example of the expected format and depth:
+
+{"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\nConcept 2: Price Elasticity\\n\\nPrice elasticity measures how responsive quantity demanded or supplied is to changes in price. Products with high elasticity see large swings in quantity purchased when prices change slightly; products with low elasticity have stable demand regardless of price changes. For instance, luxury goods like designer handbags typically show high elasticity — a 10% price increase causes 15% fewer purchases. Essential goods like insulin show low elasticity — diabetics need it regardless of cost, so even a 50% price increase barely reduces quantity demanded. Understanding your product's elasticity is critical: raising prices on elastic products shrinks revenue, but on inelastic products increases it.\\n\\nConcept 3: Market Structures\\n\\nMarket structures vary based on the number of competitors and barriers to entry, fundamentally affecting pricing power and profitability. Perfect competition features many firms selling identical products with free entry; no single firm controls prices. Monopolies involve one seller controlling the entire market, allowing price-setting power. Oligopolies have few large competitors who watch each other's moves closely. For example, smartphone makers like Apple operate in an oligopoly — three companies dominate, and when one raises prices, others quickly follow or match. Perfect competition requires commodities where firms are price-takers, such as wheat farming where global supply determines price.","keyPrinciples":["Prices gravitate toward equilibrium where quantity demanded equals quantity supplied; persistent shortages or surpluses trigger automatic price adjustments","Elasticity determines revenue impact: raising prices increases revenue for inelastic products but decreases it for elastic ones","Market structure (competition, oligopoly, monopoly) determines how much pricing power individual firms possess","External shocks shift curves unpredictably; successful firms monitor their competitive environment continuously","Buyer psychology and expectations can drive demand independently of actual supply-side fundamentals"],"keyTerms":["Equilibrium: the price point where quantity demanded equals quantity supplied, resulting in no surplus or shortage","Elasticity: the percentage change in quantity demanded per 1% change in price; elastic goods are price-sensitive, inelastic ones are not","Oligopoly: a market with few competitors (e.g., smartphones, airlines) where firms monitor each other and pricing is interdependent","Barrier to entry: a structural obstacle preventing new competitors from entering a market; includes capital requirements, patents, or brand loyalty"],"practicalApplications":["For your product, run A/B tests at three price points with 100+ customers in each group over 4 weeks, measuring conversions and revenue to empirically determine elasticity","Map your market structure: count competitors, assess their market share, and identify switching costs for customers to determine your pricing flexibility","Set prices monthly by monitoring your actual inventory levels and comparing them to competitors; if your stock is depleting, you may be underpriced","Create a simple spreadsheet tracking your costs, competitor prices, and sales volume; update it weekly to catch demand or supply shocks early"],"commonMisconceptions":["WRONG: If demand is high, raising prices is always good. CORRECT: High demand with elastic products may actually increase revenue through volume at lower prices.","WRONG: Monopolies always maximize profit by raising prices maximally. CORRECT: Some monopolies intentionally price low to build network effects or deter regulatory action.","WRONG: Competitors always match each other's prices in oligopolies. CORRECT: Competitors sometimes compete on quality or service instead of price to avoid destructive price wars.","WRONG: Costs determine prices. CORRECT: Prices are driven by supply and demand; high-cost sellers may go bankrupt if their prices fall below costs due to competition."],"summary":"Prices emerge from the continuous interaction of supply and demand, moderated by market structure. Understanding equilibrium, elasticity, and competitive positioning enables effective pricing strategies."}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
     const r = await this.callGroq(prompt, 0, undefined, 60000, 0.35, 4096);
@@ -3136,6 +3145,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const audioSpeedRef = useRef<number>(1.0);
   const audioGenRef = useRef<number>(0); // generation counter to prevent stale callbacks
   const audioPrefetchRef = useRef<Map<number,{base64:string,mimeType:string}|null>>(new Map());
+  const audioProgressBarWidthRef = useRef<number>(0); // for tap-to-skip functionality
   const clarifyRequestInFlightRef = useRef(false);
   const buildCurriculumInFlightRef = useRef(false);
   const uploadInFlightRef = useRef(false);
@@ -4540,28 +4550,20 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     return chunks.length > 0 ? chunks : [''];
   };
 
-  // Synthesize a single chunk text → {base64, mimeType} using Groq first, Gemini fallback
+  // Synthesize a single chunk text → {base64, mimeType} using Groq only (no fallback to save chat quota for Quiz/Games)
   const synthesizeChunk = async (text:string, chunkIdx:number):Promise<{base64:string,mimeType:string}|null> => {
     if(!text.trim()) return null;
-    // --- Try Groq Orpheus TTS first (saves Gemini quota) ---
+    // --- Use Groq Orpheus TTS only (no fallback to preserve Gemini quota for Quiz/Games tabs) ---
     if(ApiKeys.hasGroqKey()) {
       try {
         const result = await AI.synthesizeGroqSpeech(text, ApiKeys.getAudiobookVoice());
         return { base64: result.base64, mimeType: result.mimeType || 'audio/wav' };
       } catch(e:any) {
         console.warn('[Audiobook] Groq TTS failed on chunk', chunkIdx, ':', e?.message);
-        if(chunkIdx===0) AI._safeAlert('Groq TTS Error', 'Groq voice synthesis failed:\n' + (e?.message||'Unknown error'));
+        if(chunkIdx===0) AI._safeAlert('Groq TTS Quota Exceeded', 'Daily TTS limit reached. Try again tomorrow or check your Groq usage.');
       }
     }
-    // --- Fallback: Gemini TTS ---
-    if(ApiKeys.hasGeminiKey()) {
-      try {
-        const result = await AI.synthesizeSpeech(text, _selectedVoiceName, audioSpeedRef.current);
-        return { base64: result.base64, mimeType: result.mimeType };
-      } catch(e:any) {
-        console.warn('[Audiobook] Gemini TTS also failed on chunk', chunkIdx, ':', e?.message);
-      }
-    }
+    // No fallback — gracefully skip if TTS unavailable
     return null;
   };
 
@@ -5218,19 +5220,38 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
                   </TouchableOpacity>
                 </View>
 
-                {/* Progress indicator */}
+                {/* Progress indicator — tap/drag to skip to any section */}
                 {audioTotalChunks>0&&(
                   <View style={{marginBottom:12}}>
-                    <View style={{height:3,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2}}>
-                      <View style={{height:'100%',borderRadius:2,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
-                    </View>
+                    <TouchableOpacity
+                      activeOpacity={0.7}
+                      onPress={(e:any)=>{
+                        const {locationX, locationY} = e.nativeEvent;
+                        // Will use onLayout to capture bar width
+                        if(audioProgressBarWidthRef.current) {
+                          const percent = Math.max(0, Math.min(100, (locationX / audioProgressBarWidthRef.current) * 100));
+                          const targetChunk = Math.floor((percent / 100) * audioChunksRef.current.length);
+                          const gen = ++audioGenRef.current;
+                          TTSEngine.stop().then(async ()=>{
+                            await activatePlaybackSession();
+                            if(gen===audioGenRef.current) playChunkAt(targetChunk, gen);
+                          });
+                        }
+                      }}
+                    >
+                      <View style={{height:6,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:3}}
+                        onLayout={(e)=>{ audioProgressBarWidthRef.current = e.nativeEvent.layout.width; }}
+                      >
+                        <View style={{height:'100%',borderRadius:3,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
+                      </View>
+                    </TouchableOpacity>
                   </View>
                 )}
 
-                {/* Speed selector */}
+                {/* Speed selector — removed 2x to prevent TTS quality issues */}
                 <Text style={{color:'#64748B',fontSize:11,fontWeight:'600',letterSpacing:1,marginBottom:6}}>SPEED</Text>
                 <View style={{flexDirection:'row',gap:6}}>
-                  {[1.0,1.25,1.5,1.75,2.0].map(spd=>(
+                  {[1.0,1.25,1.5,1.75].map(spd=>(
                     <TouchableOpacity key={spd} onPress={()=>changeSpeed(spd)} style={{flex:1,backgroundColor:audioSpeed===spd?'rgba(139,92,246,0.2)':'rgba(255,255,255,0.05)',borderRadius:8,paddingVertical:8,alignItems:'center',borderWidth:1,borderColor:audioSpeed===spd?'#8B5CF6':'rgba(255,255,255,0.08)'}}>
                       <Text style={{color:audioSpeed===spd?'#8B5CF6':theme.text,fontSize:12,fontWeight:'700'}}>{spd}x</Text>
                     </TouchableOpacity>
