@@ -115,7 +115,7 @@ let _kokoroInitPromise: Promise<void>|null = null;
 let _kokoroMsgId = 0;
 const _kokoroPendingCallbacks = new Map<number, {resolve:(wav:ArrayBuffer)=>void; reject:(e:Error)=>void}>();
 const _KOKORO_INIT_TIMEOUT = 180000; // 3 min max for model download (87MB can be slow on first load)
-const _KOKORO_GEN_TIMEOUT = 90000;   // 90s max per chunk generation (measured from when worker STARTS processing)
+const _KOKORO_GEN_TIMEOUT = 120000;  // 120s max per chunk generation (first chunks after model load may be slower)
 
 // Sequential generation queue — WASM is single-threaded inside the worker, so sending
 // multiple generate messages just queues them internally. This caused timeouts because
@@ -4771,15 +4771,22 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
       if(cached) {
         kokoroResult = cached as any;
         audioPrefetchRef.current.delete(idx);
-      } else {
+      } else if(cached === undefined) {
+        // No cache and not in prefetch — generate now (don't retry)
         kokoroResult = await synthesizeChunkKokoro(text, idx);
         if(gen!==audioGenRef.current) return;
       }
-
-      // Retry once if first attempt failed (e.g. worker was still warming up)
-      if(!kokoroResult?.wavBuffer) {
-        kokoroResult = await synthesizeChunkKokoro(text, idx);
-        if(gen!==audioGenRef.current) return;
+      // If cached === null, chunk is currently being prefetched — wait for it
+      else {
+        // Wait up to 120s for prefetch to complete
+        const maxWait = 120000;
+        const startWait = Date.now();
+        while(audioPrefetchRef.current.get(idx) === null && Date.now() - startWait < maxWait) {
+          await new Promise(r => setTimeout(r, 100));
+          if(gen!==audioGenRef.current) return;
+        }
+        kokoroResult = (audioPrefetchRef.current.get(idx) as any) || null;
+        if(kokoroResult) audioPrefetchRef.current.delete(idx);
       }
 
       if(kokoroResult?.wavBuffer) {
@@ -4850,7 +4857,14 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     audioPrefetchRef.current.clear();
     _kokoroCancelAll(); // cancel all queued/in-flight Kokoro generations
     try { ExpoSpeech.stop(); } catch(_){} // stop native speech if running
-    await TTSEngine.stop();
+    await TTSEngine.stop(); // This increments _token and calls _stopCurrent(true)
+    // Double-check: if there's still an active source, kill it
+    if(TTSEngine._sound) {
+      try {
+        if(typeof TTSEngine._sound.stop === 'function') TTSEngine._sound.stop(0);
+        TTSEngine._sound = null;
+      } catch(_){}
+    }
     setAudioPlaying(false);
   };
   const resumeAudio = async () => {
