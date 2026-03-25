@@ -54,12 +54,222 @@ import Svg, { Path, Circle, Line, Polyline, Rect, Polygon } from 'react-native-s
 
 const { width: SW, height: SH } = Dimensions.get('window');
 // ========== PER-USER API KEYS (stored locally on device) ==========
-let _groqApiKey = '';
+let _cerebrasApiKey = '';
 let _geminiApiKey = '';
 let _selectedVoiceName = 'Zephyr';
 let _podcastVoiceName = 'Puck';       // Gemini Live voice for podcast
-let _audiobookVoiceName = 'diana';    // Groq Orpheus TTS voice for audiobook
+let _audiobookVoiceName = 'af_sky';   // Kokoro TTS voice for audiobook
 let _missingKeyAlerted: Record<string,boolean> = {};
+
+// ========== KOKORO TTS WEB WORKER (off-thread WASM inference) ==========
+// Worker code is embedded inline as a Blob URL. This avoids depending on Expo's
+// public/ directory (Expo dev server serves SPA HTML for unknown paths, breaking
+// file-based workers). The worker loads kokoro-js from jsdelivr CDN.
+const _KOKORO_WORKER_CODE = `
+let tts = null;
+let loading = null;
+async function initTTS() {
+  if (tts) return tts;
+  if (loading) return loading;
+  loading = (async () => {
+    try {
+      self.postMessage({ type: 'status', msg: 'Loading TTS library from CDN...' });
+      const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
+      const KokoroTTS = mod.KokoroTTS;
+      if (!KokoroTTS) throw new Error('KokoroTTS not found in module');
+      self.postMessage({ type: 'status', msg: 'Downloading voice model (~87MB, cached after first load)...' });
+      tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
+        dtype: 'q8', device: 'wasm',
+      });
+      self.postMessage({ type: 'ready' });
+      return tts;
+    } catch (e) {
+      loading = null;
+      throw e;
+    }
+  })();
+  return loading;
+}
+self.onmessage = async (e) => {
+  const { id, type, text, voice } = e.data;
+  if (type === 'generate') {
+    try {
+      const engine = await initTTS();
+      const audio = await engine.generate(text, { voice: voice || 'af_sky' });
+      const wavData = audio.toWav();
+      const buffer = wavData instanceof ArrayBuffer ? wavData : wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength);
+      self.postMessage({ type: 'result', id, wav: buffer }, [buffer]);
+    } catch (err) {
+      self.postMessage({ type: 'error', id, msg: err.message || 'Generation failed' });
+    }
+  } else if (type === 'init') {
+    try { await initTTS(); }
+    catch (err) { self.postMessage({ type: 'error', id, msg: err.message || 'Init failed' }); }
+  }
+};
+`;
+
+let _kokoroWorker: Worker|null = null;
+let _kokoroReady = false;
+let _kokoroInitPromise: Promise<void>|null = null;
+let _kokoroMsgId = 0;
+const _kokoroPendingCallbacks = new Map<number, {resolve:(wav:ArrayBuffer)=>void; reject:(e:Error)=>void}>();
+const _KOKORO_INIT_TIMEOUT = 180000; // 3 min max for model download (87MB can be slow on first load)
+const _KOKORO_GEN_TIMEOUT = 90000;   // 90s max per chunk generation (measured from when worker STARTS processing)
+
+// Sequential generation queue — WASM is single-threaded inside the worker, so sending
+// multiple generate messages just queues them internally. This caused timeouts because
+// each message's timer started when SENT, not when the worker began processing it.
+// Now we serialize: only one generate message is in-flight at a time.
+let _kokoroGenerating = false;
+const _kokoroQueue: Array<{text:string; voice:string; id:number; resolve:(wav:ArrayBuffer)=>void; reject:(e:Error)=>void; cancelToken:number}> = [];
+let _kokoroCancelGeneration = 0; // increment to cancel all pending queue items
+
+const _initKokoroWorker = ():Promise<void> => {
+  if(_kokoroReady && _kokoroWorker) return Promise.resolve();
+  if(_kokoroInitPromise) return _kokoroInitPromise;
+  if(typeof window === 'undefined') return Promise.reject(new Error('Kokoro TTS only available on web'));
+  _kokoroInitPromise = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if(!settled) { settled = true; _kokoroInitPromise = null; reject(new Error('Kokoro model download timed out (3 min). Check your internet connection.')); }
+    }, _KOKORO_INIT_TIMEOUT);
+    try {
+      const blob = new Blob([_KOKORO_WORKER_CODE], { type: 'application/javascript' });
+      _kokoroWorker = new Worker(URL.createObjectURL(blob));
+      _kokoroWorker.onmessage = (e:MessageEvent) => {
+        const { type, id, wav, msg } = e.data;
+        if(type === 'ready') {
+          _kokoroReady = true;
+          if(!settled) { settled = true; clearTimeout(timeout); resolve(); }
+        } else if(type === 'status') {
+          // status messages from worker (loading library, downloading model) — silent
+        } else if(type === 'result' && id != null) {
+          const cb = _kokoroPendingCallbacks.get(id);
+          if(cb) { _kokoroPendingCallbacks.delete(id); cb.resolve(wav); }
+        } else if(type === 'error') {
+          const errMsg = msg || 'Kokoro worker error';
+          if(id != null) {
+            const cb = _kokoroPendingCallbacks.get(id);
+            if(cb) { _kokoroPendingCallbacks.delete(id); cb.reject(new Error(errMsg)); }
+          }
+          if(!_kokoroReady && !settled) {
+            console.warn('[Kokoro] Worker init failed:', errMsg);
+            settled = true; clearTimeout(timeout); _kokoroInitPromise = null;
+            reject(new Error(errMsg));
+          }
+        }
+      };
+      _kokoroWorker.onerror = (e:ErrorEvent) => {
+        console.warn('[Kokoro] Worker error:', e?.message);
+        if(!settled) { settled = true; clearTimeout(timeout); _kokoroInitPromise = null; reject(new Error(e?.message || 'Worker failed')); }
+      };
+      _kokoroWorker.postMessage({ type: 'init' });
+    } catch(e:any) { if(!settled) { settled = true; clearTimeout(timeout); } _kokoroInitPromise = null; reject(e); }
+  });
+  return _kokoroInitPromise;
+};
+
+// Pre-initialize Kokoro worker on app start (web only) so model is cached
+// before user ever clicks play. Runs silently in background — no UI impact.
+const _kokoroPreInit = () => {
+  if(typeof window === 'undefined' || typeof Worker === 'undefined') return;
+  // Delay slightly so app startup isn't affected
+  setTimeout(() => {
+    _initKokoroWorker().catch(e => {
+      console.warn('[Kokoro] Background pre-init failed (will retry on first use):', e?.message);
+      // Reset so it can retry when user actually needs it
+      _kokoroInitPromise = null;
+    });
+  }, 2000);
+};
+
+const _kokoroProcessQueue = () => {
+  if(_kokoroGenerating || _kokoroQueue.length === 0) return;
+  const item = _kokoroQueue.shift()!;
+
+  // If cancelled while waiting in queue, reject immediately and process next
+  if(item.cancelToken !== _kokoroCancelGeneration) {
+    item.reject(new Error('Kokoro generation cancelled'));
+    _kokoroProcessQueue();
+    return;
+  }
+
+  _kokoroGenerating = true;
+
+  const timeout = setTimeout(() => {
+    _kokoroPendingCallbacks.delete(item.id);
+    item.reject(new Error('Kokoro TTS generation timed out'));
+    _kokoroGenerating = false;
+    _kokoroProcessQueue();
+  }, _KOKORO_GEN_TIMEOUT);
+
+  _kokoroPendingCallbacks.set(item.id, {
+    resolve: (wav) => {
+      clearTimeout(timeout);
+      item.resolve(wav);
+      _kokoroGenerating = false;
+      _kokoroProcessQueue();
+    },
+    reject: (e) => {
+      clearTimeout(timeout);
+      item.reject(e);
+      _kokoroGenerating = false;
+      _kokoroProcessQueue();
+    },
+  });
+
+  _kokoroWorker!.postMessage({ type:'generate', id: item.id, text: item.text, voice: item.voice });
+};
+
+const _kokoroGenerate = async (text:string, voice:string):Promise<ArrayBuffer> => {
+  await _initKokoroWorker();
+  if(!_kokoroWorker) throw new Error('Kokoro worker not available');
+  const id = ++_kokoroMsgId;
+  const cancelToken = _kokoroCancelGeneration;
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    _kokoroQueue.push({ text, voice, id, resolve, reject, cancelToken });
+    _kokoroProcessQueue();
+  });
+};
+
+// Cancel all pending and queued Kokoro generations (called on pause/stop)
+const _kokoroCancelAll = () => {
+  _kokoroCancelGeneration++;
+  // Reject and clear all queued items
+  while(_kokoroQueue.length > 0) {
+    const item = _kokoroQueue.shift()!;
+    item.reject(new Error('Kokoro generation cancelled'));
+  }
+  // Reject all in-flight callbacks
+  for(const [, cb] of _kokoroPendingCallbacks) {
+    cb.reject(new Error('Kokoro generation cancelled'));
+  }
+  _kokoroPendingCallbacks.clear();
+  _kokoroGenerating = false;
+};
+
+// ========== WEB AUDIO CONTEXT (for Kokoro TTS playback) ==========
+let _webAudioCtx: any = null;
+const _unlockWebAudio = () => {
+  if(Platform.OS !== 'web') return;
+  try {
+    if(!_webAudioCtx) {
+      const AC = (globalThis as any).AudioContext || (globalThis as any).webkitAudioContext;
+      if(AC) _webAudioCtx = new AC();
+    }
+    if(_webAudioCtx?.state === 'suspended') {
+      _webAudioCtx.resume().catch(()=>{});
+    }
+    if(_webAudioCtx?.state === 'running') {
+      const buf = _webAudioCtx.createBuffer(1, 1, 22050);
+      const src = _webAudioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(_webAudioCtx.destination);
+      src.start(0);
+    }
+  } catch(_){}
+};
 
 // ========== TYPES ==========
 type MedalType = 'none'|'bronze'|'silver'|'gold'|'trait';
@@ -267,7 +477,7 @@ const I = {
 };
 
 // ========== STORAGE ==========
-const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', GROQ_KEY:'@al_groq_key', GEMINI_KEY:'@al_gemini_key', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice' };
+const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', CEREBRAS_KEY:'@al_cerebras_key', GEMINI_KEY:'@al_gemini_key', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice' };
 type GeminiVoiceOption = { name:string; label:string; gender:'male'|'female'|'neutral'; style:string; };
 const GEMINI_TTS_VOICE_OPTIONS:GeminiVoiceOption[] = [
   { name:'Zephyr', label:'Zephyr - Bright', gender:'male', style:'bright and articulate' },
@@ -313,21 +523,23 @@ const PODCAST_VOICE_OPTIONS:GeminiVoiceOption[] = [
 ];
 const PODCAST_DEFAULT_VOICE = 'Puck';
 
-// Groq Orpheus TTS voices for audiobook narration in the Learn tab
-type GroqTTSVoiceOption = { name:string; label:string; gender:'male'|'female'; style:string; };
-const GROQ_TTS_VOICE_OPTIONS:GroqTTSVoiceOption[] = [
-  { name:'diana', label:'Diana - Clear', gender:'female', style:'clear and articulate' },
-  { name:'autumn', label:'Autumn - Gentle', gender:'female', style:'gentle and soothing' },
-  { name:'hannah', label:'Hannah - Bright', gender:'female', style:'bright and friendly' },
-  { name:'austin', label:'Austin - Confident', gender:'male', style:'confident and steady' },
-  { name:'daniel', label:'Daniel - Deep', gender:'male', style:'deep and professional' },
-  { name:'troy', label:'Troy - Strong', gender:'male', style:'strong and natural' },
+// Kokoro TTS voices for audiobook narration in the Learn tab (runs locally via WASM — free, unlimited)
+type KokoroVoiceOption = { name:string; label:string; gender:'male'|'female'; style:string; };
+const KOKORO_VOICE_OPTIONS:KokoroVoiceOption[] = [
+  { name:'af_sky', label:'Sky - Natural', gender:'female', style:'natural and clear' },
+  { name:'af_bella', label:'Bella - Warm', gender:'female', style:'warm and expressive' },
+  { name:'af_nicole', label:'Nicole - Bright', gender:'female', style:'bright and friendly' },
+  { name:'af_sarah', label:'Sarah - Calm', gender:'female', style:'calm and articulate' },
+  { name:'am_adam', label:'Adam - Confident', gender:'male', style:'confident and steady' },
+  { name:'am_michael', label:'Michael - Deep', gender:'male', style:'deep and professional' },
+  { name:'bf_emma', label:'Emma - British', gender:'female', style:'British, clear and warm' },
+  { name:'bm_george', label:'George - British', gender:'male', style:'British, composed' },
 ];
-const GROQ_TTS_DEFAULT_VOICE = 'diana';
-const _normalizeGroqVoice = (v:string|null|undefined):string => {
+const KOKORO_DEFAULT_VOICE = 'af_sky';
+const _normalizeKokoroVoice = (v:string|null|undefined):string => {
   const clean = (v||'').replace(/^"|"$/g,'').trim().toLowerCase();
-  if(!clean) return GROQ_TTS_DEFAULT_VOICE;
-  return GROQ_TTS_VOICE_OPTIONS.find(x=>x.name===clean)?.name || GROQ_TTS_DEFAULT_VOICE;
+  if(!clean) return KOKORO_DEFAULT_VOICE;
+  return KOKORO_VOICE_OPTIONS.find(x=>x.name===clean)?.name || KOKORO_DEFAULT_VOICE;
 };
 
 const _normalizePodcastVoice = (v:string|null|undefined):string => {
@@ -381,16 +593,16 @@ const _looksLikeGeminiKey = (key:string):boolean => /^AIza[0-9A-Za-z_-]{20,}$/.t
 // API keys + voice selection use secure storage when available, with AsyncStorage fallback.
 const ApiKeys = {
   async loadAll():Promise<void> {
-    try { _groqApiKey = _cleanStored(await SecretStore.getItem(SK.GROQ_KEY)); } catch(_){ _groqApiKey=''; }
+    try { _cerebrasApiKey = _cleanStored(await SecretStore.getItem(SK.CEREBRAS_KEY)); } catch(_){ _cerebrasApiKey=''; }
     try { _geminiApiKey = _cleanStored(await SecretStore.getItem(SK.GEMINI_KEY)); } catch(_){ _geminiApiKey=''; }
     try { _selectedVoiceName = _normalizeVoiceName(await SecretStore.getItem(SK.VOICE)); } catch(_){ _selectedVoiceName=GEMINI_TTS_DEFAULT_VOICE; }
     try { _podcastVoiceName = _normalizePodcastVoice(await SecretStore.getItem(SK.PODCAST_VOICE)); } catch(_){ _podcastVoiceName=PODCAST_DEFAULT_VOICE; }
-    try { _audiobookVoiceName = _normalizeGroqVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=GROQ_TTS_DEFAULT_VOICE; }
+    try { _audiobookVoiceName = _normalizeKokoroVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=KOKORO_DEFAULT_VOICE; }
   },
-  async saveGroqKey(key:string):Promise<void> {
-    _groqApiKey = key.trim();
-    await SecretStore.setItem(SK.GROQ_KEY, _groqApiKey);
-    delete _missingKeyAlerted['groq'];
+  async saveCerebrasKey(key:string):Promise<void> {
+    _cerebrasApiKey = key.trim();
+    await SecretStore.setItem(SK.CEREBRAS_KEY, _cerebrasApiKey);
+    delete _missingKeyAlerted['cerebras'];
   },
   async saveGeminiKey(key:string):Promise<void> {
     _geminiApiKey = key.trim();
@@ -409,13 +621,13 @@ const ApiKeys = {
     await SecretStore.setItem(SK.PODCAST_VOICE, next);
   },
   async saveAudiobookVoice(voiceName:string):Promise<void> {
-    const next = _normalizeGroqVoice(voiceName);
+    const next = _normalizeKokoroVoice(voiceName);
     _audiobookVoiceName = next;
     await SecretStore.setItem(SK.AUDIOBOOK_VOICE, next);
   },
-  getGroqKey:()=>_groqApiKey, getGeminiKey:()=>_geminiApiKey, getVoiceName:()=>_selectedVoiceName,
+  getCerebrasKey:()=>_cerebrasApiKey, getGeminiKey:()=>_geminiApiKey, getVoiceName:()=>_selectedVoiceName,
   getPodcastVoice:()=>_podcastVoiceName, getAudiobookVoice:()=>_audiobookVoiceName,
-  hasGroqKey:()=>_groqApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
+  hasCerebrasKey:()=>_cerebrasApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
   hasLikelyGeminiKey:()=>_looksLikeGeminiKey(_geminiApiKey),
 };
 
@@ -432,8 +644,8 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-const GROQ_MODEL = 'llama-3.3-70b-versatile'; // 70B quality + 12K TPM (fits with trimmed prompts)
-const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
+// Cerebras models in quality order. qwen-3-235b (235B MoE, 65K context) is the primary.
+const CEREBRAS_MODELS = ['qwen-3-235b-a22b-instruct-2507', 'llama-4-scout-17b-16e-instruct', 'llama3.1-8b'];
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
 const PODCAST_API_TIMEOUT_MS = 18000;
@@ -469,19 +681,16 @@ const UsageTracker = {
   },
 };
 
-// ── Global Groq API request queue ──────────────────────────────────────────
-// Serializes all Groq requests to prevent 429 rate-limit storms.
-// Only 1 request flies at a time; others wait in a FIFO queue.
-// Global cooldown: after ANY 429, ALL queued requests wait until the window resets.
-let _groqQueue: Promise<void> = Promise.resolve();
-let _groqCooldownUntil: number = 0; // timestamp (ms) — no requests before this time
-function enqueueGroq<T>(fn: () => Promise<T>): Promise<T> {
+// ── Global Cerebras API request queue ──────────────────────────────────────
+// Serializes all Cerebras requests. 1M tokens/day, 60K TPM — very generous limits.
+let _cerebrasQueue: Promise<void> = Promise.resolve();
+let _cerebrasCooldownUntil: number = 0;
+function enqueueCerebras<T>(fn: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    _groqQueue = _groqQueue.then(async () => {
-      // Wait for global cooldown before attempting
-      const waitMs = _groqCooldownUntil - Date.now();
+    _cerebrasQueue = _cerebrasQueue.then(async () => {
+      const waitMs = _cerebrasCooldownUntil - Date.now();
       if (waitMs > 0) {
-        console.warn(`AI: Groq queue waiting ${Math.round(waitMs/1000)}s for rate-limit cooldown`);
+        console.warn(`AI: Cerebras queue waiting ${Math.round(waitMs/1000)}s for cooldown`);
         await new Promise(r => setTimeout(r, waitMs));
       }
       try { resolve(await fn()); }
@@ -491,11 +700,11 @@ function enqueueGroq<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 const AI = {
-  _showMissingKeyAlert(provider:'groq'|'gemini'):void {
+  _showMissingKeyAlert(provider:'cerebras'|'gemini'):void {
     if(_missingKeyAlerted[provider]) return;
     _missingKeyAlerted[provider]=true;
-    const name = provider==='groq'?'Groq':'Gemini';
-    const url = provider==='groq'?'console.groq.com':'aistudio.google.com';
+    const name = provider==='cerebras'?'Cerebras':'Gemini';
+    const url = provider==='cerebras'?'cloud.cerebras.ai':'aistudio.google.com';
     Alert.alert(`${name} API Key Required`,`Add your ${name} API key in Profile > API Keys.\n\nGet a free key at ${url}`,[{text:'OK'}]);
   },
 
@@ -1537,42 +1746,12 @@ const AI = {
 
 
 
-  // Parse Groq's rate-limit reset headers (format: "1m30s", "6s", "2m0s", etc.)
-  _parseResetDuration(val:string):number {
-    if(!val) return 0;
-    let ms = 0;
-    const minMatch = val.match(/([\d.]+)m/);
-    const secMatch = val.match(/([\d.]+)s/);
-    if(minMatch) ms += parseFloat(minMatch[1]) * 60000;
-    if(secMatch) ms += parseFloat(secMatch[1]) * 1000;
-    return ms;
-  },
-
-  // Read remaining budget from Groq response headers and set cooldown if needed.
-  // This PREVENTS 429s by proactively waiting before the next call.
-  _updateCooldownFromHeaders(headers:Headers):void {
-    const remainingTokens = parseInt(headers.get('x-ratelimit-remaining-tokens')||'', 10);
-    const resetTokens = headers.get('x-ratelimit-reset-tokens') || '';
-    // If token budget is low (<6000 — not enough for another big call), wait for reset
-    if(!isNaN(remainingTokens) && remainingTokens < 6000 && resetTokens) {
-      const resetMs = this._parseResetDuration(resetTokens);
-      if(resetMs > 0) {
-        _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + resetMs + 2000);
-        console.log(`AI: Groq tokens remaining: ${remainingTokens}, next call will wait ${Math.round(resetMs/1000)}s for budget reset`);
-      }
-    }
-  },
-
-  async callGroq(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=16384):Promise<string> {
-    if(!_groqApiKey) { return ''; }
+  async callCerebras(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=8192):Promise<string> {
+    if(!_cerebrasApiKey) { return ''; }
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const canRequest = await UsageTracker.canMakeRequest();
     if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
-    // Route through global queue — only 1 Groq request at a time.
-    // The queue respects _groqCooldownUntil which is set proactively after each
-    // successful call based on remaining token budget. This means we NEVER call
-    // when the budget is exhausted — no 429s, no retries, just works.
-    return enqueueGroq(async () => {
+    return enqueueCerebras(async () => {
       const controller = new AbortController();
       const abortBySignal = () => controller.abort();
       let timeout:any = null;
@@ -1582,131 +1761,43 @@ const AI = {
           signal.addEventListener('abort', abortBySignal, { once:true });
         }
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
-          method:'POST',
-          headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
-          body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
-          signal:controller.signal,
-        });
-
-        if(r.status===429) {
-          // Shouldn't happen if proactive cooldown is working, but handle gracefully:
-          // read actual wait time from headers, wait, and try exactly once more.
-          const retryAfter = r.headers.get('retry-after');
-          const resetTokens = r.headers.get('x-ratelimit-reset-tokens') || '';
-          const resetRequests = r.headers.get('x-ratelimit-reset-requests') || '';
-          const retryAfterMs = retryAfter ? Math.max(parseFloat(retryAfter)||0, 0) * 1000 : 0;
-          const waitMs = Math.max(retryAfterMs, this._parseResetDuration(resetTokens), this._parseResetDuration(resetRequests), 60000) + 1000;
-          console.warn(`AI: Groq 429 (unexpected) — waiting ${Math.round(waitMs/1000)}s (retry-after=${retryAfter}, reset-tok=${resetTokens}, reset-req=${resetRequests})`);
-          _groqCooldownUntil = Math.max(_groqCooldownUntil, Date.now() + waitMs);
-          await new Promise(res => setTimeout(res, waitMs));
-          // Single retry after waiting the full duration
-          if(timeout) { clearTimeout(timeout); timeout = null; }
-          const timeout2 = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-          try {
-            const r2 = await fetch('https://api.groq.com/openai/v1/chat/completions',{
-              method:'POST',
-              headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
-              body:JSON.stringify({model:GROQ_MODEL,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
-              signal:controller.signal,
-            });
-            clearTimeout(timeout2);
-            if(!r2.ok) { console.warn(`AI: Groq retry failed: ${r2.status}`); return ''; }
-            this._updateCooldownFromHeaders(r2.headers);
-            const d2 = await r2.json();
-            const text2 = d2?.choices?.[0]?.message?.content;
-            if(text2 && typeof text2 === 'string' && text2.trim().length > 0) { await UsageTracker.increment(); return text2.trim(); }
+        // Try models in quality order — fall back if a model returns 404 (unavailable on free tier)
+        for(const model of CEREBRAS_MODELS) {
+          const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
+            method:'POST',
+            headers:{'Content-Type':'application/json','Authorization':`Bearer ${_cerebrasApiKey}`},
+            body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:maxTokens}),
+            signal:controller.signal,
+          });
+          if(r.status===404) {
+            console.warn(`AI: Cerebras model ${model} not available, trying next...`);
+            continue;
+          }
+          if(r.status===429) {
+            const retryAfter = r.headers.get('retry-after');
+            const waitMs = retryAfter ? Math.max(parseFloat(retryAfter)||30, 30) * 1000 : 60000;
+            console.warn(`AI: Cerebras 429 — waiting ${Math.round(waitMs/1000)}s`);
+            _cerebrasCooldownUntil = Math.max(_cerebrasCooldownUntil, Date.now() + waitMs);
             return '';
-          } catch(_e:any) { clearTimeout(timeout2); return ''; }
+          }
+          if(r.status===401) { this._safeAlert('Invalid Cerebras Key','Your Cerebras API key appears invalid. Check it in Profile > API Keys.'); return ''; }
+          if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status}`); return ''; }
+          const d = await r.json();
+          const text = d?.choices?.[0]?.message?.content;
+          if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
+          return '';
         }
-
-        if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-        if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status}`); return ''; }
-
-        // SUCCESS — read remaining budget and proactively set cooldown for next call
-        this._updateCooldownFromHeaders(r.headers);
-
-        const d = await r.json();
-        const text = d?.choices?.[0]?.message?.content;
-        if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
+        console.warn('AI: All Cerebras models failed');
         return '';
       } catch(e:any) {
         if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-        console.warn(`AI: Groq error: ${e?.message||'unknown'}`);
+        console.warn(`AI: Cerebras error: ${e?.message||'unknown'}`);
         return '';
       } finally {
         if(timeout) clearTimeout(timeout);
         if(signal) signal.removeEventListener('abort', abortBySignal);
       }
     });
-  },
-
-  // Groq Orpheus TTS — used for audiobook narration in the Learn tab (saves Gemini quota)
-  async synthesizeGroqSpeech(
-    text:string,
-    voice:string=_audiobookVoiceName,
-    signal?:AbortSignal,
-  ):Promise<{base64:string;mimeType:string}> {
-    if(!_groqApiKey) {
-      this._showMissingKeyAlert('groq');
-      throw new Error('Groq API key required for TTS');
-    }
-    if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-    let clean = safeStr(text||'').replace(/[#*_~`\[\]]/g,'').replace(/\s+/g,' ').trim();
-    if(!clean) throw new Error('No text to synthesize');
-    // Groq Orpheus has a 200 character limit per request
-    if(clean.length > 200) {
-      // Truncate at a word boundary near 195 chars
-      const truncated = clean.slice(0, 195);
-      const lastSpace = truncated.lastIndexOf(' ');
-      clean = lastSpace > 100 ? truncated.slice(0, lastSpace) : truncated;
-    }
-    const controller = new AbortController();
-    const abortBySignal = () => controller.abort();
-    let timeout:any = null;
-    try {
-      if(signal) {
-        if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
-        signal.addEventListener('abort', abortBySignal, { once:true });
-      }
-      timeout = setTimeout(()=>controller.abort(), TTS_API_TIMEOUT_MS);
-      const r = await fetch('https://api.groq.com/openai/v1/audio/speech',{
-        method:'POST',
-        headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${_groqApiKey}` },
-        body:JSON.stringify({
-          model: GROQ_TTS_MODEL,
-          voice: _normalizeGroqVoice(voice),
-          input: clean,
-          response_format: 'wav',
-        }),
-        signal:controller.signal,
-      });
-      if(r.status===401) throw new Error('Invalid Groq key for TTS');
-      if(r.status===429) throw new Error('Groq TTS quota exceeded');
-      if(!r.ok) {
-        let detail = '';
-        try { detail = safeStr(await r.text()); } catch(_){}
-        throw new Error(detail ? `Groq TTS HTTP ${r.status}: ${detail}` : `Groq TTS HTTP ${r.status}`);
-      }
-      const buffer = await r.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      if(!bytes.length) throw new Error('Groq TTS returned empty audio');
-      // Validate WAV header: must start with "RIFF"
-      if(bytes.length < 44 || bytes[0]!==0x52 || bytes[1]!==0x49 || bytes[2]!==0x46 || bytes[3]!==0x46) {
-        console.warn('[Groq TTS] Response does not have valid WAV header, first 8 bytes:', Array.from(bytes.slice(0,8)));
-        throw new Error('Groq TTS returned invalid WAV data');
-      }
-      console.warn(`[Groq TTS] Valid WAV: ${bytes.length} bytes, header OK`);
-      const rawCT = safeStr(r.headers.get('content-type') || '').toLowerCase();
-      const mimeType = rawCT.startsWith('audio/') ? rawCT.split(';')[0].trim() : 'audio/wav';
-      return { base64:_bytesToBase64(bytes), mimeType };
-    } catch(e:any) {
-      if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-      throw e;
-    } finally {
-      if(timeout) clearTimeout(timeout);
-      if(signal) signal.removeEventListener('abort', abortBySignal);
-    }
   },
 
   async callGemini(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000, maxModels:number=GEMINI_MODELS.length):Promise<string> {
@@ -1777,19 +1868,19 @@ const AI = {
     return '';
   },
 
-  // App-wide text generation is Groq-only. Gemini is reserved for podcast live voice features.
+  // App-wide text generation uses Cerebras. Gemini is reserved for podcast live voice features.
   async call(prompt:string, retries:number=2, maxTokens:number=4096):Promise<string> {
-    if(_groqApiKey) {
-      const result = await this.callGroq(prompt, retries, undefined, 30000, 0.4, maxTokens);
+    if(_cerebrasApiKey) {
+      const result = await this.callCerebras(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
-    if(!_groqApiKey) {
-      this._showMissingKeyAlert('groq');
+    if(!_cerebrasApiKey) {
+      this._showMissingKeyAlert('cerebras');
     }
     return '';
   },
 
-  // Podcast-specific: tries Gemini first, falls back to Groq
+  // Podcast-specific: tries Gemini first, falls back to Cerebras
   async callForPodcast(prompt:string, retries:number=2, signal?:AbortSignal):Promise<string> {
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const quickRetries = Math.min(PODCAST_API_MAX_RETRIES, Math.max(0, retries));
@@ -1797,11 +1888,11 @@ const AI = {
       const result = await this.callGemini(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS, 1);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
-    if(_groqApiKey) {
-      const result = await this.callGroq(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
+    if(_cerebrasApiKey) {
+      const result = await this.callCerebras(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
-    if(!_groqApiKey && !_geminiApiKey) {
+    if(!_cerebrasApiKey && !_geminiApiKey) {
       this._showMissingKeyAlert('gemini');
     }
     return '';
@@ -2074,8 +2165,8 @@ Return ONLY valid JSON:
     }
 
     // --- Step 2: Require API key ---
-    if(!_groqApiKey) {
-      throw new Error('GROQ_API_KEY_MISSING');
+    if(!_cerebrasApiKey) {
+      throw new Error('CEREBRAS_API_KEY_MISSING');
     }
 
     // --- Step 3: Build the prompt ---
@@ -2151,7 +2242,7 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
 {"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\nConcept 2: Price Elasticity\\n\\nPrice elasticity measures how responsive quantity demanded or supplied is to changes in price. Products with high elasticity see large swings in quantity purchased when prices change slightly; products with low elasticity have stable demand regardless of price changes. For instance, luxury goods like designer handbags typically show high elasticity — a 10% price increase causes 15% fewer purchases. Essential goods like insulin show low elasticity — diabetics need it regardless of cost, so even a 50% price increase barely reduces quantity demanded. Understanding your product's elasticity is critical: raising prices on elastic products shrinks revenue, but on inelastic products increases it.\\n\\nConcept 3: Market Structures\\n\\nMarket structures vary based on the number of competitors and barriers to entry, fundamentally affecting pricing power and profitability. Perfect competition features many firms selling identical products with free entry; no single firm controls prices. Monopolies involve one seller controlling the entire market, allowing price-setting power. Oligopolies have few large competitors who watch each other's moves closely. For example, smartphone makers like Apple operate in an oligopoly — three companies dominate, and when one raises prices, others quickly follow or match. Perfect competition requires commodities where firms are price-takers, such as wheat farming where global supply determines price.","keyPrinciples":["Prices gravitate toward equilibrium where quantity demanded equals quantity supplied; persistent shortages or surpluses trigger automatic price adjustments","Elasticity determines revenue impact: raising prices increases revenue for inelastic products but decreases it for elastic ones","Market structure (competition, oligopoly, monopoly) determines how much pricing power individual firms possess","External shocks shift curves unpredictably; successful firms monitor their competitive environment continuously","Buyer psychology and expectations can drive demand independently of actual supply-side fundamentals"],"keyTerms":["Equilibrium: the price point where quantity demanded equals quantity supplied, resulting in no surplus or shortage","Elasticity: the percentage change in quantity demanded per 1% change in price; elastic goods are price-sensitive, inelastic ones are not","Oligopoly: a market with few competitors (e.g., smartphones, airlines) where firms monitor each other and pricing is interdependent","Barrier to entry: a structural obstacle preventing new competitors from entering a market; includes capital requirements, patents, or brand loyalty"],"practicalApplications":["For your product, run A/B tests at three price points with 100+ customers in each group over 4 weeks, measuring conversions and revenue to empirically determine elasticity","Map your market structure: count competitors, assess their market share, and identify switching costs for customers to determine your pricing flexibility","Set prices monthly by monitoring your actual inventory levels and comparing them to competitors; if your stock is depleting, you may be underpriced","Create a simple spreadsheet tracking your costs, competitor prices, and sales volume; update it weekly to catch demand or supply shocks early"],"commonMisconceptions":["WRONG: If demand is high, raising prices is always good. CORRECT: High demand with elastic products may actually increase revenue through volume at lower prices.","WRONG: Monopolies always maximize profit by raising prices maximally. CORRECT: Some monopolies intentionally price low to build network effects or deter regulatory action.","WRONG: Competitors always match each other's prices in oligopolies. CORRECT: Competitors sometimes compete on quality or service instead of price to avoid destructive price wars.","WRONG: Costs determine prices. CORRECT: Prices are driven by supply and demand; high-cost sellers may go bankrupt if their prices fall below costs due to competition."],"summary":"Prices emerge from the continuous interaction of supply and demand, moderated by market structure. Understanding equilibrium, elasticity, and competitive positioning enables effective pricing strategies."}`;
 
     // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    const r = await this.callGroq(prompt, 0, undefined, 60000, 0.35, 4096);
+    const r = await this.callCerebras(prompt, 0, undefined, 60000, 0.35, 4096);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -2370,7 +2461,7 @@ IMPORTANT RULES:
 - No asterisks, hashtags, or special characters — just natural speech
 - Occasionally reference things the host said earlier to show you're listening
 - Avoid repeating the same explanation from prior turns`;
-    // Podcast uses cross-provider fallback: Gemini first, then Groq
+    // Podcast uses cross-provider fallback: Gemini first, then Cerebras
     const result = await this.callForPodcast(p, 2, signal);
     const normalized = result ? this._normalizePodcastText(result) : '';
     if(normalized && lastAiTurn && _podcastSimilarity(normalized, lastAiTurn) > 0.82) {
@@ -2821,14 +2912,15 @@ const _detectAudioMime = (base64:string):string => {
   return '';
 };
 
-// Platform audio session setup
-const _nativeSpeechSupported = ():boolean => Platform.OS!=='web' && typeof (ExpoSpeech as any)?.speak === 'function';
-// On native, use cache directory for temp TTS files. On web, use data URIs (no file system).
+// Platform audio session setup — cache directory for native TTS temp files
 const _ttsCacheDir = (Platform.OS !== 'web') ? (LegacyFileSystem.cacheDirectory || LegacyFileSystem.documentDirectory || '') : '';
 const _ttsFilePrefix = _ttsCacheDir ? `${_ttsCacheDir}gemini_tts_` : '';
 
 const activatePlaybackSession = async () => {
-  if(Platform.OS==='web') return;
+  if(Platform.OS==='web') {
+    _unlockWebAudio(); // Create/resume AudioContext during user gesture for Kokoro TTS playback
+    return;
+  }
   try {
     await Audio.setAudioModeAsync({
       playsInSilentModeIOS: true,
@@ -2842,13 +2934,6 @@ const activatePlaybackSession = async () => {
     console.warn('activatePlaybackSession:', e);
   }
 };
-
-const _webSpeechSupported = ():boolean => {
-  if(Platform.OS!=='web') return false;
-  const g:any = globalThis as any;
-  return !!(g?.speechSynthesis && g?.SpeechSynthesisUtterance);
-};
-const _nativeRate = (rate:number):number => Math.max(0.1, Math.min(1, rate/1.6));
 
 type TTSSpeakCallbacks = {
   onStart?: ()=>void;
@@ -2878,10 +2963,16 @@ const TTSEngine = {
     this._fileUri = '';
     if(snd) {
       if(Platform.OS==='web') {
-        // HTML5 Audio cleanup
-        try { snd.pause(); } catch(_){}
-        try { snd.onended=null; snd.onerror=null; snd.onplay=null; } catch(_){}
-        try { snd.removeAttribute('src'); snd.load(); } catch(_){}
+        // Check if it's a Web Audio API AudioBufferSourceNode (from playWavBuffer)
+        if(typeof snd.stop === 'function' && typeof snd.connect === 'function' && !snd.pause) {
+          try { snd.onended=null; } catch(_){}
+          try { snd.stop(); } catch(_){}
+        } else {
+          // HTML5 Audio cleanup
+          try { snd.pause(); } catch(_){}
+          try { snd.onended=null; snd.onerror=null; snd.onplay=null; } catch(_){}
+          try { snd.removeAttribute('src'); snd.load(); } catch(_){}
+        }
       } else {
         // expo-av Sound cleanup
         try { snd.setOnPlaybackStatusUpdate(null as any); } catch(_){}
@@ -2905,6 +2996,52 @@ const TTSEngine = {
   },
 
   get isPlaying():boolean { return this._sound !== null || this._callbacks !== null; },
+
+  // Play WAV ArrayBuffer directly via Web Audio API — bypasses HTML5 Audio autoplay issues
+  async playWavBuffer(wavBuffer:ArrayBuffer, options:TTSSpeakOptions={}):Promise<void> {
+    await this._stopCurrent(false);
+    const token = ++this._token;
+    this._callbacks = options;
+    try {
+      const volume = Math.max(0.05, Math.min(1.0, options.volume ?? 1.0));
+      await activatePlaybackSession();
+      if(token!==this._token) return;
+
+      if(!_webAudioCtx) {
+        const AC = (globalThis as any).AudioContext || (globalThis as any).webkitAudioContext;
+        if(AC) _webAudioCtx = new AC();
+      }
+      if(!_webAudioCtx) throw new Error('Web Audio API not available');
+      if(_webAudioCtx.state === 'suspended') await _webAudioCtx.resume();
+
+      const bufferCopy = wavBuffer.slice(0);
+      const audioBuffer = await _webAudioCtx.decodeAudioData(bufferCopy);
+      if(token!==this._token) return;
+
+      const source = _webAudioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      const gainNode = _webAudioCtx.createGain();
+      gainNode.gain.value = volume;
+      source.connect(gainNode);
+      gainNode.connect(_webAudioCtx.destination);
+
+      this._sound = source;
+      source.onended = () => {
+        if(token===this._token) {
+          this._sound = null;
+          this._callbacks = null;
+          options.onDone?.();
+        }
+      };
+      source.start(0);
+      if(token===this._token) options.onStart?.();
+    } catch(e:any) {
+      console.warn('[TTSEngine.playWavBuffer] error:', e?.message);
+      if(token!==this._token) return;
+      this._callbacks = null;
+      options.onError?.(e);
+    }
+  },
 
   async playAudioBase64(base64:string, mimeType:string='audio/wav', options:TTSSpeakOptions={}):Promise<void> {
     await this._stopCurrent(false);
@@ -3136,6 +3273,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
   // Audio book mode
   const [audioPlaying,setAudioPlaying] = useState(false);
+  const [audioStarting,setAudioStarting] = useState(false); // true while Kokoro model is loading for first playback
   const [audioSpeed,setAudioSpeed] = useState<number>(1.0);
   const [showAudioControls,setShowAudioControls] = useState(false);
   const [audioProgress,setAudioProgress] = useState(0);
@@ -3144,7 +3282,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const audioChunkIdxRef = useRef<number>(0);
   const audioSpeedRef = useRef<number>(1.0);
   const audioGenRef = useRef<number>(0); // generation counter to prevent stale callbacks
-  const audioPrefetchRef = useRef<Map<number,{base64:string,mimeType:string}|null>>(new Map());
+  const audioPrefetchRef = useRef<Map<number,{wavBuffer:ArrayBuffer}|null>>(new Map());
   const audioProgressBarWidthRef = useRef<number>(0); // for tap-to-skip functionality
   const clarifyRequestInFlightRef = useRef(false);
   const buildCurriculumInFlightRef = useRef(false);
@@ -4507,7 +4645,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     // Paragraphs are separated by double newlines or sentence-ending punctuation groups.
     const rawParagraphs = text.split(/\n\s*\n|\r\n\s*\r\n/).map(p=>p.trim()).filter(Boolean);
     const chunks:string[] = [];
-    const MAX_CHUNK_WORDS = 30; // Cap chunks to ~30 words (~180 chars) for Groq Orpheus 200-char limit
+    const MAX_CHUNK_WORDS = 50; // Kokoro WASM has no character limit — use larger chunks for smoother narration
     for(const para of rawParagraphs) {
       const words = para.split(/\s+/).filter(Boolean);
       if(words.length <= MAX_CHUNK_WORDS) {
@@ -4550,21 +4688,18 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     return chunks.length > 0 ? chunks : [''];
   };
 
-  // Synthesize a single chunk text → {base64, mimeType} using Groq only (no fallback to save chat quota for Quiz/Games)
-  const synthesizeChunk = async (text:string, chunkIdx:number):Promise<{base64:string,mimeType:string}|null> => {
+  // Synthesize a single chunk via Kokoro TTS (local WASM — free, unlimited, no API key needed)
+  const synthesizeChunkKokoro = async (text:string, chunkIdx:number):Promise<{wavBuffer:ArrayBuffer}|null> => {
     if(!text.trim()) return null;
-    // --- Use Groq Orpheus TTS only (no fallback to preserve Gemini quota for Quiz/Games tabs) ---
-    if(ApiKeys.hasGroqKey()) {
-      try {
-        const result = await AI.synthesizeGroqSpeech(text, ApiKeys.getAudiobookVoice());
-        return { base64: result.base64, mimeType: result.mimeType || 'audio/wav' };
-      } catch(e:any) {
-        console.warn('[Audiobook] Groq TTS failed on chunk', chunkIdx, ':', e?.message);
-        if(chunkIdx===0) AI._safeAlert('Groq TTS Quota Exceeded', 'Daily TTS limit reached. Try again tomorrow or check your Groq usage.');
-      }
+    if(Platform.OS!=='web') return null; // Kokoro only works on web via WASM; native uses device speech fallback
+    try {
+      const voice = ApiKeys.getAudiobookVoice() || KOKORO_DEFAULT_VOICE;
+      const wavBuffer = await _kokoroGenerate(text, voice);
+      return { wavBuffer };
+    } catch(e:any) {
+      console.warn('[Kokoro] TTS failed on chunk', chunkIdx, ':', e?.message);
+      return null;
     }
-    // No fallback — gracefully skip if TTS unavailable
-    return null;
   };
 
   // Start prefetching the next chunk in the background
@@ -4575,12 +4710,10 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const text = (chunks[nextIdx]||'').trim();
     if(!text) return;
     audioPrefetchRef.current.set(nextIdx, null); // mark as in-flight
-    console.log('[Audiobook] Prefetching chunk', nextIdx);
-    synthesizeChunk(text, nextIdx).then(result=>{
+    synthesizeChunkKokoro(text, nextIdx).then(result=>{
       if(gen!==audioGenRef.current) { audioPrefetchRef.current.delete(nextIdx); return; }
       if(result) {
         audioPrefetchRef.current.set(nextIdx, result);
-        console.log('[Audiobook] Prefetch ready for chunk', nextIdx);
       } else {
         audioPrefetchRef.current.delete(nextIdx);
       }
@@ -4626,52 +4759,86 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const onStartCb = ()=>{
       if(gen===audioGenRef.current) {
         setAudioPlaying(true);
-        // Start prefetching the NEXT chunk as soon as current starts playing
-        prefetchNextChunk(idx+1, gen);
       }
     };
     const onStoppedCb = ()=>{ setAudioPlaying(false); };
 
-    // Check if we have a prefetched result for this chunk
-    let audioResult: {base64:string,mimeType:string}|null = null;
-    const cached = audioPrefetchRef.current.get(idx);
-    if(cached) {
-      console.log('[Audiobook] Using prefetched audio for chunk', idx);
-      audioResult = cached;
-      audioPrefetchRef.current.delete(idx);
-    } else {
-      // Not prefetched — synthesize now (and start prefetching next in parallel)
-      console.log('[Audiobook] Synthesizing chunk', idx, '(not prefetched)');
-      prefetchNextChunk(idx+1, gen); // start prefetching next while we synthesize this one
-      audioResult = await synthesizeChunk(text, idx);
-      if(gen!==audioGenRef.current) return;
-    }
+    // Generate via Kokoro TTS (local WASM — free, unlimited on web)
+    // On native platforms, fall back to device speech at the bottom.
+    if(Platform.OS === 'web') {
+      let kokoroResult: {wavBuffer:ArrayBuffer}|null = null;
+      const cached = audioPrefetchRef.current.get(idx);
+      if(cached) {
+        kokoroResult = cached as any;
+        audioPrefetchRef.current.delete(idx);
+      } else {
+        kokoroResult = await synthesizeChunkKokoro(text, idx);
+        if(gen!==audioGenRef.current) return;
+      }
 
-    if(audioResult) {
-      console.log('[Audiobook] Playing chunk', idx, ':', audioResult.base64.length, 'chars');
-      await TTSEngine.playAudioBase64(audioResult.base64, audioResult.mimeType, {
-        rate, volume: 1,
-        onStart: onStartCb,
-        onDone: advanceToNextChunk,
-        onStopped: onStoppedCb,
-        onError: (e:any)=>{
-          console.warn('[Audiobook] playback error on chunk', idx, e?.message);
+      // Retry once if first attempt failed (e.g. worker was still warming up)
+      if(!kokoroResult?.wavBuffer) {
+        kokoroResult = await synthesizeChunkKokoro(text, idx);
+        if(gen!==audioGenRef.current) return;
+      }
+
+      if(kokoroResult?.wavBuffer) {
+        try {
+          await TTSEngine.playWavBuffer(kokoroResult.wavBuffer, {
+            rate, volume: 1,
+            onStart: () => {
+              onStartCb();
+              // Only prefetch AFTER current chunk starts playing (sequential, no queue flood)
+              prefetchNextChunk(idx+1, gen);
+            },
+            onDone: advanceToNextChunk,
+            onStopped: onStoppedCb,
+            onError: (e:any)=>{
+              console.warn('[Audiobook] Kokoro playback error on chunk', idx, e?.message);
+              if(gen===audioGenRef.current) advanceToNextChunk();
+            },
+          });
+          return;
+        } catch(e:any) {
+          console.warn('[Audiobook] Kokoro playback failed on chunk', idx, ':', e?.message);
+          // Skip this chunk and advance — do NOT fall back to robotic device speech
           if(gen===audioGenRef.current) advanceToNextChunk();
-        },
-      });
-      return;
+          return;
+        }
+      } else {
+        // Kokoro generation failed twice — skip chunk silently and continue
+        console.warn('[Audiobook] Kokoro unavailable for chunk', idx, '— skipping');
+        if(gen===audioGenRef.current) advanceToNextChunk();
+        return;
+      }
     }
 
-    // No TTS available — skip to next chunk (no robotic fallback)
-    console.warn('[Audiobook] No TTS available, skipping chunk', idx);
-    advanceToNextChunk();
+    // Native platform only — use device speech (Kokoro WASM is web-only)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ExpoSpeech.speak(text, {
+          rate: rate,
+          onDone: resolve,
+          onError: (e:any) => reject(e),
+          onStopped: () => { onStoppedCb(); resolve(); },
+        });
+        onStartCb();
+      });
+      advanceToNextChunk();
+    } catch(e:any) {
+      console.warn('[Audiobook] Device speech failed on chunk', idx, e?.message);
+      advanceToNextChunk();
+    }
   };
 
   const stopAudio = async () => {
     audioGenRef.current++; // invalidate all pending callbacks
     audioPrefetchRef.current.clear();
+    _kokoroCancelAll(); // cancel all queued/in-flight Kokoro generations
+    try { ExpoSpeech.stop(); } catch(_){} // stop native speech if running
     await TTSEngine.stop();
     setAudioPlaying(false);
+    setAudioStarting(false);
     setShowAudioControls(false);
     setAudioProgress(0);
     setAudioTotalChunks(0);
@@ -4681,6 +4848,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const pauseAudio = async () => {
     audioGenRef.current++; // invalidate pending onDone so it won't auto-advance
     audioPrefetchRef.current.clear();
+    _kokoroCancelAll(); // cancel all queued/in-flight Kokoro generations
+    try { ExpoSpeech.stop(); } catch(_){} // stop native speech if running
     await TTSEngine.stop();
     setAudioPlaying(false);
   };
@@ -4721,6 +4890,9 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   };
 
   const playFullLesson = async (overview:SectionOverview) => {
+    // Prevent double-clicks while already starting or playing
+    if(audioStarting) return;
+
     const fullText = AI._normalizeReadableText(
       safeStr(overview.lesson||'').replace(/[#*_~`]/g,''),
       {ensureSentenceEnd:true, maxWordsWithoutPunctuation:24}
@@ -4730,8 +4902,24 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const chunks = splitIntoChunks(fullText);
     if(!chunks.length) { Alert.alert('No Content','There is no audio content to read.'); return; }
 
-    // Stop any existing playback
+    // Stop any existing playback and cancel pending generations
+    _kokoroCancelAll();
     await TTSEngine.stop();
+
+    // Show loading state while ensuring Kokoro model is ready (web only)
+    if(Platform.OS === 'web' && !_kokoroReady) {
+      setAudioStarting(true);
+      setShowAudioControls(true);
+      try {
+        await _initKokoroWorker();
+      } catch(e:any) {
+        console.warn('[Audiobook] Kokoro init failed:', e?.message);
+        setAudioStarting(false);
+        Alert.alert('Voice Model Error', 'Could not load the voice model. Please check your internet connection and try again.');
+        return;
+      }
+      setAudioStarting(false);
+    }
 
     // Activate playback audio session (overrides iOS mute switch)
     await activatePlaybackSession();
@@ -5208,17 +5396,26 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
                   <TouchableOpacity onPress={skipBackward} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center'}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>-10s</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={()=>{
+                  <TouchableOpacity disabled={audioStarting} onPress={()=>{
+                    if(audioStarting) return; // prevent double-clicks during model load
                     if(audioPlaying){pauseAudio();}
                     else if(audioChunksRef.current.length>0){resumeAudio();}
                     else{playFullLesson(overview);}
-                  }} style={{width:56,height:56,borderRadius:28,backgroundColor:audioPlaying?'#EF4444':'#8B5CF6',alignItems:'center',justifyContent:'center'}}>
-                    {audioPlaying?<I.Stop s={22} c="white"/>:<I.Play s={22} c="white"/>}
+                  }} style={{width:56,height:56,borderRadius:28,backgroundColor:audioStarting?'#6B7280':audioPlaying?'#EF4444':'#8B5CF6',alignItems:'center',justifyContent:'center',opacity:audioStarting?0.7:1}}>
+                    {audioStarting?<ActivityIndicator size="small" color="white"/>:audioPlaying?<I.Stop s={22} c="white"/>:<I.Play s={22} c="white"/>}
                   </TouchableOpacity>
                   <TouchableOpacity onPress={skipForward} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center'}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>+10s</Text>
                   </TouchableOpacity>
                 </View>
+
+                {/* Loading indicator while Kokoro model downloads */}
+                {audioStarting&&(
+                  <View style={{alignItems:'center',marginBottom:12}}>
+                    <Text style={{color:'#8B5CF6',fontSize:13,fontWeight:'600'}}>Preparing voice model…</Text>
+                    <Text style={{color:'#64748B',fontSize:11,marginTop:2}}>First time takes ~30s (cached after)</Text>
+                  </View>
+                )}
 
                 {/* Progress indicator — tap/drag to skip to any section */}
                 {audioTotalChunks>0&&(
@@ -5278,7 +5475,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
             </Text>
             <Text style={{color:'#94A3B8',fontSize:14,textAlign:'center',marginBottom:16}}>
               {sectionOverviewError==='no_api_key'
-                ? 'Add your Groq API key in Profile > API Keys to generate lessons.'
+                ? 'Add your Cerebras API key in Profile > API Keys to generate lessons.'
                 : 'The AI could not generate this lesson. Check your connection and try again.'}
             </Text>
             <TouchableOpacity onPress={()=>{setSectionOverviewError(null);loadSectionOverview(selSection,true);}} style={{backgroundColor:theme.primary,paddingHorizontal:28,paddingVertical:12,borderRadius:12}}>
@@ -10408,24 +10605,24 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   const [tempColor,setTempColor] = useState('');
   // API keys state
   const [showApiKeys,setShowApiKeys] = useState(false);
-  const [groqKey,setGroqKey] = useState('');
+  const [cerebrasKey,setCerebrasKey] = useState('');
   const [geminiKey,setGeminiKey] = useState('');
   // Voice state
   const [showVoicePicker,setShowVoicePicker] = useState(false);
   const [selectedVoice,setSelectedVoice] = useState(_podcastVoiceName);
   const [voicePreviewing,setVoicePreviewing] = useState(false);
   const selectedVoiceMeta = PODCAST_VOICE_OPTIONS.find(v=>v.name===selectedVoice) || PODCAST_VOICE_OPTIONS[0];
-  // Groq audiobook voice state
+  // Kokoro audiobook voice state
   const [selectedAudiobookVoice,setSelectedAudiobookVoice] = useState(_audiobookVoiceName);
-  const [groqVoicePreviewing,setGroqVoicePreviewing] = useState(false);
-  const selectedAudiobookMeta = GROQ_TTS_VOICE_OPTIONS.find(v=>v.name===selectedAudiobookVoice) || GROQ_TTS_VOICE_OPTIONS[0];
+  const [kokoroVoicePreviewing,setKokoroVoicePreviewing] = useState(false);
+  const selectedAudiobookMeta = KOKORO_VOICE_OPTIONS.find(v=>v.name===selectedAudiobookVoice) || KOKORO_VOICE_OPTIONS[0];
 
   useEffect(()=>{
     (async()=>{
-      try { const g = await SecretStore.getItem(SK.GROQ_KEY); setGroqKey(_cleanStored(g)); } catch(_){ setGroqKey(''); }
+      try { const g = await SecretStore.getItem(SK.CEREBRAS_KEY); setCerebrasKey(_cleanStored(g)); } catch(_){ setCerebrasKey(''); }
       try { const m = await SecretStore.getItem(SK.GEMINI_KEY); setGeminiKey(_cleanStored(m)); } catch(_){ setGeminiKey(''); }
       try { const v = await SecretStore.getItem(SK.PODCAST_VOICE); setSelectedVoice(_normalizePodcastVoice(v||_podcastVoiceName)); } catch(_){ setSelectedVoice(_podcastVoiceName); }
-      try { const av = await SecretStore.getItem(SK.AUDIOBOOK_VOICE); setSelectedAudiobookVoice(_normalizeGroqVoice(av||_audiobookVoiceName)); } catch(_){ setSelectedAudiobookVoice(_audiobookVoiceName); }
+      try { const av = await SecretStore.getItem(SK.AUDIOBOOK_VOICE); setSelectedAudiobookVoice(_normalizeKokoroVoice(av||_audiobookVoiceName)); } catch(_){ setSelectedAudiobookVoice(_audiobookVoiceName); }
     })();
   },[]);
   useEffect(()=>{
@@ -10466,35 +10663,38 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
     await ApiKeys.savePodcastVoice(nextVoice);
   },[]);
 
-  const previewGroqVoice = useCallback(async (voiceName:string)=>{
-    if(groqVoicePreviewing) return;
-    if(!ApiKeys.hasGroqKey()) {
-      Alert.alert('Groq API Key Required','Voice preview uses Groq TTS. Add your Groq API key in Profile > API Keys.',[{text:'OK'}]);
-      return;
-    }
-    setGroqVoicePreviewing(true);
+  const previewKokoroVoice = useCallback(async (voiceName:string)=>{
+    if(kokoroVoicePreviewing) return;
+    setKokoroVoicePreviewing(true);
     try {
       await TTSEngine.stop();
+      _unlockWebAudio(); // Unlock AudioContext during this user gesture (button tap)
       const sample = `Hello! I'm your audiobook narrator. Let me read your lessons aloud.`;
-      const { base64, mimeType } = await AI.synthesizeGroqSpeech(sample, voiceName);
-      console.warn(`[previewGroqVoice] Groq returned: base64.length=${base64.length}, mimeType="${mimeType}"`);
-      await TTSEngine.playAudioBase64(base64, mimeType, {
-        onDone: ()=>setGroqVoicePreviewing(false),
-        onError: (e:any)=>{
-          setGroqVoicePreviewing(false);
-          const msg = String(e?.message||'');
-          Alert.alert('Voice Preview Error', msg.length>160 ? msg.slice(0,157)+'...' : (msg||'Could not generate preview audio.'));
-        },
-      });
+      if(Platform.OS==='web') {
+        const wavBuffer = await _kokoroGenerate(sample, voiceName);
+        await TTSEngine.playWavBuffer(wavBuffer, {
+          onDone: ()=>setKokoroVoicePreviewing(false),
+          onError: (e:any)=>{
+            setKokoroVoicePreviewing(false);
+            Alert.alert('Voice Preview Error', String(e?.message||'Could not generate preview audio.').slice(0,160));
+          },
+        });
+      } else {
+        // Native: use expo-speech for preview
+        ExpoSpeech.speak(sample, {
+          rate: 1,
+          onDone: ()=>setKokoroVoicePreviewing(false),
+          onError: ()=>setKokoroVoicePreviewing(false),
+        });
+      }
     } catch(e:any) {
-      setGroqVoicePreviewing(false);
-      const msg = String(e?.message||'');
-      Alert.alert('Voice Preview Error', msg.length>160 ? msg.slice(0,157)+'...' : (msg||'Could not generate preview audio.'));
+      setKokoroVoicePreviewing(false);
+      Alert.alert('Voice Preview Error', String(e?.message||'Could not generate preview audio.').slice(0,160));
     }
-  },[groqVoicePreviewing]);
+  },[kokoroVoicePreviewing]);
 
   const applyAudiobookVoice = useCallback(async (voiceName:string)=>{
-    const next = _normalizeGroqVoice(voiceName);
+    const next = _normalizeKokoroVoice(voiceName);
     setSelectedAudiobookVoice(next);
     await ApiKeys.saveAudiobookVoice(next);
   },[]);
@@ -10513,7 +10713,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   const hasPassword = !!safeStr(profile.password||'').trim();
   const accountHealthScore = Math.max(0, Math.min(100,
     (hasPassword?30:0) +
-    (ApiKeys.hasGroqKey()?35:0) +
+    (ApiKeys.hasCerebrasKey()?35:0) +
     (ApiKeys.hasGeminiKey()?20:0) +
     (profile.tutorialCompleted?15:0)
   ));
@@ -10632,11 +10832,11 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         </View>
         <Text style={{color:theme.text,fontSize:24,fontWeight:'800',marginBottom:4}}>{accountHealthScore}/100</Text>
         <Text style={{color:'#94A3B8',fontSize:13,lineHeight:20,marginBottom:10}}>
-          {ApiKeys.hasGroqKey() ? 'Groq key configured.' : 'Add a Groq key for full Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
+          {ApiKeys.hasCerebrasKey() ? 'Cerebras key configured.' : 'Add a Cerebras key for full Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
         </Text>
         <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(hasPassword?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:hasPassword?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{hasPassword?'Password set':'Password missing'}</Text></View>
-          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasGroqKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasGroqKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasGroqKey()?'Groq ready':'Groq missing'}</Text></View>
+          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasCerebrasKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasCerebrasKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasCerebrasKey()?'Cerebras ready':'Cerebras missing'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasGeminiKey()?'rgba(16,185,129,0.14)':'rgba(245,158,11,0.14)')}}><Text style={{color:ApiKeys.hasGeminiKey()?'#34D399':'#F59E0B',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasGeminiKey()?'Gemini ready':'Gemini optional'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(99,102,241,0.14)'}}><Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700'}}>Mastery {conceptMasteryPct}%</Text></View>
         </View>
@@ -10737,8 +10937,8 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           <Text style={{fontSize:20}}>🔑</Text>
           <View style={{flex:1}}>
             <Text style={{color:theme.text,fontSize:15}}>Manage API Keys</Text>
-            <Text style={{color:ApiKeys.hasGroqKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasGroqKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
-              Groq: {ApiKeys.hasGroqKey()?'✓ Set':'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}
+            <Text style={{color:ApiKeys.hasCerebrasKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasCerebrasKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
+              Cerebras: {ApiKeys.hasCerebrasKey()?'✓ Set':'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}
             </Text>
           </View>
           <I.Right s={20} c="#64748B"/>
@@ -10776,7 +10976,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         </TouchableOpacity>
         <View style={{borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',paddingTop:10,paddingBottom:6}}>
           <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
-            {GROQ_TTS_VOICE_OPTIONS.map(v=>{
+            {KOKORO_VOICE_OPTIONS.map(v=>{
               const isActive = selectedAudiobookVoice===v.name;
               return (
                 <TouchableOpacity key={v.name} onPress={()=>applyAudiobookVoice(v.name)} style={{backgroundColor:isActive?'rgba(139,92,246,0.2)':'rgba(255,255,255,0.05)',borderRadius:10,paddingVertical:8,paddingHorizontal:12,borderWidth:1,borderColor:isActive?'#8B5CF6':'rgba(255,255,255,0.08)',flexDirection:'row',alignItems:'center',gap:6}}>
@@ -10790,13 +10990,13 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           </View>
         </View>
         <TouchableOpacity
-          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',marginTop:6,opacity:groqVoicePreviewing?0.7:1}}
-          disabled={groqVoicePreviewing}
-          onPress={()=>previewGroqVoice(selectedAudiobookVoice)}
+          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',marginTop:6,opacity:kokoroVoicePreviewing?0.7:1}}
+          disabled={kokoroVoicePreviewing}
+          onPress={()=>previewKokoroVoice(selectedAudiobookVoice)}
         >
-          <I.Play s={20} c="#10B981"/><Text style={{color:theme.text,flex:1,fontSize:15}}>{groqVoicePreviewing?'Playing Preview...':'Preview Narrator Voice'}</Text>
+          <I.Play s={20} c="#10B981"/><Text style={{color:theme.text,flex:1,fontSize:15}}>{kokoroVoicePreviewing?'Loading Voice Model...':'Preview Narrator Voice'}</Text>
         </TouchableOpacity>
-        <Text style={{color:'#64748B',fontSize:12,paddingVertical:8,lineHeight:18}}>Used for lesson read-aloud in Learn tab. Powered by Groq Orpheus TTS (requires Groq API key).</Text>
+        <Text style={{color:'#64748B',fontSize:12,paddingVertical:8,lineHeight:18}}>Used for lesson read-aloud in Learn tab. Powered by Kokoro AI — runs locally, no API calls needed. First play downloads the voice model (~160MB, cached).</Text>
       </View>
 
       <Text style={st.section}>ACCOUNT</Text>
@@ -10870,13 +11070,13 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>API Keys</Text>
             <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>Stored securely on your device</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Groq API Key <Text style={{color:'#EF4444'}}>(required)</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Cerebras API Key <Text style={{color:'#EF4444'}}>(required)</Text></Text>
             <TextInput
               style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
-              placeholder="gsk_..." placeholderTextColor="#475569"
-              value={groqKey} onChangeText={setGroqKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
+              placeholder="csk-..." placeholderTextColor="#475569"
+              value={cerebrasKey} onChangeText={setCerebrasKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
             />
-            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at console.groq.com → API Keys → Create</Text>
+            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at cloud.cerebras.ai → API Keys → Create</Text>
 
             <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#F59E0B'}}>(for podcast live voice chat only)</Text></Text>
             <TextInput
@@ -10891,7 +11091,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
                 <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={async()=>{
-                await ApiKeys.saveGroqKey(groqKey);
+                await ApiKeys.saveCerebrasKey(cerebrasKey);
                 await ApiKeys.saveGeminiKey(geminiKey);
                 Alert.alert('Saved','API keys updated. They are stored securely on your device.');
                 setShowApiKeys(false);
@@ -10956,7 +11156,7 @@ const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void
   const [step,setStep] = useState(0);
   const steps = [
     {e:'📚',t:'Welcome to Auto Learn!',d:'Learn without feeling like you\'re studying. Upload notes, take quizzes, play games, or chat with an AI expert!'},
-    {e:'🔑',t:'Set Up AI Access',d:'To use Auto Learn, you\'ll need free API keys. Go to Profile > API Keys after this tutorial to add them:\n\n• Groq (required: text generation + audiobook/preview voice) — console.groq.com\n• Gemini (podcast live voice chat only) — aistudio.google.com\n\nBoth are free! You can set them up later.'},
+    {e:'🔑',t:'Set Up AI Access',d:'To use Auto Learn, you\'ll need free API keys. Go to Profile > API Keys after this tutorial to add them:\n\n• Cerebras (required: text generation) — cloud.cerebras.ai\n• Gemini (podcast live voice chat only) — aistudio.google.com\n\nAudiobook narration uses Kokoro AI (runs locally, no key needed). Both API keys are free! You can set them up later.'},
     {e:'📖',t:'Learn Tab',d:'Upload PDF/TXT notes, or type what you want to learn. Set study session goals and the AI tracks your progress.'},
     {e:'✍️',t:'Quiz Tab',d:'Fully customizable quizzes - multiple choice, fill-in-blank, short response, scenario questions. Control question types and count!'},
     {e:'🎮',t:'Games Tab',d:'Pop Scholar, Brain Blocks, Lexicon - fun games with AI learning interruptions. Wrong answers end your run!'},
@@ -11013,6 +11213,7 @@ export default function App() {
   const loadData = async () => {
     setIsLoading(true);
     await ApiKeys.loadAll(); // Load per-user API keys and voice preference from device storage
+    if(Platform.OS === 'web') _kokoroPreInit(); // Pre-download TTS model in background so it's ready when user clicks play
     const [t,p,pr,tut] = await Promise.all([
       Store.load<Topic[]>(SK.TOPICS,[]),
       Store.load<UserProfile>(SK.PROFILE,defaultProfile),
