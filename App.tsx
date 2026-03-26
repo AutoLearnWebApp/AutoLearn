@@ -271,6 +271,44 @@ const _unlockWebAudio = () => {
   } catch(_){}
 };
 
+// Ensure AudioContext is created and running (for audiobook playback engine)
+const _ensureAudioCtx = ():AudioContext|null => {
+  if(Platform.OS !== 'web') return null;
+  if(!_webAudioCtx) {
+    const AC = (globalThis as any).AudioContext || (globalThis as any).webkitAudioContext;
+    if(AC) _webAudioCtx = new AC();
+  }
+  if(_webAudioCtx?.state === 'suspended') _webAudioCtx.resume().catch(()=>{});
+  return _webAudioCtx;
+};
+
+// Concatenate multiple AudioBuffers into a single AudioBuffer (for seamless audiobook playback)
+const _concatenateAudioBuffers = (buffers:AudioBuffer[], ctx:AudioContext):AudioBuffer => {
+  if(buffers.length === 0) throw new Error('No audio buffers to concatenate');
+  if(buffers.length === 1) return buffers[0];
+  const channels = buffers[0].numberOfChannels;
+  const sampleRate = buffers[0].sampleRate;
+  let totalLength = 0;
+  for(const b of buffers) totalLength += b.length;
+  const output = ctx.createBuffer(channels, totalLength, sampleRate);
+  for(let ch = 0; ch < channels; ch++) {
+    const outData = output.getChannelData(ch);
+    let offset = 0;
+    for(const b of buffers) {
+      outData.set(b.getChannelData(ch), offset);
+      offset += b.length;
+    }
+  }
+  return output;
+};
+
+// Format seconds as m:ss for audio time display
+const _formatAudioTime = (s:number):string => {
+  const m = Math.floor(Math.max(0,s) / 60);
+  const sec = Math.floor(Math.max(0,s) % 60);
+  return `${m}:${sec.toString().padStart(2,'0')}`;
+};
+
 // ========== TYPES ==========
 type MedalType = 'none'|'bronze'|'silver'|'gold'|'trait';
 interface Concept {
@@ -3272,18 +3310,27 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const [editTitleValue,setEditTitleValue] = useState('');
 
   // Audio book mode
+  // ===== Audiobook state (pre-generate-then-play architecture) =====
   const [audioPlaying,setAudioPlaying] = useState(false);
-  const [audioStarting,setAudioStarting] = useState(false); // true while Kokoro model is loading for first playback
+  const [audioStarting,setAudioStarting] = useState(false); // true during generation phase
   const [audioSpeed,setAudioSpeed] = useState<number>(1.0);
   const [showAudioControls,setShowAudioControls] = useState(false);
-  const [audioProgress,setAudioProgress] = useState(0);
-  const [audioTotalChunks,setAudioTotalChunks] = useState(0);
-  const audioChunksRef = useRef<string[]>([]);
-  const audioChunkIdxRef = useRef<number>(0);
+  const [audioProgress,setAudioProgress] = useState(0); // 0-100 for seekable bar
+  const [audioGenProgress,setAudioGenProgress] = useState(0); // 0-100 generation progress
+  const [audioDuration,setAudioDuration] = useState(0); // total seconds
+  const [audioCurrentTime,setAudioCurrentTime] = useState(0); // current position seconds
   const audioSpeedRef = useRef<number>(1.0);
   const audioGenRef = useRef<number>(0); // generation counter to prevent stale callbacks
-  const audioPrefetchRef = useRef<Map<number,{wavBuffer:ArrayBuffer}|null>>(new Map());
-  const audioProgressBarWidthRef = useRef<number>(0); // for tap-to-skip functionality
+  const audioBufferRef = useRef<AudioBuffer|null>(null); // concatenated full audio
+  const audioSourceRef = useRef<AudioBufferSourceNode|null>(null); // current playing source
+  const audioGainRef = useRef<GainNode|null>(null);
+  const audioStartOffsetRef = useRef<number>(0); // offset in buffer where playback started
+  const audioCtxStartTimeRef = useRef<number>(0); // AudioContext.currentTime at source.start()
+  const audioDurationRef = useRef<number>(0);
+  const audioPausedAtRef = useRef<number>(0); // position when paused
+  const audioPositionIntervalRef = useRef<any>(null); // setInterval ID for progress updates
+  const audioStoppedManuallyRef = useRef<boolean>(false); // distinguish manual stop from natural end
+  const audioProgressBarWidthRef = useRef<number>(0); // for tap-to-seek functionality
   const clarifyRequestInFlightRef = useRef(false);
   const buildCurriculumInFlightRef = useRef(false);
   const uploadInFlightRef = useRef(false);
@@ -4688,217 +4735,122 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     return chunks.length > 0 ? chunks : [''];
   };
 
-  // Synthesize a single chunk via Kokoro TTS (local WASM — free, unlimited, no API key needed)
-  const synthesizeChunkKokoro = async (text:string, chunkIdx:number):Promise<{wavBuffer:ArrayBuffer}|null> => {
-    if(!text.trim()) return null;
-    if(Platform.OS!=='web') return null; // Kokoro only works on web via WASM; native uses device speech fallback
-    try {
-      const voice = ApiKeys.getAudiobookVoice() || KOKORO_DEFAULT_VOICE;
-      const wavBuffer = await _kokoroGenerate(text, voice);
-      return { wavBuffer };
-    } catch(e:any) {
-      console.warn('[Kokoro] TTS failed on chunk', chunkIdx, ':', e?.message);
-      return null;
+  // ===== Audiobook Playback Engine (pre-generate-then-play) =====
+  // Get current playback position in seconds
+  const getAudioPosition = ():number => {
+    if(!audioSourceRef.current || !_webAudioCtx) return audioPausedAtRef.current;
+    const elapsed = (_webAudioCtx.currentTime - audioCtxStartTimeRef.current) * audioSourceRef.current.playbackRate.value;
+    return Math.min(audioStartOffsetRef.current + elapsed, audioDurationRef.current);
+  };
+
+  // Start/stop position tracking (updates UI every 250ms)
+  const startPositionTracking = () => {
+    if(audioPositionIntervalRef.current) clearInterval(audioPositionIntervalRef.current);
+    audioPositionIntervalRef.current = setInterval(() => {
+      const pos = getAudioPosition();
+      setAudioCurrentTime(pos);
+      setAudioProgress(audioDurationRef.current > 0 ? Math.round((pos / audioDurationRef.current) * 100) : 0);
+    }, 250);
+  };
+  const stopPositionTracking = () => {
+    if(audioPositionIntervalRef.current) { clearInterval(audioPositionIntervalRef.current); audioPositionIntervalRef.current = null; }
+  };
+
+  // Start playback from a specific offset (seconds) into the full audio buffer
+  const startPlaybackFromOffset = (offsetSeconds:number) => {
+    const buffer = audioBufferRef.current;
+    const ctx = _ensureAudioCtx();
+    if(!buffer || !ctx) return;
+    if(audioSourceRef.current) {
+      audioStoppedManuallyRef.current = true;
+      try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
+      audioSourceRef.current = null;
     }
-  };
-
-  // Start prefetching the next chunk in the background
-  const prefetchNextChunk = (nextIdx:number, gen:number) => {
-    const chunks = audioChunksRef.current;
-    if(gen!==audioGenRef.current || nextIdx<0 || nextIdx>=chunks.length) return;
-    if(audioPrefetchRef.current.has(nextIdx)) return; // already prefetching or cached
-    const text = (chunks[nextIdx]||'').trim();
-    if(!text) return;
-    audioPrefetchRef.current.set(nextIdx, null); // mark as in-flight
-    synthesizeChunkKokoro(text, nextIdx).then(result=>{
-      if(gen!==audioGenRef.current) { audioPrefetchRef.current.delete(nextIdx); return; }
-      if(result) {
-        audioPrefetchRef.current.set(nextIdx, result);
-      } else {
-        audioPrefetchRef.current.delete(nextIdx);
-      }
-    }).catch(()=>{ audioPrefetchRef.current.delete(nextIdx); });
-  };
-
-  const playChunkAt = async (idx:number, gen:number) => {
-    const chunks = audioChunksRef.current;
-    if(gen!==audioGenRef.current) return;
-    if(idx<0||idx>=chunks.length){
+    if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
+    const offset = Math.max(0, Math.min(offsetSeconds, buffer.duration - 0.01));
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = audioSpeedRef.current;
+    if(!audioGainRef.current) { audioGainRef.current = ctx.createGain(); audioGainRef.current.connect(ctx.destination); }
+    audioGainRef.current.gain.value = 1.0;
+    source.connect(audioGainRef.current);
+    source.onended = () => {
+      if(audioStoppedManuallyRef.current) { audioStoppedManuallyRef.current = false; return; }
+      stopPositionTracking();
+      audioSourceRef.current = null;
       setAudioPlaying(false);
       setAudioProgress(100);
-      audioChunkIdxRef.current=0;
-      audioPrefetchRef.current.clear();
-      return;
-    }
-    audioChunkIdxRef.current=idx;
-    setAudioProgress(Math.round(((idx)/Math.max(chunks.length,1))*100));
-    // DON'T set audioPlaying=true here — wait until audio actually starts playing (onStart callback)
-    // Setting it prematurely shows the stop button, and if user clicks it during generation, everything gets cancelled
-
-    const text = (chunks[idx]||'').trim();
-    if(!text) {
-      const nextIdx = idx+1;
-      if(nextIdx<chunks.length) playChunkAt(nextIdx, gen);
-      else { setAudioPlaying(false); setAudioProgress(100); audioChunkIdxRef.current=0; audioPrefetchRef.current.clear(); }
-      return;
-    }
-
-    const advanceToNextChunk = () => {
-      if(gen!==audioGenRef.current) return;
-      const nextIdx = audioChunkIdxRef.current+1;
-      if(nextIdx<audioChunksRef.current.length){
-        playChunkAt(nextIdx, gen);
-      } else {
-        setAudioPlaying(false);
-        setAudioProgress(100);
-        audioChunkIdxRef.current=0;
-        audioPrefetchRef.current.clear();
-      }
+      setAudioCurrentTime(audioDurationRef.current);
     };
+    audioStartOffsetRef.current = offset;
+    audioCtxStartTimeRef.current = ctx.currentTime;
+    source.start(0, offset);
+    audioSourceRef.current = source;
+    audioPausedAtRef.current = 0;
+    setAudioPlaying(true);
+    setAudioStarting(false);
+    startPositionTracking();
+  };
 
-    const rate = Math.max(0.5, Math.min(2.0, audioSpeedRef.current));
-    const onStartCb = ()=>{
-      if(gen===audioGenRef.current) {
-        setAudioStarting(false); // Clear loading spinner — audio is now actually playing
-        setAudioPlaying(true);
-      }
-    };
-    const onStoppedCb = ()=>{ setAudioPlaying(false); setAudioStarting(false); };
-
-    // Generate via Kokoro TTS (local WASM — free, unlimited on web)
-    // On native platforms, fall back to device speech at the bottom.
-    if(Platform.OS === 'web') {
-      let kokoroResult: {wavBuffer:ArrayBuffer}|null = null;
-      const cached = audioPrefetchRef.current.get(idx);
-      if(cached) {
-        // Use pre-generated audio from prefetch
-        kokoroResult = cached as any;
-        audioPrefetchRef.current.delete(idx);
-      } else {
-        // Not cached — generate now (clear any stale null marker first)
-        audioPrefetchRef.current.delete(idx);
-        kokoroResult = await synthesizeChunkKokoro(text, idx);
-        if(gen!==audioGenRef.current) return;
-      }
-
-      if(kokoroResult?.wavBuffer) {
-        try {
-          await TTSEngine.playWavBuffer(kokoroResult.wavBuffer, {
-            rate, volume: 1,
-            onStart: () => {
-              onStartCb();
-              // Only prefetch AFTER current chunk starts playing (sequential, no queue flood)
-              prefetchNextChunk(idx+1, gen);
-            },
-            onDone: advanceToNextChunk,
-            onStopped: onStoppedCb,
-            onError: (e:any)=>{
-              console.warn('[Audiobook] Kokoro playback error on chunk', idx, e?.message);
-              if(gen===audioGenRef.current) advanceToNextChunk();
-            },
-          });
-          return;
-        } catch(e:any) {
-          console.warn('[Audiobook] Kokoro playback failed on chunk', idx, ':', e?.message);
-          // Skip this chunk and advance — do NOT fall back to robotic device speech
-          if(gen===audioGenRef.current) advanceToNextChunk();
-          return;
-        }
-      } else {
-        // Kokoro generation failed — skip chunk and continue
-        console.warn('[Audiobook] Kokoro unavailable for chunk', idx, '— skipping');
-        setAudioStarting(false); // Clear loading state if we're stuck
-        if(gen===audioGenRef.current) advanceToNextChunk();
-        return;
-      }
-    }
-
-    // Native platform only — use device speech (Kokoro WASM is web-only)
-    try {
-      await new Promise<void>((resolve, reject) => {
-        ExpoSpeech.speak(text, {
-          rate: rate,
-          onDone: resolve,
-          onError: (e:any) => reject(e),
-          onStopped: () => { onStoppedCb(); resolve(); },
-        });
-        onStartCb();
-      });
-      advanceToNextChunk();
-    } catch(e:any) {
-      console.warn('[Audiobook] Device speech failed on chunk', idx, e?.message);
-      advanceToNextChunk();
+  const seekTo = (seconds:number) => {
+    const clamped = Math.max(0, Math.min(seconds, audioDurationRef.current));
+    if(audioSourceRef.current && _webAudioCtx) {
+      startPlaybackFromOffset(clamped);
+    } else if(audioBufferRef.current) {
+      audioPausedAtRef.current = clamped;
+      setAudioCurrentTime(clamped);
+      setAudioProgress(audioDurationRef.current > 0 ? Math.round((clamped / audioDurationRef.current) * 100) : 0);
     }
   };
 
-  const stopAudio = async () => {
-    audioGenRef.current++; // invalidate all pending callbacks
-    audioPrefetchRef.current.clear();
-    _kokoroCancelAll(); // cancel all queued/in-flight Kokoro generations
-    try { ExpoSpeech.stop(); } catch(_){} // stop native speech if running
-    await TTSEngine.stop();
+  const stopAudio = () => {
+    audioGenRef.current++;
+    _kokoroCancelAll();
+    stopPositionTracking();
+    if(audioSourceRef.current) {
+      audioStoppedManuallyRef.current = true;
+      try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
+      audioSourceRef.current = null;
+    }
+    audioBufferRef.current = null;
+    audioDurationRef.current = 0;
+    audioPausedAtRef.current = 0;
     setAudioPlaying(false);
     setAudioStarting(false);
     setShowAudioControls(false);
     setAudioProgress(0);
-    setAudioTotalChunks(0);
-    audioChunkIdxRef.current=0;
-    audioChunksRef.current=[];
-  };
-  const pauseAudio = async () => {
-    audioGenRef.current++; // invalidate pending onDone so it won't auto-advance
-    audioPrefetchRef.current.clear();
-    _kokoroCancelAll(); // cancel all queued/in-flight Kokoro generations
-    try { ExpoSpeech.stop(); } catch(_){} // stop native speech if running
-    await TTSEngine.stop(); // This increments _token and calls _stopCurrent(true)
-    // Double-check: if there's still an active source, kill it
-    if(TTSEngine._sound) {
-      try {
-        if(typeof TTSEngine._sound.stop === 'function') TTSEngine._sound.stop(0);
-        TTSEngine._sound = null;
-      } catch(_){}
-    }
-    setAudioPlaying(false);
-  };
-  const resumeAudio = async () => {
-    if(audioChunksRef.current.length>0){
-      const gen = ++audioGenRef.current;
-      await activatePlaybackSession(); // re-activate after pause gap
-      if(gen!==audioGenRef.current) return;
-      playChunkAt(audioChunkIdxRef.current, gen);
-    }
-  };
-  const skipForward = async () => {
-    const next = Math.min(audioChunkIdxRef.current+1, audioChunksRef.current.length-1);
-    const gen = ++audioGenRef.current;
-    await TTSEngine.stop();
-    await activatePlaybackSession();
-    if(gen!==audioGenRef.current) return;
-    playChunkAt(next, gen);
-  };
-  const skipBackward = async () => {
-    const prev = Math.max(audioChunkIdxRef.current-1, 0);
-    const gen = ++audioGenRef.current;
-    await TTSEngine.stop();
-    await activatePlaybackSession();
-    if(gen!==audioGenRef.current) return;
-    playChunkAt(prev, gen);
-  };
-  const changeSpeed = async (spd:number) => {
-    setAudioSpeed(spd);
-    audioSpeedRef.current=spd;
-    if(audioPlaying){
-      const gen = ++audioGenRef.current;
-      await TTSEngine.stop();
-      await activatePlaybackSession();
-      if(gen!==audioGenRef.current) return;
-      playChunkAt(audioChunkIdxRef.current, gen);
-    }
+    setAudioGenProgress(0);
+    setAudioCurrentTime(0);
+    setAudioDuration(0);
   };
 
+  const pauseAudio = () => {
+    if(!audioSourceRef.current) return;
+    audioPausedAtRef.current = getAudioPosition();
+    audioStoppedManuallyRef.current = true;
+    try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
+    audioSourceRef.current = null;
+    stopPositionTracking();
+    setAudioPlaying(false);
+    setAudioCurrentTime(audioPausedAtRef.current);
+  };
+
+  const resumeAudio = () => {
+    if(audioBufferRef.current) startPlaybackFromOffset(audioPausedAtRef.current);
+  };
+
+  const skipForward = () => seekTo(getAudioPosition() + 10);
+  const skipBackward = () => seekTo(getAudioPosition() - 10);
+
+  const changeSpeed = (spd:number) => {
+    setAudioSpeed(spd);
+    audioSpeedRef.current = spd;
+    if(audioSourceRef.current) startPlaybackFromOffset(getAudioPosition());
+  };
+
+  // ===== Pre-generate all audio then play =====
   const playFullLesson = async (overview:SectionOverview) => {
-    // Prevent double-clicks while already starting or playing
-    if(audioStarting) return;
+    if(audioStarting || audioPlaying) return;
 
     const fullText = AI._normalizeReadableText(
       safeStr(overview.lesson||'').replace(/[#*_~`]/g,''),
@@ -4909,40 +4861,74 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const chunks = splitIntoChunks(fullText);
     if(!chunks.length) { Alert.alert('No Content','There is no audio content to read.'); return; }
 
-    // Stop any existing playback and cancel pending generations
-    _kokoroCancelAll();
-    await TTSEngine.stop();
-
-    // Show loading state — keeps button disabled until first chunk actually starts playing.
-    // This prevents the user from seeing a "stop" button and clicking it while Kokoro
-    // is still generating, which would cancel everything.
+    stopAudio();
+    const gen = ++audioGenRef.current;
     setAudioStarting(true);
     setShowAudioControls(true);
+    setAudioGenProgress(0);
 
-    // Ensure Kokoro model is ready (web only) — first time downloads ~87MB (cached after)
+    // Ensure Kokoro model is ready (first time downloads ~87MB, cached after)
     if(Platform.OS === 'web' && !_kokoroReady) {
-      try {
-        await _initKokoroWorker();
-      } catch(e:any) {
-        console.warn('[Audiobook] Kokoro init failed:', e?.message);
+      try { await _initKokoroWorker(); }
+      catch(e:any) {
         setAudioStarting(false);
         Alert.alert('Voice Model Error', 'Could not load the voice model. Please check your internet connection and try again.');
         return;
       }
+      if(gen !== audioGenRef.current) return;
     }
 
-    // Activate playback audio session (overrides iOS mute switch)
     await activatePlaybackSession();
 
-    const gen = ++audioGenRef.current;
-    audioChunksRef.current = chunks;
-    audioChunkIdxRef.current = 0;
-    audioSpeedRef.current = audioSpeed;
-    setAudioTotalChunks(chunks.length);
-    setAudioProgress(0);
-    // audioStarting stays true — cleared by onStart callback in playChunkAt
-    playChunkAt(0, gen);
+    // Generate ALL chunks sequentially with progress tracking
+    const voice = ApiKeys.getAudiobookVoice() || KOKORO_DEFAULT_VOICE;
+    const wavBuffers:ArrayBuffer[] = [];
+    for(let i = 0; i < chunks.length; i++) {
+      if(gen !== audioGenRef.current) return;
+      const text = chunks[i].trim();
+      if(!text) { setAudioGenProgress(Math.round(((i+1)/chunks.length)*100)); continue; }
+      try {
+        const wav = await _kokoroGenerate(text, voice);
+        wavBuffers.push(wav);
+      } catch(e:any) {
+        console.warn('[Audiobook] Generation failed chunk', i, ':', e?.message);
+      }
+      setAudioGenProgress(Math.round(((i+1)/chunks.length)*100));
+    }
+    if(gen !== audioGenRef.current) return;
+
+    if(wavBuffers.length === 0) {
+      setAudioStarting(false);
+      Alert.alert('Generation Failed', 'Could not generate audio. Please try again.');
+      return;
+    }
+
+    // Decode and concatenate into a single AudioBuffer
+    const ctx = _ensureAudioCtx();
+    if(!ctx) { setAudioStarting(false); return; }
+
+    const audioBuffers:AudioBuffer[] = [];
+    for(const wav of wavBuffers) {
+      try { audioBuffers.push(await ctx.decodeAudioData(wav.slice(0))); }
+      catch(e:any) { console.warn('[Audiobook] WAV decode failed:', e?.message); }
+    }
+    if(gen !== audioGenRef.current) return;
+
+    if(audioBuffers.length === 0) {
+      setAudioStarting(false);
+      Alert.alert('Audio Error', 'Could not decode audio.');
+      return;
+    }
+
+    const fullBuffer = _concatenateAudioBuffers(audioBuffers, ctx);
+    audioBufferRef.current = fullBuffer;
+    audioDurationRef.current = fullBuffer.duration;
+    setAudioDuration(fullBuffer.duration);
+    setAudioGenProgress(100);
+
+    startPlaybackFromOffset(0);
   };
+
 
   // Load section overview
   const loadSectionOverview = async (section:Section, force:boolean=false) => {
@@ -5403,62 +5389,72 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
                 {/* Playback controls: back 10s, play/pause, forward 10s */}
                 <View style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:16,marginBottom:14}}>
-                  <TouchableOpacity onPress={skipBackward} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center'}}>
+                  <TouchableOpacity onPress={skipBackward} disabled={audioStarting || !audioBufferRef.current} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',opacity:audioBufferRef.current?1:0.4}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>-10s</Text>
                   </TouchableOpacity>
                   <TouchableOpacity disabled={audioStarting} onPress={()=>{
-                    if(audioStarting) return; // prevent double-clicks during model load
+                    if(audioStarting) return;
                     if(audioPlaying){pauseAudio();}
-                    else if(audioChunksRef.current.length>0){resumeAudio();}
+                    else if(audioBufferRef.current){resumeAudio();}
                     else{playFullLesson(overview);}
                   }} style={{width:56,height:56,borderRadius:28,backgroundColor:audioStarting?'#6B7280':audioPlaying?'#EF4444':'#8B5CF6',alignItems:'center',justifyContent:'center',opacity:audioStarting?0.7:1}}>
                     {audioStarting?<ActivityIndicator size="small" color="white"/>:audioPlaying?<I.Stop s={22} c="white"/>:<I.Play s={22} c="white"/>}
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={skipForward} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center'}}>
+                  <TouchableOpacity onPress={skipForward} disabled={audioStarting || !audioBufferRef.current} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',opacity:audioBufferRef.current?1:0.4}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>+10s</Text>
                   </TouchableOpacity>
                 </View>
 
-                {/* Loading indicator while Kokoro model downloads */}
+                {/* Generation progress — shown while generating all chunks */}
                 {audioStarting&&(
-                  <View style={{alignItems:'center',marginBottom:12}}>
-                    <Text style={{color:'#8B5CF6',fontSize:13,fontWeight:'600'}}>Preparing voice model…</Text>
-                    <Text style={{color:'#64748B',fontSize:11,marginTop:2}}>First time takes ~30s (cached after)</Text>
+                  <View style={{marginBottom:12}}>
+                    <View style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',marginBottom:4}}>
+                      <Text style={{color:'#8B5CF6',fontSize:13,fontWeight:'600'}}>
+                        {audioGenProgress > 0 ? `Generating audio... ${audioGenProgress}%` : 'Loading voice model...'}
+                      </Text>
+                      <TouchableOpacity onPress={stopAudio} hitSlop={{top:8,bottom:8,left:8,right:8}}>
+                        <Text style={{color:'#EF4444',fontSize:12,fontWeight:'600'}}>Cancel</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <View style={{height:4,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2}}>
+                      <View style={{height:'100%',borderRadius:2,backgroundColor:'#8B5CF6',width:`${audioGenProgress}%`}}/>
+                    </View>
+                    {audioGenProgress === 0 && (
+                      <Text style={{color:'#64748B',fontSize:11,marginTop:4}}>First time downloads voice model (~87MB, cached after)</Text>
+                    )}
                   </View>
                 )}
 
-                {/* Progress indicator — tap/drag to skip to any section */}
-                {audioTotalChunks>0&&(
+                {/* Seekable progress bar with time display */}
+                {audioDuration>0&&!audioStarting&&(
                   <View style={{marginBottom:12}}>
                     <TouchableOpacity
                       activeOpacity={0.7}
                       onPress={(e:any)=>{
-                        const {locationX, locationY} = e.nativeEvent;
-                        // Will use onLayout to capture bar width
-                        if(audioProgressBarWidthRef.current) {
-                          const percent = Math.max(0, Math.min(100, (locationX / audioProgressBarWidthRef.current) * 100));
-                          const targetChunk = Math.floor((percent / 100) * audioChunksRef.current.length);
-                          const gen = ++audioGenRef.current;
-                          TTSEngine.stop().then(async ()=>{
-                            await activatePlaybackSession();
-                            if(gen===audioGenRef.current) playChunkAt(targetChunk, gen);
-                          });
+                        const {locationX} = e.nativeEvent;
+                        if(audioProgressBarWidthRef.current && audioDurationRef.current > 0) {
+                          const seekSeconds = (locationX / audioProgressBarWidthRef.current) * audioDurationRef.current;
+                          seekTo(seekSeconds);
                         }
                       }}
                     >
-                      <View style={{height:6,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:3}}
+                      <View style={{height:8,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:4}}
                         onLayout={(e)=>{ audioProgressBarWidthRef.current = e.nativeEvent.layout.width; }}
                       >
-                        <View style={{height:'100%',borderRadius:3,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
+                        <View style={{height:'100%',borderRadius:4,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
                       </View>
                     </TouchableOpacity>
+                    <View style={{flexDirection:'row',justifyContent:'space-between',marginTop:4}}>
+                      <Text style={{color:'#94A3B8',fontSize:11,fontFamily:Platform.OS==='web'?'monospace':undefined}}>{_formatAudioTime(audioCurrentTime)}</Text>
+                      <Text style={{color:'#94A3B8',fontSize:11,fontFamily:Platform.OS==='web'?'monospace':undefined}}>{_formatAudioTime(audioDuration)}</Text>
+                    </View>
                   </View>
                 )}
 
-                {/* Speed selector — removed 2x to prevent TTS quality issues */}
+                {/* Speed selector — playbackRate is applied directly on AudioBufferSourceNode */}
                 <Text style={{color:'#64748B',fontSize:11,fontWeight:'600',letterSpacing:1,marginBottom:6}}>SPEED</Text>
                 <View style={{flexDirection:'row',gap:6}}>
-                  {[1.0,1.25,1.5,1.75].map(spd=>(
+                  {[1.0,1.25,1.5,1.75,2.0].map(spd=>(
                     <TouchableOpacity key={spd} onPress={()=>changeSpeed(spd)} style={{flex:1,backgroundColor:audioSpeed===spd?'rgba(139,92,246,0.2)':'rgba(255,255,255,0.05)',borderRadius:8,paddingVertical:8,alignItems:'center',borderWidth:1,borderColor:audioSpeed===spd?'#8B5CF6':'rgba(255,255,255,0.08)'}}>
                       <Text style={{color:audioSpeed===spd?'#8B5CF6':theme.text,fontSize:12,fontWeight:'700'}}>{spd}x</Text>
                     </TouchableOpacity>
