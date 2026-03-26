@@ -136,7 +136,7 @@ const _initKokoroWorker = ():Promise<void> => {
     }, _KOKORO_INIT_TIMEOUT);
     try {
       const blob = new Blob([_KOKORO_WORKER_CODE], { type: 'application/javascript' });
-      _kokoroWorker = new Worker(URL.createObjectURL(blob));
+      _kokoroWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
       _kokoroWorker.onmessage = (e:MessageEvent) => {
         const { type, id, wav, msg } = e.data;
         if(type === 'ready') {
@@ -4732,7 +4732,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     }
     audioChunkIdxRef.current=idx;
     setAudioProgress(Math.round(((idx)/Math.max(chunks.length,1))*100));
-    setAudioPlaying(true);
+    // DON'T set audioPlaying=true here — wait until audio actually starts playing (onStart callback)
+    // Setting it prematurely shows the stop button, and if user clicks it during generation, everything gets cancelled
 
     const text = (chunks[idx]||'').trim();
     if(!text) {
@@ -4758,10 +4759,11 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const rate = Math.max(0.5, Math.min(2.0, audioSpeedRef.current));
     const onStartCb = ()=>{
       if(gen===audioGenRef.current) {
+        setAudioStarting(false); // Clear loading spinner — audio is now actually playing
         setAudioPlaying(true);
       }
     };
-    const onStoppedCb = ()=>{ setAudioPlaying(false); };
+    const onStoppedCb = ()=>{ setAudioPlaying(false); setAudioStarting(false); };
 
     // Generate via Kokoro TTS (local WASM — free, unlimited on web)
     // On native platforms, fall back to device speech at the bottom.
@@ -4769,24 +4771,14 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
       let kokoroResult: {wavBuffer:ArrayBuffer}|null = null;
       const cached = audioPrefetchRef.current.get(idx);
       if(cached) {
+        // Use pre-generated audio from prefetch
         kokoroResult = cached as any;
         audioPrefetchRef.current.delete(idx);
-      } else if(cached === undefined) {
-        // No cache and not in prefetch — generate now (don't retry)
+      } else {
+        // Not cached — generate now (clear any stale null marker first)
+        audioPrefetchRef.current.delete(idx);
         kokoroResult = await synthesizeChunkKokoro(text, idx);
         if(gen!==audioGenRef.current) return;
-      }
-      // If cached === null, chunk is currently being prefetched — wait for it
-      else {
-        // Wait up to 120s for prefetch to complete
-        const maxWait = 120000;
-        const startWait = Date.now();
-        while(audioPrefetchRef.current.get(idx) === null && Date.now() - startWait < maxWait) {
-          await new Promise(r => setTimeout(r, 100));
-          if(gen!==audioGenRef.current) return;
-        }
-        kokoroResult = (audioPrefetchRef.current.get(idx) as any) || null;
-        if(kokoroResult) audioPrefetchRef.current.delete(idx);
       }
 
       if(kokoroResult?.wavBuffer) {
@@ -4813,8 +4805,9 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           return;
         }
       } else {
-        // Kokoro generation failed twice — skip chunk silently and continue
+        // Kokoro generation failed — skip chunk and continue
         console.warn('[Audiobook] Kokoro unavailable for chunk', idx, '— skipping');
+        setAudioStarting(false); // Clear loading state if we're stuck
         if(gen===audioGenRef.current) advanceToNextChunk();
         return;
       }
@@ -4920,10 +4913,14 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     _kokoroCancelAll();
     await TTSEngine.stop();
 
-    // Show loading state while ensuring Kokoro model is ready (web only)
+    // Show loading state — keeps button disabled until first chunk actually starts playing.
+    // This prevents the user from seeing a "stop" button and clicking it while Kokoro
+    // is still generating, which would cancel everything.
+    setAudioStarting(true);
+    setShowAudioControls(true);
+
+    // Ensure Kokoro model is ready (web only) — first time downloads ~87MB (cached after)
     if(Platform.OS === 'web' && !_kokoroReady) {
-      setAudioStarting(true);
-      setShowAudioControls(true);
       try {
         await _initKokoroWorker();
       } catch(e:any) {
@@ -4932,7 +4929,6 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
         Alert.alert('Voice Model Error', 'Could not load the voice model. Please check your internet connection and try again.');
         return;
       }
-      setAudioStarting(false);
     }
 
     // Activate playback audio session (overrides iOS mute switch)
@@ -4944,7 +4940,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     audioSpeedRef.current = audioSpeed;
     setAudioTotalChunks(chunks.length);
     setAudioProgress(0);
-    setShowAudioControls(true);
+    // audioStarting stays true — cleared by onStart callback in playChunkAt
     playChunkAt(0, gen);
   };
 
@@ -11227,7 +11223,8 @@ export default function App() {
   const loadData = async () => {
     setIsLoading(true);
     await ApiKeys.loadAll(); // Load per-user API keys and voice preference from device storage
-    if(Platform.OS === 'web') _kokoroPreInit(); // Pre-download TTS model in background so it's ready when user clicks play
+    // Kokoro TTS model is loaded on-demand when user first clicks play (not on startup)
+    // This prevents the 87MB model download from making the page unresponsive on load
     const [t,p,pr,tut] = await Promise.all([
       Store.load<Topic[]>(SK.TOPICS,[]),
       Store.load<UserProfile>(SK.PROFILE,defaultProfile),
