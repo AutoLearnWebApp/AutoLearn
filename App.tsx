@@ -50,206 +50,61 @@ try {
   // Optional in this project; fallback storage is AsyncStorage.
 }
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import Svg, { Path, Circle, Line, Polyline, Rect, Polygon } from 'react-native-svg';
 
 const { width: SW, height: SH } = Dimensions.get('window');
+
+// ========== SUPABASE CONFIGURATION ==========
+// TODO: Replace these with your actual Supabase project credentials
+// Get them from: https://supabase.com → Your Project → Settings → API
+const SUPABASE_URL: string = 'YOUR_SUPABASE_URL'; // e.g. https://abcdefgh.supabase.co
+const SUPABASE_ANON_KEY: string = 'YOUR_SUPABASE_ANON_KEY'; // e.g. eyJhbGciOi...
+
+const _supabaseConfigured = ():boolean => SUPABASE_URL !== 'YOUR_SUPABASE_URL' && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY' && SUPABASE_URL.length>10;
+
+let supabase: SupabaseClient | null = null;
+try {
+  if(_supabaseConfigured()) {
+    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: {
+        storage: AsyncStorage as any,
+        autoRefreshToken: true,
+        persistSession: true,
+        detectSessionInUrl: Platform.OS === 'web',
+      },
+    });
+  }
+} catch(e) {
+  console.warn('[Supabase] Init failed:', e);
+}
+let _supabaseUserId: string | null = null;
 // ========== PER-USER API KEYS (stored locally on device) ==========
 let _cerebrasApiKey = '';
 let _geminiApiKey = '';
+// Custom OpenAI-compatible provider (user-configured)
+let _customProviderKey = '';
+let _customProviderUrl = '';  // e.g. https://api.openai.com/v1, https://api.groq.com/openai/v1
+let _customProviderModel = ''; // e.g. gpt-4o-mini, llama-3.1-70b
+let _customProviderName = ''; // display name e.g. "OpenAI", "Groq"
 let _selectedVoiceName = 'Zephyr';
 let _podcastVoiceName = 'Puck';       // Gemini Live voice for podcast
-let _audiobookVoiceName = 'af_sky';   // Kokoro TTS voice for audiobook
+let _audiobookVoiceName = 'Samantha'; // expo-speech voice identifier (cross-platform)
 let _missingKeyAlerted: Record<string,boolean> = {};
 
-// ========== KOKORO TTS WEB WORKER (off-thread WASM inference) ==========
-// Worker code is embedded inline as a Blob URL. This avoids depending on Expo's
-// public/ directory (Expo dev server serves SPA HTML for unknown paths, breaking
-// file-based workers). The worker loads kokoro-js from jsdelivr CDN.
-const _KOKORO_WORKER_CODE = `
-let tts = null;
-let loading = null;
-async function initTTS() {
-  if (tts) return tts;
-  if (loading) return loading;
-  loading = (async () => {
-    try {
-      self.postMessage({ type: 'status', msg: 'Loading TTS library from CDN...' });
-      const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
-      const KokoroTTS = mod.KokoroTTS;
-      if (!KokoroTTS) throw new Error('KokoroTTS not found in module');
-      self.postMessage({ type: 'status', msg: 'Downloading voice model (~87MB, cached after first load)...' });
-      tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
-        dtype: 'q8', device: 'wasm',
-      });
-      self.postMessage({ type: 'ready' });
-      return tts;
-    } catch (e) {
-      loading = null;
-      throw e;
-    }
-  })();
-  return loading;
-}
-self.onmessage = async (e) => {
-  const { id, type, text, voice } = e.data;
-  if (type === 'generate') {
-    try {
-      const engine = await initTTS();
-      const audio = await engine.generate(text, { voice: voice || 'af_sky' });
-      const wavData = audio.toWav();
-      const buffer = wavData instanceof ArrayBuffer ? wavData : wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength);
-      self.postMessage({ type: 'result', id, wav: buffer }, [buffer]);
-    } catch (err) {
-      self.postMessage({ type: 'error', id, msg: err.message || 'Generation failed' });
-    }
-  } else if (type === 'init') {
-    try { await initTTS(); }
-    catch (err) { self.postMessage({ type: 'error', id, msg: err.message || 'Init failed' }); }
+// ========== EXPO SPEECH TTS (cross-platform: web, iOS, Android) ==========
+// Uses expo-speech which wraps native TTS on each platform.
+// No downloads, no WASM, no API keys — uses the device's built-in speech engine.
+const _speechCancelAll = () => {
+  if(typeof window !== 'undefined' && window.speechSynthesis) {
+    try { window.speechSynthesis.cancel(); } catch(_){}
   }
-};
-`;
-
-let _kokoroWorker: Worker|null = null;
-let _kokoroReady = false;
-let _kokoroInitPromise: Promise<void>|null = null;
-let _kokoroMsgId = 0;
-const _kokoroPendingCallbacks = new Map<number, {resolve:(wav:ArrayBuffer)=>void; reject:(e:Error)=>void}>();
-const _KOKORO_INIT_TIMEOUT = 180000; // 3 min max for model download (87MB can be slow on first load)
-const _KOKORO_GEN_TIMEOUT = 120000;  // 120s max per chunk generation (first chunks after model load may be slower)
-
-// Sequential generation queue — WASM is single-threaded inside the worker, so sending
-// multiple generate messages just queues them internally. This caused timeouts because
-// each message's timer started when SENT, not when the worker began processing it.
-// Now we serialize: only one generate message is in-flight at a time.
-let _kokoroGenerating = false;
-const _kokoroQueue: Array<{text:string; voice:string; id:number; resolve:(wav:ArrayBuffer)=>void; reject:(e:Error)=>void; cancelToken:number}> = [];
-let _kokoroCancelGeneration = 0; // increment to cancel all pending queue items
-
-const _initKokoroWorker = ():Promise<void> => {
-  if(_kokoroReady && _kokoroWorker) return Promise.resolve();
-  if(_kokoroInitPromise) return _kokoroInitPromise;
-  if(typeof window === 'undefined') return Promise.reject(new Error('Kokoro TTS only available on web'));
-  _kokoroInitPromise = new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if(!settled) { settled = true; _kokoroInitPromise = null; reject(new Error('Kokoro model download timed out (3 min). Check your internet connection.')); }
-    }, _KOKORO_INIT_TIMEOUT);
-    try {
-      const blob = new Blob([_KOKORO_WORKER_CODE], { type: 'application/javascript' });
-      _kokoroWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
-      _kokoroWorker.onmessage = (e:MessageEvent) => {
-        const { type, id, wav, msg } = e.data;
-        if(type === 'ready') {
-          _kokoroReady = true;
-          if(!settled) { settled = true; clearTimeout(timeout); resolve(); }
-        } else if(type === 'status') {
-          // status messages from worker (loading library, downloading model) — silent
-        } else if(type === 'result' && id != null) {
-          const cb = _kokoroPendingCallbacks.get(id);
-          if(cb) { _kokoroPendingCallbacks.delete(id); cb.resolve(wav); }
-        } else if(type === 'error') {
-          const errMsg = msg || 'Kokoro worker error';
-          if(id != null) {
-            const cb = _kokoroPendingCallbacks.get(id);
-            if(cb) { _kokoroPendingCallbacks.delete(id); cb.reject(new Error(errMsg)); }
-          }
-          if(!_kokoroReady && !settled) {
-            console.warn('[Kokoro] Worker init failed:', errMsg);
-            settled = true; clearTimeout(timeout); _kokoroInitPromise = null;
-            reject(new Error(errMsg));
-          }
-        }
-      };
-      _kokoroWorker.onerror = (e:ErrorEvent) => {
-        console.warn('[Kokoro] Worker error:', e?.message);
-        if(!settled) { settled = true; clearTimeout(timeout); _kokoroInitPromise = null; reject(new Error(e?.message || 'Worker failed')); }
-      };
-      _kokoroWorker.postMessage({ type: 'init' });
-    } catch(e:any) { if(!settled) { settled = true; clearTimeout(timeout); } _kokoroInitPromise = null; reject(e); }
-  });
-  return _kokoroInitPromise;
+  try { ExpoSpeech.stop(); } catch(_){}
 };
 
-// Pre-initialize Kokoro worker on app start (web only) so model is cached
-// before user ever clicks play. Runs silently in background — no UI impact.
-const _kokoroPreInit = () => {
-  if(typeof window === 'undefined' || typeof Worker === 'undefined') return;
-  // Delay slightly so app startup isn't affected
-  setTimeout(() => {
-    _initKokoroWorker().catch(e => {
-      console.warn('[Kokoro] Background pre-init failed (will retry on first use):', e?.message);
-      // Reset so it can retry when user actually needs it
-      _kokoroInitPromise = null;
-    });
-  }, 2000);
-};
 
-const _kokoroProcessQueue = () => {
-  if(_kokoroGenerating || _kokoroQueue.length === 0) return;
-  const item = _kokoroQueue.shift()!;
 
-  // If cancelled while waiting in queue, reject immediately and process next
-  if(item.cancelToken !== _kokoroCancelGeneration) {
-    item.reject(new Error('Kokoro generation cancelled'));
-    _kokoroProcessQueue();
-    return;
-  }
-
-  _kokoroGenerating = true;
-
-  const timeout = setTimeout(() => {
-    _kokoroPendingCallbacks.delete(item.id);
-    item.reject(new Error('Kokoro TTS generation timed out'));
-    _kokoroGenerating = false;
-    _kokoroProcessQueue();
-  }, _KOKORO_GEN_TIMEOUT);
-
-  _kokoroPendingCallbacks.set(item.id, {
-    resolve: (wav) => {
-      clearTimeout(timeout);
-      item.resolve(wav);
-      _kokoroGenerating = false;
-      _kokoroProcessQueue();
-    },
-    reject: (e) => {
-      clearTimeout(timeout);
-      item.reject(e);
-      _kokoroGenerating = false;
-      _kokoroProcessQueue();
-    },
-  });
-
-  _kokoroWorker!.postMessage({ type:'generate', id: item.id, text: item.text, voice: item.voice });
-};
-
-const _kokoroGenerate = async (text:string, voice:string):Promise<ArrayBuffer> => {
-  await _initKokoroWorker();
-  if(!_kokoroWorker) throw new Error('Kokoro worker not available');
-  const id = ++_kokoroMsgId;
-  const cancelToken = _kokoroCancelGeneration;
-  return new Promise<ArrayBuffer>((resolve, reject) => {
-    _kokoroQueue.push({ text, voice, id, resolve, reject, cancelToken });
-    _kokoroProcessQueue();
-  });
-};
-
-// Cancel all pending and queued Kokoro generations (called on pause/stop)
-const _kokoroCancelAll = () => {
-  _kokoroCancelGeneration++;
-  // Reject and clear all queued items
-  while(_kokoroQueue.length > 0) {
-    const item = _kokoroQueue.shift()!;
-    item.reject(new Error('Kokoro generation cancelled'));
-  }
-  // Reject all in-flight callbacks
-  for(const [, cb] of _kokoroPendingCallbacks) {
-    cb.reject(new Error('Kokoro generation cancelled'));
-  }
-  _kokoroPendingCallbacks.clear();
-  _kokoroGenerating = false;
-};
-
-// ========== WEB AUDIO CONTEXT (for Kokoro TTS playback) ==========
+// ========== WEB AUDIO CONTEXT (for audio playback) ==========
 let _webAudioCtx: any = null;
 const _unlockWebAudio = () => {
   if(Platform.OS !== 'web') return;
@@ -271,41 +126,11 @@ const _unlockWebAudio = () => {
   } catch(_){}
 };
 
-// Ensure AudioContext is created and running (for audiobook playback engine)
-const _ensureAudioCtx = ():AudioContext|null => {
-  if(Platform.OS !== 'web') return null;
-  if(!_webAudioCtx) {
-    const AC = (globalThis as any).AudioContext || (globalThis as any).webkitAudioContext;
-    if(AC) _webAudioCtx = new AC();
-  }
-  if(_webAudioCtx?.state === 'suspended') _webAudioCtx.resume().catch(()=>{});
-  return _webAudioCtx;
-};
-
-// Concatenate multiple AudioBuffers into a single AudioBuffer (for seamless audiobook playback)
-const _concatenateAudioBuffers = (buffers:AudioBuffer[], ctx:AudioContext):AudioBuffer => {
-  if(buffers.length === 0) throw new Error('No audio buffers to concatenate');
-  if(buffers.length === 1) return buffers[0];
-  const channels = buffers[0].numberOfChannels;
-  const sampleRate = buffers[0].sampleRate;
-  let totalLength = 0;
-  for(const b of buffers) totalLength += b.length;
-  const output = ctx.createBuffer(channels, totalLength, sampleRate);
-  for(let ch = 0; ch < channels; ch++) {
-    const outData = output.getChannelData(ch);
-    let offset = 0;
-    for(const b of buffers) {
-      outData.set(b.getChannelData(ch), offset);
-      offset += b.length;
-    }
-  }
-  return output;
-};
-
 // Format seconds as m:ss for audio time display
 const _formatAudioTime = (s:number):string => {
-  const m = Math.floor(Math.max(0,s) / 60);
-  const sec = Math.floor(Math.max(0,s) % 60);
+  const v = Number.isFinite(s) ? Math.max(0, s) : 0;
+  const m = Math.floor(v / 60);
+  const sec = Math.floor(v % 60);
   return `${m}:${sec.toString().padStart(2,'0')}`;
 };
 
@@ -324,6 +149,26 @@ interface ConceptTeaching {
   analogies?: string[];
   commonMistakes?: string[];
   loaded: boolean;
+}
+type StudyGuideItemStatus = 'none'|'familiar'|'known'; // none=not reviewed, familiar=yellow, known=green
+interface StudyGuideSection {
+  id: string;
+  sectionId: string;
+  sectionTitle: string;
+  conceptTitle?: string; // individual concept name for fine-grained sections
+  topicId: string;
+  topicTitle: string;
+  content: string; // markdown-like study guide text
+  keyPoints: string[]; // bullet points of key takeaways
+  status: StudyGuideItemStatus;
+}
+interface SavedStudyGuide {
+  id: string;
+  name: string;
+  sections: StudyGuideSection[];
+  createdAt: number;
+  lastAccessedAt: number;
+  scrollPosition?: number;
 }
 interface SectionOverview {
   lesson: string;
@@ -360,6 +205,20 @@ interface ChatMessage {
   id: string; role: 'user'|'ai'; text: string;
   timestamp: string; conceptId?: string;
 }
+interface ReferralNode {
+  username: string;
+  invitedBy: string|null; // null = root (organic join)
+  invitees: string[]; // usernames they've invited
+  joinedAt: string;
+  depth: number; // 0=root, 1=direct invite, 2=grandchild, etc.
+}
+interface ReferralData {
+  myCode: string;
+  myUsername: string;
+  invitedBy: string|null;
+  tree: ReferralNode[];
+  totalInvites: number;
+}
 interface QuizPreset {
   id: string; name: string;
   questionTypes: { multipleChoice: boolean; fillInBlank: boolean; shortResponse: boolean; scenario: boolean; };
@@ -372,8 +231,14 @@ interface Question {
 }
 interface UserProfile {
   username: string; level: number; totalPoints: number;
+  totalConceptsLearned: number; // persistent — never decremented even if topics deleted
+  traitTopicIds: string[]; // topic IDs that ever reached trait medal (persistent)
   themeColors: ThemeColors;
   privacySettings: { showMedals: boolean; showCurrentStudy: boolean; };
+  profilePicture?: string; // base64 data URI or URL
+  email?: string; // for auth
+  authProvider?: 'local'|'google'|'supabase'; // how they signed up
+  newsletterOptIn: boolean; // auto-opted in on signup, can unsubscribe in settings
   tutorialCompleted: boolean; createdAt: string; password: string;
 }
 interface ThemeColors {
@@ -406,7 +271,15 @@ interface Organization {
   createdAt?: string;
   joinCode?: string;
   members: OrganizationMember[];
+  perks: OrgPerk[];
 }
+type OrgPerk = {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  unlockThreshold: number; // member count to unlock
+};
 interface FriendChallenge {
   id: string;
   friendId: string;
@@ -443,6 +316,7 @@ const defaultTheme: ThemeColors = {
   background:'#0F0F1A', card:'#1A1A2E', text:'#E2E8F0',
 };
 const THEME_PRESET_OPTIONS: {id:string;name:string;description:string;colors:ThemeColors}[] = [
+  // ── DARK THEMES ──
   {
     id:'midnight_focus',
     name:'Midnight Focus',
@@ -479,12 +353,130 @@ const THEME_PRESET_OPTIONS: {id:string;name:string;description:string;colors:The
     description:'Neutral dark mode with clean highlights',
     colors:{primary:'#64748B',secondary:'#334155',accent:'#94A3B8',background:'#090B10',card:'#141922',text:'#E5E7EB'},
   },
+  // ── LIGHT THEMES ──
+  {
+    id:'clean_daylight',
+    name:'Clean Daylight',
+    description:'Bright white with indigo accents',
+    colors:{primary:'#4F46E5',secondary:'#6366F1',accent:'#EC4899',background:'#F8FAFC',card:'#FFFFFF',text:'#1E293B'},
+  },
+  {
+    id:'paper_cream',
+    name:'Paper & Cream',
+    description:'Warm off-white like a textbook page',
+    colors:{primary:'#D97706',secondary:'#B45309',accent:'#059669',background:'#FFFBF0',card:'#FFF8E7',text:'#292524'},
+  },
+  {
+    id:'sky_blue',
+    name:'Sky Blue',
+    description:'Light blue atmosphere with crisp text',
+    colors:{primary:'#0284C7',secondary:'#0369A1',accent:'#F59E0B',background:'#F0F9FF',card:'#E0F2FE',text:'#0C4A6E'},
+  },
+  {
+    id:'mint_fresh',
+    name:'Mint Fresh',
+    description:'Cool green-white for focused reading',
+    colors:{primary:'#059669',secondary:'#047857',accent:'#8B5CF6',background:'#F0FDF4',card:'#DCFCE7',text:'#14532D'},
+  },
+  {
+    id:'rose_garden',
+    name:'Rose Garden',
+    description:'Soft pink tones with warm contrast',
+    colors:{primary:'#DB2777',secondary:'#BE185D',accent:'#7C3AED',background:'#FFF1F2',card:'#FFE4E6',text:'#4C0519'},
+  },
+  {
+    id:'lavender_light',
+    name:'Lavender Light',
+    description:'Gentle purple on light lilac background',
+    colors:{primary:'#7C3AED',secondary:'#6D28D9',accent:'#EC4899',background:'#FAF5FF',card:'#F3E8FF',text:'#3B0764'},
+  },
+  {
+    id:'slate_cloud',
+    name:'Slate Cloud',
+    description:'Neutral light gray — minimal and clean',
+    colors:{primary:'#475569',secondary:'#334155',accent:'#3B82F6',background:'#F1F5F9',card:'#E2E8F0',text:'#1E293B'},
+  },
+  {
+    id:'ocean_breeze',
+    name:'Ocean Breeze',
+    description:'Teal and aqua on a bright canvas',
+    colors:{primary:'#0D9488',secondary:'#0F766E',accent:'#F97316',background:'#F0FDFA',card:'#CCFBF1',text:'#134E4A'},
+  },
 ];
+// Detect if a theme is light or dark based on background luminance
+const _isLightTheme = (bg:string):boolean => {
+  const hex = bg.replace('#','');
+  if(hex.length<6) return false;
+  const r = parseInt(hex.slice(0,2),16);
+  const g = parseInt(hex.slice(2,4),16);
+  const b = parseInt(hex.slice(4,6),16);
+  const luminance = (0.299*r + 0.587*g + 0.114*b) / 255;
+  return luminance > 0.5;
+};
+// Get adaptive border/separator/overlay colors based on theme lightness
+const _themeAdaptive = (theme:ThemeColors) => {
+  const light = _isLightTheme(theme.background);
+  return {
+    isLight: light,
+    border: light ? 'rgba(0,0,0,0.1)' : 'rgba(128,128,128,0.15)',
+    borderStrong: light ? 'rgba(0,0,0,0.15)' : 'rgba(128,128,128,0.2)',
+    separator: light ? 'rgba(0,0,0,0.06)' : 'rgba(128,128,128,0.12)',
+    overlay: light ? 'rgba(0,0,0,0.04)' : 'rgba(128,128,128,0.08)',
+    muted: light ? '#64748B' : '#94A3B8',
+    mutedLight: light ? '#94A3B8' : '#64748B',
+    cardShadow: light ? 'rgba(0,0,0,0.06)' : 'transparent',
+    inputBg: light ? 'rgba(0,0,0,0.04)' : 'rgba(128,128,128,0.08)',
+    statusBar: light ? 'dark' as const : 'light' as const,
+    tabBar: light ? 'rgba(0,0,0,0.03)' : theme.card,
+    tabBorder: light ? 'rgba(0,0,0,0.08)' : 'rgba(128,128,128,0.15)',
+  };
+};
+
 const defaultProfile: UserProfile = {
-  username:'Learner', level:1, totalPoints:0, themeColors:defaultTheme,
+  username:'Learner', level:1, totalPoints:0, totalConceptsLearned:0, traitTopicIds:[],
+  themeColors:defaultTheme,
   privacySettings:{showMedals:true,showCurrentStudy:true},
+  newsletterOptIn:true,
   tutorialCompleted:false, createdAt:new Date().toISOString(), password:'',
 };
+// Progressive leveling: easy at first, harder at higher magnitudes
+// Levels 1-9: 100 pts each | 10-99: 250 each | 100-999: 500 each | 1000+: 1000 each
+const getPointsForLevel = (level:number):number => {
+  if(level<=1) return 0;
+  let pts = 0;
+  for(let l=2;l<=level;l++) {
+    if(l<=10) pts+=100;
+    else if(l<=100) pts+=250;
+    else if(l<=1000) pts+=500;
+    else pts+=1000;
+  }
+  return pts;
+};
+const getLevelFromPoints = (pts:number):number => {
+  let level = 1;
+  let remaining = pts;
+  while(remaining>0) {
+    const cost = level<10?100:level<100?250:level<1000?500:1000;
+    if(remaining<cost) break;
+    remaining-=cost;
+    level++;
+  }
+  return level;
+};
+const getLevelProgress = (pts:number):{level:number;pointsInLevel:number;pointsForNext:number;pct:number} => {
+  const level = getLevelFromPoints(pts);
+  const levelStart = getPointsForLevel(level);
+  const cost = level<10?100:level<100?250:level<1000?500:1000;
+  const pointsInLevel = pts - levelStart;
+  return { level, pointsInLevel, pointsForNext:cost, pct:Math.min(100,Math.round((pointsInLevel/cost)*100)) };
+};
+const DEFAULT_ORG_PERKS:OrgPerk[] = [
+  {id:'p1',name:'Study Buddies',description:'See what members are studying in real time',icon:'👀',unlockThreshold:2},
+  {id:'p2',name:'Group Challenges',description:'Create challenges between all org members',icon:'🏆',unlockThreshold:3},
+  {id:'p3',name:'Leaderboard',description:'Full XP and level rankings for all members',icon:'📊',unlockThreshold:2},
+  {id:'p4',name:'Study Streaks',description:'Track consecutive study days as a group',icon:'🔥',unlockThreshold:4},
+  {id:'p5',name:'Shared Topics',description:'Share topic recommendations with members',icon:'📚',unlockThreshold:5},
+];
 const defaultPreset: QuizPreset = {
   id:'default', name:'Balanced Mix',
   questionTypes:{multipleChoice:true,fillInBlank:true,shortResponse:false,scenario:false},
@@ -511,11 +503,14 @@ const I = {
   Edit:({s=24,c='#818CF8'}:{s?:number;c?:string})=>(<Svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth={2}><Path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><Path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></Svg>),
   Send:({s=24,c='#818CF8'}:{s?:number;c?:string})=>(<Svg width={s} height={s} viewBox="0 0 24 24" fill={c} stroke="none"><Path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></Svg>),
   Play:({s=24,c='#818CF8'}:{s?:number;c?:string})=>(<Svg width={s} height={s} viewBox="0 0 24 24" fill={c} stroke="none"><Polygon points="5 3 19 12 5 21 5 3"/></Svg>),
+  Pause:({s=24,c='#818CF8'}:{s?:number;c?:string})=>(<Svg width={s} height={s} viewBox="0 0 24 24" fill={c} stroke="none"><Rect x="5" y="4" width="5" height="16" rx="1"/><Rect x="14" y="4" width="5" height="16" rx="1"/></Svg>),
   Stop:({s=24,c='#EF4444'}:{s?:number;c?:string})=>(<Svg width={s} height={s} viewBox="0 0 24 24" fill={c} stroke="none"><Rect x="4" y="4" width="16" height="16" rx="2"/></Svg>),
 };
 
 // ========== STORAGE ==========
-const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', CEREBRAS_KEY:'@al_cerebras_key', GEMINI_KEY:'@al_gemini_key', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice' };
+interface SavedTheme { id:string; name:string; colors:ThemeColors; createdAt:string; }
+interface AuthState { isLoggedIn:boolean; username:string; email?:string; provider:'local'|'google'|'supabase'; createdAt:string; supabaseId?:string; }
+const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', CEREBRAS_KEY:'@al_cerebras_key', GEMINI_KEY:'@al_gemini_key', CUSTOM_PROVIDER:'@al_custom_provider', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice', REFERRALS:'@al_referrals', STUDY_GUIDES:'@al_study_guides', SAVED_THEMES:'@al_saved_themes', AUTH:'@al_auth' };
 type GeminiVoiceOption = { name:string; label:string; gender:'male'|'female'|'neutral'; style:string; };
 const GEMINI_TTS_VOICE_OPTIONS:GeminiVoiceOption[] = [
   { name:'Zephyr', label:'Zephyr - Bright', gender:'male', style:'bright and articulate' },
@@ -561,23 +556,17 @@ const PODCAST_VOICE_OPTIONS:GeminiVoiceOption[] = [
 ];
 const PODCAST_DEFAULT_VOICE = 'Puck';
 
-// Kokoro TTS voices for audiobook narration in the Learn tab (runs locally via WASM — free, unlimited)
-type KokoroVoiceOption = { name:string; label:string; gender:'male'|'female'; style:string; };
-const KOKORO_VOICE_OPTIONS:KokoroVoiceOption[] = [
-  { name:'af_sky', label:'Sky - Natural', gender:'female', style:'natural and clear' },
-  { name:'af_bella', label:'Bella - Warm', gender:'female', style:'warm and expressive' },
-  { name:'af_nicole', label:'Nicole - Bright', gender:'female', style:'bright and friendly' },
-  { name:'af_sarah', label:'Sarah - Calm', gender:'female', style:'calm and articulate' },
-  { name:'am_adam', label:'Adam - Confident', gender:'male', style:'confident and steady' },
-  { name:'am_michael', label:'Michael - Deep', gender:'male', style:'deep and professional' },
-  { name:'bf_emma', label:'Emma - British', gender:'female', style:'British, clear and warm' },
-  { name:'bm_george', label:'George - British', gender:'male', style:'British, composed' },
+// Audiobook voices (expo-speech — cross-platform: web, iOS, Android)
+type AudiobookVoiceOption = { name:string; label:string; gender:'male'|'female'; style:string; };
+const AUDIOBOOK_VOICE_OPTIONS:AudiobookVoiceOption[] = [
+  { name:'Samantha', label:'Samantha', gender:'female', style:'warm and natural' },
+  { name:'Daniel', label:'Daniel', gender:'male', style:'British, composed' },
 ];
-const KOKORO_DEFAULT_VOICE = 'af_sky';
-const _normalizeKokoroVoice = (v:string|null|undefined):string => {
-  const clean = (v||'').replace(/^"|"$/g,'').trim().toLowerCase();
-  if(!clean) return KOKORO_DEFAULT_VOICE;
-  return KOKORO_VOICE_OPTIONS.find(x=>x.name===clean)?.name || KOKORO_DEFAULT_VOICE;
+const AUDIOBOOK_DEFAULT_VOICE = 'Samantha';
+const _normalizeAudiobookVoice = (v:string|null|undefined):string => {
+  const clean = (v||'').replace(/^"|"$/g,'').trim();
+  if(!clean) return AUDIOBOOK_DEFAULT_VOICE;
+  return AUDIOBOOK_VOICE_OPTIONS.find(x=>x.name===clean)?.name || AUDIOBOOK_DEFAULT_VOICE;
 };
 
 const _normalizePodcastVoice = (v:string|null|undefined):string => {
@@ -586,10 +575,455 @@ const _normalizePodcastVoice = (v:string|null|undefined):string => {
   return PODCAST_VOICE_OPTIONS.find(x=>x.name===clean)?.name || PODCAST_DEFAULT_VOICE;
 };
 
+// Keys that should sync to Supabase cloud (user data, not device-specific settings)
+const CLOUD_SYNC_KEYS = new Set([
+  SK.TOPICS, SK.PROFILE, SK.PRESETS, SK.TUTORIAL, SK.FRIENDS, SK.ORGS,
+  SK.FRIEND_CHALLENGES, SK.HIGHSCORES, SK.REFERRALS, SK.STUDY_GUIDES,
+  SK.SAVED_THEMES, SK.CEREBRAS_KEY, SK.GEMINI_KEY, SK.CUSTOM_PROVIDER,
+  SK.VOICE, SK.PODCAST_VOICE, SK.AUDIOBOOK_VOICE,
+]);
+
 const Store = {
-  save: async (k:string,v:any) => { try { await AsyncStorage.setItem(k,JSON.stringify(v)); } catch(e){} },
-  load: async <T,>(k:string,d:T):Promise<T> => { try { const r = await AsyncStorage.getItem(k); return r ? JSON.parse(r) : d; } catch(e){ return d; } },
+  save: async (k:string,v:any) => {
+    try { await AsyncStorage.setItem(k,JSON.stringify(v)); } catch(e){ console.warn('[Store] Save failed:', k, e); }
+    // Sync to Supabase if user is logged in and key is cloud-syncable
+    if(supabase && _supabaseUserId && CLOUD_SYNC_KEYS.has(k)) {
+      try {
+        await supabase.from('user_data').upsert(
+          { user_id: _supabaseUserId, key: k, value: v, updated_at: new Date().toISOString() },
+          { onConflict: 'user_id,key' }
+        );
+      } catch(e){ console.warn('[Store] Cloud sync failed:', k, e); }
+    }
+  },
+  load: async <T,>(k:string,d:T):Promise<T> => {
+    try { const r = await AsyncStorage.getItem(k); return r ? JSON.parse(r) : d; } catch(e){ console.warn('[Store] Load failed:', k, e); return d; }
+  },
+  // Pull all user data from Supabase into local storage (called on login)
+  syncFromCloud: async ():Promise<void> => {
+    if(!supabase || !_supabaseUserId) return;
+    try {
+      const { data, error } = await supabase
+        .from('user_data')
+        .select('key, value')
+        .eq('user_id', _supabaseUserId);
+      if(error) { console.warn('[Store] Cloud pull failed:', error.message); return; }
+      if(data && data.length > 0) {
+        for(const row of data) {
+          try { await AsyncStorage.setItem(row.key, JSON.stringify(row.value)); } catch(_){}
+        }
+      }
+    } catch(e){ console.warn('[Store] Cloud sync error:', e); }
+  },
+  // Push all local data to Supabase (called on first signup to seed cloud)
+  pushToCloud: async ():Promise<void> => {
+    if(!supabase || !_supabaseUserId) return;
+    try {
+      const keys = Array.from(CLOUD_SYNC_KEYS);
+      const rows: {user_id:string; key:string; value:any; updated_at:string}[] = [];
+      for(const k of keys) {
+        try {
+          const raw = await AsyncStorage.getItem(k);
+          if(raw !== null) {
+            rows.push({ user_id: _supabaseUserId, key: k, value: JSON.parse(raw), updated_at: new Date().toISOString() });
+          }
+        } catch(_){}
+      }
+      if(rows.length > 0) {
+        await supabase.from('user_data').upsert(rows, { onConflict: 'user_id,key' });
+      }
+    } catch(e){ console.warn('[Store] Cloud push failed:', e); }
+  },
 };
+// ========== SOCIAL DATABASE (Supabase-backed multi-user features) ==========
+const SocialDB = {
+  // Sync current user's public profile to Supabase (called on profile update)
+  async syncPublicProfile(profile:{username:string;level:number;totalPoints:number;totalConceptsLearned:number;profilePicture?:string;privacySettings:{showMedals:boolean;showCurrentStudy:boolean}}, studying?:string):Promise<void> {
+    if(!supabase || !_supabaseUserId) return;
+    try {
+      await supabase.from('public_profiles').upsert({
+        user_id: _supabaseUserId,
+        username: profile.username,
+        level: profile.level,
+        total_points: profile.totalPoints,
+        total_concepts_learned: profile.totalConceptsLearned || 0,
+        studying: studying || '',
+        show_medals: profile.privacySettings?.showMedals !== false,
+        show_studying: profile.privacySettings?.showCurrentStudy !== false,
+        profile_picture: profile.profilePicture || null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id' });
+    } catch(e) { console.warn('[SocialDB] syncPublicProfile failed:', e); }
+  },
+
+  // Search for a user by username
+  async findUser(username:string):Promise<{user_id:string;username:string;level:number;total_points:number;profile_picture?:string}|null> {
+    if(!supabase || !_supabaseUserId) return null;
+    try {
+      const { data, error } = await supabase
+        .from('public_profiles')
+        .select('user_id, username, level, total_points, profile_picture')
+        .ilike('username', username)
+        .neq('user_id', _supabaseUserId)
+        .limit(1)
+        .single();
+      if(error || !data) return null;
+      return data;
+    } catch(_) { return null; }
+  },
+
+  // Send a friend request
+  async sendFriendRequest(toUserId:string):Promise<{success:boolean;error?:string}> {
+    if(!supabase || !_supabaseUserId) return {success:false, error:'Not connected'};
+    try {
+      // Check if request already exists
+      const { data: existing } = await supabase
+        .from('friend_requests')
+        .select('id, status')
+        .or(`and(from_user_id.eq.${_supabaseUserId},to_user_id.eq.${toUserId}),and(from_user_id.eq.${toUserId},to_user_id.eq.${_supabaseUserId})`)
+        .limit(1);
+      if(existing && existing.length > 0) {
+        if(existing[0].status === 'accepted') return {success:false, error:'Already friends'};
+        if(existing[0].status === 'pending') return {success:false, error:'Friend request already pending'};
+      }
+      const { error } = await supabase.from('friend_requests').insert({
+        from_user_id: _supabaseUserId,
+        to_user_id: toUserId,
+        status: 'pending',
+      });
+      if(error) return {success:false, error: error.message};
+      // Also create a notification for the recipient
+      await supabase.from('notifications').insert({
+        user_id: toUserId,
+        from_user_id: _supabaseUserId,
+        type: 'friend_request',
+        message: 'sent you a friend request',
+      });
+      return {success:true};
+    } catch(e:any) { return {success:false, error: e?.message || 'Failed'}; }
+  },
+
+  // Get pending incoming friend requests
+  async getPendingRequests():Promise<{id:string;from_user_id:string;username:string;level:number;total_points:number}[]> {
+    if(!supabase || !_supabaseUserId) return [];
+    try {
+      const { data, error } = await supabase
+        .from('friend_requests')
+        .select('id, from_user_id, public_profiles!friend_requests_from_user_id_fkey(username, level, total_points)')
+        .eq('to_user_id', _supabaseUserId)
+        .eq('status', 'pending');
+      if(error || !data) return [];
+      return data.map((r:any) => ({
+        id: r.id,
+        from_user_id: r.from_user_id,
+        username: r.public_profiles?.username || 'Unknown',
+        level: r.public_profiles?.level || 1,
+        total_points: r.public_profiles?.total_points || 0,
+      }));
+    } catch(_) { return []; }
+  },
+
+  // Accept or reject a friend request
+  async respondToRequest(requestId:string, accept:boolean):Promise<void> {
+    if(!supabase) return;
+    try {
+      await supabase.from('friend_requests')
+        .update({ status: accept ? 'accepted' : 'rejected' })
+        .eq('id', requestId);
+    } catch(_) {}
+  },
+
+  // Get accepted friends with real profile data
+  async getFriends():Promise<Friend[]> {
+    if(!supabase || !_supabaseUserId) return [];
+    try {
+      // Get all accepted friend requests where I'm either sender or receiver
+      const { data: sent } = await supabase
+        .from('friend_requests')
+        .select('to_user_id')
+        .eq('from_user_id', _supabaseUserId)
+        .eq('status', 'accepted');
+      const { data: received } = await supabase
+        .from('friend_requests')
+        .select('from_user_id')
+        .eq('to_user_id', _supabaseUserId)
+        .eq('status', 'accepted');
+      const friendIds = [
+        ...(sent || []).map((r:any) => r.to_user_id),
+        ...(received || []).map((r:any) => r.from_user_id),
+      ];
+      if(friendIds.length === 0) return [];
+      const { data: profiles } = await supabase
+        .from('public_profiles')
+        .select('user_id, username, level, total_points, studying, show_studying, profile_picture, updated_at')
+        .in('user_id', friendIds);
+      if(!profiles) return [];
+      return profiles.map((p:any):Friend => {
+        const lastActive = p.updated_at || new Date().toISOString();
+        const hoursSince = (Date.now() - new Date(lastActive).getTime()) / 3600000;
+        const status:FriendPresence = hoursSince < 0.25 ? 'online' : hoursSince < 2 ? 'away' : 'offline';
+        return {
+          id: p.user_id,
+          username: p.username || 'Unknown',
+          level: p.level || 1,
+          points: p.total_points || 0,
+          streak: 0,
+          studying: (p.show_studying !== false) ? (p.studying || '') : '',
+          showStudying: p.show_studying !== false,
+          status,
+          lastActive,
+        };
+      });
+    } catch(_) { return []; }
+  },
+
+  // Send a nudge notification
+  async sendNudge(friendUserId:string, friendUsername:string):Promise<boolean> {
+    if(!supabase || !_supabaseUserId) return false;
+    try {
+      const { error } = await supabase.from('notifications').insert({
+        user_id: friendUserId,
+        from_user_id: _supabaseUserId,
+        type: 'nudge',
+        message: 'sent you a study nudge! Time to learn!',
+      });
+      return !error;
+    } catch(_) { return false; }
+  },
+
+  // Get my notifications
+  async getNotifications():Promise<{id:string;type:string;message:string;from_username?:string;read:boolean;created_at:string}[]> {
+    if(!supabase || !_supabaseUserId) return [];
+    try {
+      const { data } = await supabase
+        .from('notifications')
+        .select('id, type, message, read, created_at, from_user_id, public_profiles!notifications_from_user_id_fkey(username)')
+        .eq('user_id', _supabaseUserId)
+        .order('created_at', { ascending: false })
+        .limit(50);
+      if(!data) return [];
+      return data.map((n:any) => ({
+        id: n.id,
+        type: n.type,
+        message: n.message,
+        from_username: n.public_profiles?.username || 'Someone',
+        read: n.read || false,
+        created_at: n.created_at,
+      }));
+    } catch(_) { return []; }
+  },
+
+  // Mark notifications as read
+  async markNotificationsRead():Promise<void> {
+    if(!supabase || !_supabaseUserId) return;
+    try {
+      await supabase.from('notifications')
+        .update({ read: true })
+        .eq('user_id', _supabaseUserId)
+        .eq('read', false);
+    } catch(_) {}
+  },
+
+  // Create an organization in Supabase
+  async createOrganization(name:string, description:string, joinCode:string):Promise<{success:boolean;id?:string;error?:string}> {
+    if(!supabase || !_supabaseUserId) return {success:false, error:'Not connected'};
+    try {
+      const { data, error } = await supabase.from('organizations').insert({
+        name,
+        description,
+        join_code: joinCode,
+        created_by: _supabaseUserId,
+      }).select('id').single();
+      if(error) return {success:false, error: error.message};
+      // Add creator as first member
+      await supabase.from('org_members').insert({
+        org_id: data.id,
+        user_id: _supabaseUserId,
+      });
+      return {success:true, id: data.id};
+    } catch(e:any) { return {success:false, error: e?.message || 'Failed'}; }
+  },
+
+  // Join organization by code
+  async joinOrganizationByCode(joinCode:string):Promise<{success:boolean;orgName?:string;error?:string}> {
+    if(!supabase || !_supabaseUserId) return {success:false, error:'Not connected'};
+    try {
+      // Find org by code
+      const { data: org, error: findErr } = await supabase
+        .from('organizations')
+        .select('id, name')
+        .eq('join_code', joinCode.toUpperCase())
+        .single();
+      if(findErr || !org) return {success:false, error:'No organization found with that code'};
+      // Check if already a member
+      const { data: existing } = await supabase
+        .from('org_members')
+        .select('org_id')
+        .eq('org_id', org.id)
+        .eq('user_id', _supabaseUserId)
+        .limit(1);
+      if(existing && existing.length > 0) return {success:false, error:'You are already a member'};
+      // Join
+      await supabase.from('org_members').insert({
+        org_id: org.id,
+        user_id: _supabaseUserId,
+      });
+      return {success:true, orgName: org.name};
+    } catch(e:any) { return {success:false, error: e?.message || 'Failed'}; }
+  },
+
+  // Get organizations the user belongs to, with members
+  async getOrganizations():Promise<Organization[]> {
+    if(!supabase || !_supabaseUserId) return [];
+    try {
+      // Get org IDs I'm a member of
+      const { data: myMemberships } = await supabase
+        .from('org_members')
+        .select('org_id')
+        .eq('user_id', _supabaseUserId);
+      if(!myMemberships || myMemberships.length === 0) return [];
+      const orgIds = myMemberships.map((m:any) => m.org_id);
+      // Get org details
+      const { data: orgData } = await supabase
+        .from('organizations')
+        .select('id, name, description, join_code, created_by, created_at')
+        .in('id', orgIds);
+      if(!orgData) return [];
+      // Get all members for these orgs
+      const { data: allMembers } = await supabase
+        .from('org_members')
+        .select('org_id, user_id, joined_at, public_profiles!org_members_user_id_fkey(username, level, total_points)')
+        .in('org_id', orgIds);
+      return orgData.map((o:any):Organization => ({
+        id: o.id,
+        name: o.name,
+        description: o.description || '',
+        createdBy: o.created_by || '',
+        createdAt: o.created_at || new Date().toISOString(),
+        joinCode: o.join_code || '',
+        members: (allMembers || [])
+          .filter((m:any) => m.org_id === o.id)
+          .map((m:any):OrganizationMember => ({
+            username: m.public_profiles?.username || 'Member',
+            level: m.public_profiles?.level || 1,
+            points: m.public_profiles?.total_points || 0,
+            joinedAt: m.joined_at || new Date().toISOString(),
+          })),
+        perks: DEFAULT_ORG_PERKS,
+      }));
+    } catch(_) { return []; }
+  },
+
+  // Leave an organization
+  async leaveOrganization(orgId:string):Promise<void> {
+    if(!supabase || !_supabaseUserId) return;
+    try {
+      await supabase.from('org_members')
+        .delete()
+        .eq('org_id', orgId)
+        .eq('user_id', _supabaseUserId);
+    } catch(_) {}
+  },
+
+  // Create a challenge (both users can see it)
+  async createChallenge(friendUserId:string, friendUsername:string, title:string, description:string, targetXP:number, deadlineISO:string, startPoints:number):Promise<{success:boolean;error?:string}> {
+    if(!supabase || !_supabaseUserId) return {success:false, error:'Not connected'};
+    try {
+      const { error } = await supabase.from('challenges').insert({
+        creator_id: _supabaseUserId,
+        friend_id: friendUserId,
+        title,
+        description,
+        target_xp: targetXP,
+        creator_start_points: startPoints,
+        friend_start_points: 0, // Will be set when friend sees it
+        deadline: deadlineISO,
+        status: 'active',
+      });
+      if(error) return {success:false, error: error.message};
+      // Notify friend
+      await supabase.from('notifications').insert({
+        user_id: friendUserId,
+        from_user_id: _supabaseUserId,
+        type: 'challenge',
+        message: `challenged you to "${title}" — earn ${targetXP} XP!`,
+      });
+      return {success:true};
+    } catch(e:any) { return {success:false, error: e?.message || 'Failed'}; }
+  },
+
+  // Get challenges involving this user
+  async getChallenges():Promise<FriendChallenge[]> {
+    if(!supabase || !_supabaseUserId) return [];
+    try {
+      const { data } = await supabase
+        .from('challenges')
+        .select('id, creator_id, friend_id, title, description, target_xp, creator_start_points, deadline, status, created_at, public_profiles!challenges_creator_id_fkey(username)')
+        .or(`creator_id.eq.${_supabaseUserId},friend_id.eq.${_supabaseUserId}`)
+        .order('created_at', { ascending: false });
+      if(!data) return [];
+      return data.map((c:any):FriendChallenge => {
+        const isCreator = c.creator_id === _supabaseUserId;
+        return {
+          id: c.id,
+          friendId: isCreator ? c.friend_id : c.creator_id,
+          friendUsername: c.public_profiles?.username || 'Unknown',
+          title: c.title || 'Challenge',
+          description: c.description || '',
+          targetXP: c.target_xp || 100,
+          startPoints: c.creator_start_points || 0,
+          createdAt: c.created_at || new Date().toISOString(),
+          deadlineISO: c.deadline || new Date().toISOString(),
+          status: c.status || 'active',
+        };
+      });
+    } catch(_) { return []; }
+  },
+
+  // Add referral
+  async addReferral(referredUsername:string):Promise<{success:boolean;error?:string}> {
+    if(!supabase || !_supabaseUserId) return {success:false, error:'Not connected'};
+    try {
+      const user = await SocialDB.findUser(referredUsername);
+      if(!user) return {success:false, error:'User not found'};
+      const { error } = await supabase.from('referrals').insert({
+        referrer_id: _supabaseUserId,
+        referred_id: user.user_id,
+      });
+      if(error) {
+        if(error.message.includes('duplicate')) return {success:false, error:'This user has already been referred'};
+        return {success:false, error: error.message};
+      }
+      return {success:true};
+    } catch(e:any) { return {success:false, error: e?.message || 'Failed'}; }
+  },
+
+  // Get referral tree
+  async getReferralTree():Promise<{referrals:{username:string;joinedAt:string}[];invitedBy:string|null}> {
+    if(!supabase || !_supabaseUserId) return {referrals:[], invitedBy:null};
+    try {
+      // Get people I referred
+      const { data: myReferrals } = await supabase
+        .from('referrals')
+        .select('referred_id, created_at, public_profiles!referrals_referred_id_fkey(username)')
+        .eq('referrer_id', _supabaseUserId);
+      // Get who referred me
+      const { data: myReferrer } = await supabase
+        .from('referrals')
+        .select('referrer_id, public_profiles!referrals_referrer_id_fkey(username)')
+        .eq('referred_id', _supabaseUserId)
+        .limit(1);
+      return {
+        referrals: (myReferrals || []).map((r:any) => ({
+          username: r.public_profiles?.username || 'Unknown',
+          joinedAt: r.created_at || new Date().toISOString(),
+        })),
+        invitedBy: (myReferrer as any)?.[0]?.public_profiles?.username || null,
+      };
+    } catch(_) { return {referrals:[], invitedBy:null}; }
+  },
+};
+
 const SecretStore = {
   async getItem(key:string):Promise<string|null> {
     if(_SecureStoreModule?.getItemAsync && Platform.OS!=='web') {
@@ -633,9 +1067,13 @@ const ApiKeys = {
   async loadAll():Promise<void> {
     try { _cerebrasApiKey = _cleanStored(await SecretStore.getItem(SK.CEREBRAS_KEY)); } catch(_){ _cerebrasApiKey=''; }
     try { _geminiApiKey = _cleanStored(await SecretStore.getItem(SK.GEMINI_KEY)); } catch(_){ _geminiApiKey=''; }
+    try {
+      const cp = await Store.load<{key:string;url:string;model:string;name:string}>(SK.CUSTOM_PROVIDER,{key:'',url:'',model:'',name:''});
+      _customProviderKey = cp.key||''; _customProviderUrl = cp.url||''; _customProviderModel = cp.model||''; _customProviderName = cp.name||'';
+    } catch(_){ _customProviderKey=''; _customProviderUrl=''; _customProviderModel=''; _customProviderName=''; }
     try { _selectedVoiceName = _normalizeVoiceName(await SecretStore.getItem(SK.VOICE)); } catch(_){ _selectedVoiceName=GEMINI_TTS_DEFAULT_VOICE; }
     try { _podcastVoiceName = _normalizePodcastVoice(await SecretStore.getItem(SK.PODCAST_VOICE)); } catch(_){ _podcastVoiceName=PODCAST_DEFAULT_VOICE; }
-    try { _audiobookVoiceName = _normalizeKokoroVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=KOKORO_DEFAULT_VOICE; }
+    try { _audiobookVoiceName = _normalizeAudiobookVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=AUDIOBOOK_DEFAULT_VOICE; }
   },
   async saveCerebrasKey(key:string):Promise<void> {
     _cerebrasApiKey = key.trim();
@@ -646,6 +1084,11 @@ const ApiKeys = {
     _geminiApiKey = key.trim();
     await SecretStore.setItem(SK.GEMINI_KEY, _geminiApiKey);
     delete _missingKeyAlerted['gemini'];
+  },
+  async saveCustomProvider(key:string,url:string,model:string,name:string):Promise<void> {
+    _customProviderKey = key.trim(); _customProviderUrl = url.trim().replace(/\/+$/,''); _customProviderModel = model.trim(); _customProviderName = name.trim();
+    await Store.save(SK.CUSTOM_PROVIDER,{key:_customProviderKey,url:_customProviderUrl,model:_customProviderModel,name:_customProviderName});
+    delete _missingKeyAlerted['custom'];
   },
   async saveVoice(voiceName:string):Promise<void> {
     const nextVoice = _normalizeVoiceName(voiceName);
@@ -659,7 +1102,7 @@ const ApiKeys = {
     await SecretStore.setItem(SK.PODCAST_VOICE, next);
   },
   async saveAudiobookVoice(voiceName:string):Promise<void> {
-    const next = _normalizeKokoroVoice(voiceName);
+    const next = _normalizeAudiobookVoice(voiceName);
     _audiobookVoiceName = next;
     await SecretStore.setItem(SK.AUDIOBOOK_VOICE, next);
   },
@@ -667,6 +1110,9 @@ const ApiKeys = {
   getPodcastVoice:()=>_podcastVoiceName, getAudiobookVoice:()=>_audiobookVoiceName,
   hasCerebrasKey:()=>_cerebrasApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
   hasLikelyGeminiKey:()=>_looksLikeGeminiKey(_geminiApiKey),
+  hasCustomProvider:()=>_customProviderKey.length>0 && _customProviderUrl.length>0 && _customProviderModel.length>0,
+  hasAnyTextKey:()=>_cerebrasApiKey.length>0 || (_customProviderKey.length>0 && _customProviderUrl.length>0 && _customProviderModel.length>0),
+  getCustomProvider:()=>({key:_customProviderKey,url:_customProviderUrl,model:_customProviderModel,name:_customProviderName}),
 };
 
 // ========== AI SERVICE ==========
@@ -741,9 +1187,11 @@ const AI = {
   _showMissingKeyAlert(provider:'cerebras'|'gemini'):void {
     if(_missingKeyAlerted[provider]) return;
     _missingKeyAlerted[provider]=true;
-    const name = provider==='cerebras'?'Cerebras':'Gemini';
-    const url = provider==='cerebras'?'cloud.cerebras.ai':'aistudio.google.com';
-    Alert.alert(`${name} API Key Required`,`Add your ${name} API key in Profile > API Keys.\n\nGet a free key at ${url}`,[{text:'OK'}]);
+    if(provider==='cerebras') {
+      Alert.alert('AI Provider Key Required','Add an AI provider key in Profile > API Keys.\n\nCerebras offers free keys at cloud.cerebras.ai, or use any OpenAI-compatible provider (OpenAI, Groq, Together, etc.).',[{text:'OK'}]);
+    } else {
+      Alert.alert('Gemini API Key Required','Add your Gemini API key in Profile > API Keys for live podcast voice chat.\n\nGet a free key at aistudio.google.com',[{text:'OK'}]);
+    }
   },
 
   _lastAlertTime: 0 as number,
@@ -829,21 +1277,26 @@ const AI = {
   _repairHyphenatedWordBreaks(text:string):string {
     const keepHyphenLeft = new Set([
       'real','well','high','low','long','short','full','part','cross','state',
-      'time','cost','risk','data','case','value','user','customer','market'
+      'time','cost','risk','data','case','value','user','customer','market',
+      'self','non','pre','post','anti','multi','over','under','co','re','sub',
+      'decision','problem','end','top','mid','all','half','hand','life','work'
     ]);
     return safeStr(text||'').replace(/\b([A-Za-z]{2,})\s*[-–—]\s*([A-Za-z]{2,})\b/g, (_m,left,right)=>{
       const l = safeStr(left).toLowerCase();
       const r = safeStr(right).toLowerCase();
       if(keepHyphenLeft.has(l)) return `${left}-${right}`;
+      // Only merge when the right side is clearly a broken suffix fragment (not a real word)
       const looksLikeSplitSuffix = /^(tion|sion|ment|ness|able|ible|ally|ality|ative|ivity|ology|ized|ises?|ising|ism|ist|ship|ance|ence|ward|wards|less|ful|ly)$/i.test(r);
-      if(looksLikeSplitSuffix || (left.length>=3 && right.length>=3 && (left.length+right.length)>=7)) {
+      if(looksLikeSplitSuffix) {
         return `${left}${right}`;
       }
+      // Preserve hyphen for legitimate compound words (both sides are real words)
       return `${left}-${right}`;
     });
   },
 
   _repairSplitWordFragments(text:string):string {
+    // Only merge when the RIGHT side is clearly a broken suffix (not a standalone word)
     const tailFragments = new Set([
       'mation','rmation','nagement','nvironment','nalysis','nalytic','rategy','rategic',
       'rinciple','rinciples','ractical','isconception','isconceptions','efinition','efinitions',
@@ -852,24 +1305,25 @@ const AI = {
       'nizational','ncluding','ncluded','ntegrated','lignment','petitive','petitor','sumption',
       'uation','xecution','ffectiveness','dership','teraction','terpretive','onsistency'
     ]);
-    const headFragments = new Set([
-      'info','infor','informa','manag','manage','environ','analy','analyt','strate','strateg',
-      'princi','practi','miscon','defi','defin','appli','perfor','conclu','instr','inter',
-      'exter','evi','rele','deci','varia','organi','organiz','competi','execut','effec',
-      'leader','intera','consis','sustai','align','objec','curr','poten','missi','purpo','visi'
-    ]);
     const commonStandalone = new Set([
       'about','after','before','between','without','within','under','over','across','through',
       'during','other','another','these','those','their','there','where','which','while',
-      'because','since','being','every','could','would','should','might','from','into','onto'
+      'because','since','being','every','could','would','should','might','from','into','onto',
+      'also','only','just','very','more','most','some','many','much','each','both','this','that',
+      'with','have','will','been','they','them','then','than','what','when','were','does','done',
+      'make','made','take','took','give','gave','come','came','know','knew','think','thought',
+      'want','need','help','find','tell','keep','call','show','turn','move','play','work',
+      'such','like','used','using','based','given','back','even','still','also','well'
     ]);
-    const likelySuffix = /^(tion|sion|ment|ness|ship|ance|ence|ality|ative|ivity|ability|ibility|ology|graphy|ization|isation|izing|ising|ized|ised|ical|ically|able|ible|ward|wards|less|fully|ously|ently|ively|ary|aries|ing|ings|ed|er|ers|ory|ories|ive|ives|al|ally)$/i;
-    const likelyPrefix = /^(infor?|informa|manag|strateg|organi|organiz|environ|evalu|analy|analyt|inter|perfor|consider|consid|poten|curr|relev|deci|appli|miscon|defin|oper|align|competi|execut|sustai|objec|congru|leader|missi|purpo|visi)$/i;
+    const likelySuffix = /^(tion|sion|ment|ness|ship|ance|ence|ality|ative|ivity|ability|ibility|ology|graphy|ization|isation|izing|ising|ized|ised|ical|ically|ward|wards|less|fully|ously|ently|ively|ary|aries)$/i;
+    const likelyPrefix = /^(infor?|informa|manag|strateg|organi|organiz|environ|evalu|analy|analyt|perfor|consider|consid|poten|relev|appli|miscon|defin|oper|competi|execut|sustai|congru|missi|purpo|visi)$/i;
     return safeStr(text||'').replace(/\b([A-Za-z]{3,10})\s+([A-Za-z]{3,16})\b/g, (m,left,right)=>{
       const l = left.toLowerCase();
       const r = right.toLowerCase();
       if(commonStandalone.has(l) || commonStandalone.has(r)) return m;
-      if(tailFragments.has(r) || headFragments.has(l)) return `${left}${right}`;
+      // Only merge when right side is a broken suffix fragment (not a standalone word)
+      if(tailFragments.has(r)) return `${left}${right}`;
+      // Only merge prefix+suffix when BOTH match (not just one side)
       if(likelyPrefix.test(l) && likelySuffix.test(r)) return `${left}${right}`;
       return m;
     });
@@ -916,8 +1370,30 @@ const AI = {
     return out;
   },
 
+  // Split merged words like "managingcontracts" → "managing contracts"
+  _splitMergedWords(text:string):string {
+    // Pattern: lowercase letter followed by uppercase (camelCase merge)
+    let out = text.replace(/([a-z])([A-Z])/g, '$1 $2');
+    // Pattern: very long words (18+ chars) that are likely two words merged
+    out = out.replace(/\b([a-z]{18,})\b/gi, (word) => {
+      // Try to find a split point using common word boundaries
+      const splits = [
+        /^(managing|establishing|understanding|implementing|developing|evaluating|analyzing|determining|maintaining|considering|representing|incorporating|demonstrating|communicating|investigating)(.)/,
+        /^(\w+?)(contracts?|management|strategies?|decisions?|principles?|concepts?|analysis|planning|process|systems?|models?|theory|practice|development|performance|assessment|evaluation|objectives?|resources?|operations?|structures?|functions?|organizations?|environments?|requirements?|relationships?|perspectives?|approaches?|frameworks?|applications?|implications?|investments?|opportunities?|technologies?|responsibilities?)$/i
+      ];
+      for(const re of splits) {
+        const m = word.match(re);
+        if(m && m[1].length >= 4 && m[2].length >= 4) return m[1] + ' ' + word.slice(m[1].length);
+      }
+      return word;
+    });
+    return out;
+  },
+
   _normalizeLessonText(lesson:string):string {
-    const lines = safeStr(lesson||'').replace(/\r/g,'\n').split('\n');
+    // First pass: split any merged words the AI may have produced
+    const cleaned = this._splitMergedWords(safeStr(lesson||''));
+    const lines = cleaned.replace(/\r/g,'\n').split('\n');
     const normalized:string[] = [];
     for(const rawLine of lines) {
       const line = safeStr(rawLine||'').trim();
@@ -1838,6 +2314,45 @@ const AI = {
     });
   },
 
+  async callCustomProvider(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=8192):Promise<string> {
+    if(!_customProviderKey || !_customProviderUrl || !_customProviderModel) return '';
+    if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
+    const canRequest = await UsageTracker.canMakeRequest();
+    if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
+    const controller = new AbortController();
+    const abortBySignal = () => controller.abort();
+    let timeout:any = null;
+    try {
+      if(signal) {
+        if(signal.aborted) throw new Error(PODCAST_ABORT_ERROR);
+        signal.addEventListener('abort', abortBySignal, { once:true });
+      }
+      timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
+      const baseUrl = _customProviderUrl.replace(/\/+$/,'');
+      const endpoint = baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}${baseUrl.endsWith('/v1')?'':'/v1'}/chat/completions`;
+      const r = await fetch(endpoint,{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':`Bearer ${_customProviderKey}`},
+        body:JSON.stringify({model:_customProviderModel,messages:[{role:'user',content:prompt}],temperature,max_tokens:maxTokens}),
+        signal:controller.signal,
+      });
+      if(r.status===429) { console.warn(`AI: Custom provider 429 rate limited`); return ''; }
+      if(r.status===401) { this._safeAlert(`Invalid ${_customProviderName||'Custom'} Key`,`Your API key for ${_customProviderName||'custom provider'} appears invalid. Check it in Profile > API Keys.`); return ''; }
+      if(!r.ok) { console.warn(`AI: Custom provider HTTP ${r.status}`); return ''; }
+      const d = await r.json();
+      const text = d?.choices?.[0]?.message?.content;
+      if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
+      return '';
+    } catch(e:any) {
+      if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
+      console.warn(`AI: Custom provider error: ${e?.message||'unknown'}`);
+      return '';
+    } finally {
+      if(timeout) clearTimeout(timeout);
+      if(signal) signal.removeEventListener('abort', abortBySignal);
+    }
+  },
+
   async callGemini(prompt:string, retries:number=2, signal?:AbortSignal, timeoutMs:number=30000, maxModels:number=GEMINI_MODELS.length):Promise<string> {
     if(!_geminiApiKey) { return ''; } // silent fail — call() handles missing key alerts
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
@@ -1906,19 +2421,25 @@ const AI = {
     return '';
   },
 
-  // App-wide text generation uses Cerebras. Gemini is reserved for podcast live voice features.
+  // App-wide text generation: tries custom provider first, then Cerebras. Gemini is reserved for podcast.
   async call(prompt:string, retries:number=2, maxTokens:number=4096):Promise<string> {
+    // Try custom provider first (if configured)
+    if(ApiKeys.hasCustomProvider()) {
+      const result = await this.callCustomProvider(prompt, retries, undefined, 30000, 0.4, maxTokens);
+      if(result && result.trim().length > 0) return result;
+    }
+    // Fall back to Cerebras
     if(_cerebrasApiKey) {
       const result = await this.callCerebras(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
-    if(!_cerebrasApiKey) {
+    if(!ApiKeys.hasAnyTextKey()) {
       this._showMissingKeyAlert('cerebras');
     }
     return '';
   },
 
-  // Podcast-specific: tries Gemini first, falls back to Cerebras
+  // Podcast-specific: tries Gemini first, falls back to custom provider, then Cerebras
   async callForPodcast(prompt:string, retries:number=2, signal?:AbortSignal):Promise<string> {
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const quickRetries = Math.min(PODCAST_API_MAX_RETRIES, Math.max(0, retries));
@@ -1926,11 +2447,15 @@ const AI = {
       const result = await this.callGemini(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS, 1);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
+    if(ApiKeys.hasCustomProvider()) {
+      const result = await this.callCustomProvider(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
+      if(result && result.trim().length > 0) return this._normalizePodcastText(result);
+    }
     if(_cerebrasApiKey) {
       const result = await this.callCerebras(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
-    if(!_cerebrasApiKey && !_geminiApiKey) {
+    if(!_cerebrasApiKey && !_geminiApiKey && !ApiKeys.hasCustomProvider()) {
       this._showMissingKeyAlert('gemini');
     }
     return '';
@@ -2203,8 +2728,8 @@ Return ONLY valid JSON:
     }
 
     // --- Step 2: Require API key ---
-    if(!_cerebrasApiKey) {
-      throw new Error('CEREBRAS_API_KEY_MISSING');
+    if(!_cerebrasApiKey && !ApiKeys.hasCustomProvider()) {
+      throw new Error('API_KEY_MISSING');
     }
 
     // --- Step 3: Build the prompt ---
@@ -2261,12 +2786,14 @@ LENGTH REQUIREMENT: Write at least 2-3 full paragraphs (each 80-120 words) for E
 FORMAT RULES:
 - Use subheadings: "Concept 1: [Name]", "Concept 2: [Name]", etc.
 - For each concept: (a) define it clearly, (b) explain how/why it works with detail, (c) give a concrete real-world example with specifics.
+- CRITICAL: A concept is a principle, theory, framework, or idea — NOT an example. Examples SUPPORT and illustrate concepts but are never the concept itself. For instance, "Supply and Demand" is a concept; "Coffee shop pricing" is an example that illustrates it. Never make an example a concept heading.
 - Separate paragraphs with \\n\\n.
 - No introductions, conclusions, or recap paragraphs. End after the last concept.
 - No meta-commentary ("In this section...", "To summarize...", "Let us explore...").
 - AVOID REPETITION: Never repeat the same phrase, definition, or example across concepts. Each concept must have unique content. Use varied language — do not repeat "the concept of X" for multiple concepts.
 - Each concept must be DISTINCT and cannot reuse definitions, explanations, or examples from other concepts.
 - If a concept name appears in examples, it should only appear once, then use pronouns or different phrasing.
+- PROOFREAD your output: fix all typos, spelling errors, grammatical mistakes, and broken/missing words before returning. Every sentence must be complete and readable.
 
 SUPPLEMENTARY FIELDS REQUIREMENTS:
 - keyPrinciples (5-7 items): Core truths or laws that govern the topic. Each must be complete, actionable, and non-obvious. Format: "Statement of principle: explanation of why."
@@ -2279,8 +2806,10 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
 
 {"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\nConcept 2: Price Elasticity\\n\\nPrice elasticity measures how responsive quantity demanded or supplied is to changes in price. Products with high elasticity see large swings in quantity purchased when prices change slightly; products with low elasticity have stable demand regardless of price changes. For instance, luxury goods like designer handbags typically show high elasticity — a 10% price increase causes 15% fewer purchases. Essential goods like insulin show low elasticity — diabetics need it regardless of cost, so even a 50% price increase barely reduces quantity demanded. Understanding your product's elasticity is critical: raising prices on elastic products shrinks revenue, but on inelastic products increases it.\\n\\nConcept 3: Market Structures\\n\\nMarket structures vary based on the number of competitors and barriers to entry, fundamentally affecting pricing power and profitability. Perfect competition features many firms selling identical products with free entry; no single firm controls prices. Monopolies involve one seller controlling the entire market, allowing price-setting power. Oligopolies have few large competitors who watch each other's moves closely. For example, smartphone makers like Apple operate in an oligopoly — three companies dominate, and when one raises prices, others quickly follow or match. Perfect competition requires commodities where firms are price-takers, such as wheat farming where global supply determines price.","keyPrinciples":["Prices gravitate toward equilibrium where quantity demanded equals quantity supplied; persistent shortages or surpluses trigger automatic price adjustments","Elasticity determines revenue impact: raising prices increases revenue for inelastic products but decreases it for elastic ones","Market structure (competition, oligopoly, monopoly) determines how much pricing power individual firms possess","External shocks shift curves unpredictably; successful firms monitor their competitive environment continuously","Buyer psychology and expectations can drive demand independently of actual supply-side fundamentals"],"keyTerms":["Equilibrium: the price point where quantity demanded equals quantity supplied, resulting in no surplus or shortage","Elasticity: the percentage change in quantity demanded per 1% change in price; elastic goods are price-sensitive, inelastic ones are not","Oligopoly: a market with few competitors (e.g., smartphones, airlines) where firms monitor each other and pricing is interdependent","Barrier to entry: a structural obstacle preventing new competitors from entering a market; includes capital requirements, patents, or brand loyalty"],"practicalApplications":["For your product, run A/B tests at three price points with 100+ customers in each group over 4 weeks, measuring conversions and revenue to empirically determine elasticity","Map your market structure: count competitors, assess their market share, and identify switching costs for customers to determine your pricing flexibility","Set prices monthly by monitoring your actual inventory levels and comparing them to competitors; if your stock is depleting, you may be underpriced","Create a simple spreadsheet tracking your costs, competitor prices, and sales volume; update it weekly to catch demand or supply shocks early"],"commonMisconceptions":["WRONG: If demand is high, raising prices is always good. CORRECT: High demand with elastic products may actually increase revenue through volume at lower prices.","WRONG: Monopolies always maximize profit by raising prices maximally. CORRECT: Some monopolies intentionally price low to build network effects or deter regulatory action.","WRONG: Competitors always match each other's prices in oligopolies. CORRECT: Competitors sometimes compete on quality or service instead of price to avoid destructive price wars.","WRONG: Costs determine prices. CORRECT: Prices are driven by supply and demand; high-cost sellers may go bankrupt if their prices fall below costs due to competition."],"summary":"Prices emerge from the continuous interaction of supply and demand, moderated by market structure. Understanding equilibrium, elasticity, and competitive positioning enables effective pricing strategies."}`;
 
-    // --- Step 4: Single AI generation call (minimize API calls under rate limiting) ---
-    const r = await this.callCerebras(prompt, 0, undefined, 60000, 0.35, 4096);
+    // --- Step 4: Single AI generation call (try custom provider first, then Cerebras) ---
+    let r = '';
+    if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(prompt, 0, undefined, 60000, 0.35, 4096);
+    if(!r && _cerebrasApiKey) r = await this.callCerebras(prompt, 0, undefined, 60000, 0.35, 4096);
     if(!r) { throw new Error('AI_GENERATION_FAILED'); }
     try {
       const parsed = this._parseJsonObject(r);
@@ -2307,6 +2836,85 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
     }
   },
 
+  async generateStudyGuideSegments(section:{title:string;description:string;concepts:{name:string;description:string}[]}, topicTitle:string, lessonText?:string, sourceContent?:string, alreadyCoveredTitles?:string[]):Promise<{title:string;content:string}[]> {
+    const concepts = (section.concepts||[]).slice(0,15);
+    const conceptList = concepts.map((c,i)=>`${i+1}. ${c.name}: ${c.description}`).join('\n');
+    const lessonContext = lessonText ? `\nLESSON CONTENT (primary source — extract key facts):\n${lessonText.substring(0,6000)}\n` : '';
+    const sourceContext = sourceContent ? `\nORIGINAL SOURCE MATERIAL (extract key facts):\n${sourceContent.substring(0,4000)}\n` : '';
+    const alreadyCoveredBlock = alreadyCoveredTitles && alreadyCoveredTitles.length > 0
+      ? `\nALREADY COVERED IN PREVIOUS SECTIONS (DO NOT REPEAT ANY OF THESE — skip them entirely):\n${alreadyCoveredTitles.map((t,i)=>`${i+1}. ${t}`).join('\n')}\n\nIf a concept from the list below was already covered above, DO NOT create a segment for it. Only cover NEW material that has not appeared yet.\n`
+      : '';
+    const p = `You are creating a CONCISE study guide for "${topicTitle}" — section: "${section.title}".
+${lessonContext}${sourceContext}
+CONCEPTS TO COVER (only if NOT already covered):
+${conceptList}
+${alreadyCoveredBlock}
+CRITICAL RULE — NO REPETITION:
+- Each concept/topic must appear EXACTLY ONCE in the entire study guide
+- If a concept was already covered in a previous section, SKIP IT completely — do not create a segment for it
+- Do not restate, rephrase, or re-explain anything that has already been covered
+- Only produce segments for genuinely NEW information not seen before
+- Cover each concept THOROUGHLY the one time it appears — include all important details so it never needs to be revisited
+
+SEGMENTATION RULES:
+Each segment covers ONE focused idea. A single concept may become multiple segments ONLY if it has genuinely distinct sub-ideas that were NOT previously covered.
+Progress through concepts systematically — go topic by topic in a logical order.
+
+TITLE RULES (CRITICAL — varied, descriptive titles):
+- Each title must be UNIQUE and SPECIFIC to the actual content
+- Use the real name of the concept, term, or distinction — not a generic pattern
+- GOOD: "Bilateral vs. Unilateral Contracts", "7 Elements of a Valid Contract", "Supply and Demand Equilibrium", "Types of Market Failure"
+- BAD: "What Is X?", "How X Works", "Key Concepts of X", "Understanding X" — these are lazy and repetitive
+- NEVER use the same title structure twice. Vary every title.
+- Titles should read like a textbook table of contents — each one tells you exactly what you'll learn
+
+CONTENT FORMAT (CRITICAL — be CONCISE but COMPLETE):
+- Use bullet points as the PRIMARY format. Paragraphs are allowed only when a flowing explanation is truly needed.
+- Each bullet = one testable fact, definition, or distinction (1 sentence)
+- Bold key terms: **Term** — definition
+- Total content per segment: 3-8 bullets OR 2-4 short sentences. NO MORE.
+- Strip ALL filler: no "this is important", no "it is worth noting", no introductory sentences
+- Every word must earn its place — if removing a sentence loses no information, remove it
+- Include a brief example only when it clarifies a non-obvious point
+- Be THOROUGH — include all key details, sub-types, exceptions, and formulas the first time you cover a topic
+
+WHAT TO INCLUDE:
+- Definitions with precise language
+- Key distinctions between similar terms
+- Categories/types listed as bullets with **bold** labels
+- Formulas, rules, or requirements if applicable
+- One concrete example per segment ONLY if it adds clarity
+- ALL important sub-details so the topic is fully covered in one place
+
+WHAT TO EXCLUDE:
+- Introductory or transitional sentences
+- Repetition of the title in the content
+- Obvious or common-sense statements
+- Lengthy paragraphs when bullets suffice
+- Filler phrases ("In other words...", "It should be noted...", "This concept is important because...")
+- ANYTHING already covered in a previous section
+
+Return ONLY valid JSON — an array of segments (return empty array [] if all concepts were already covered):
+[{"title":"Bilateral vs. Unilateral Contracts","content":"- **Bilateral contract** — both parties exchange promises (most common type)\\n- **Unilateral contract** — one party makes a promise in exchange for an action\\n- Example: reward posters are unilateral — payment is owed only if someone performs the action"},{"title":"7 Elements of a Valid Contract","content":"All must be present for enforceability:\\n- **Offer** — clear proposal with definite terms\\n- **Acceptance** — unqualified agreement to the offer\\n- **Consideration** — something of value exchanged\\n- **Capacity** — parties must be legally competent (age, mental fitness)\\n- **Legality** — purpose must be lawful\\n- **Consent** — free from fraud, duress, or undue influence\\n- **Written form** — required for certain contracts (Statute of Frauds)"}]`;
+    let r = '';
+    if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(p, 0, undefined, 60000, 0.3, 8192);
+    if(!r && _cerebrasApiKey) r = await this.callCerebras(p, 0, undefined, 60000, 0.3, 8192);
+    if(!r) return [];
+    try {
+      const m = r.match(/\[[\s\S]*\]/);
+      if(m) {
+        const parsed = JSON.parse(m[0]);
+        if(Array.isArray(parsed)) {
+          return parsed.filter((s:any)=>s.title&&s.content&&s.content.length>20).map((s:any)=>({
+            title: safeStr(s.title).trim(),
+            content: safeStr(s.content).trim(),
+          }));
+        }
+      }
+    } catch(_){}
+    return [];
+  },
+
   async answerQuestion(question:string, concept:Concept|null, topicTitle:string, recentChat:ChatMessage[], sectionContext?:string):Promise<string> {
     const ctx = concept ? `\nCurrent concept: "${concept.name}" — ${concept.description}` : '';
     const sectionCtx = sectionContext ? `\nLesson context:\n${sectionContext.substring(0,9000)}\n` : '';
@@ -2327,6 +2935,40 @@ Answer accurately using your full knowledge of ${topicTitle}. Be thorough but co
   },
 
   async generateQuestions(topic:Topic, types:QuizPreset['questionTypes'], count:number, conceptSubset?:Concept[], difficultyCounts?:{easy:number;medium:number;hard:number}):Promise<Question[]> {
+    // Batch: AI struggles with 30+ questions at once, so batch in chunks of 10-15
+    if(count > 15) {
+      const allQs:Question[] = [];
+      let remaining = count;
+      const concepts = (conceptSubset && conceptSubset.length>0) ? conceptSubset : (topic.concepts||[]);
+      let conceptOffset = 0;
+      while(remaining > 0 && allQs.length < count) {
+        const batchSize = Math.min(remaining, 12);
+        // Rotate concept subsets to get varied questions
+        const batchConcepts = concepts.length > 0 ? (() => {
+          const rotated:Concept[] = [];
+          for(let i=0;i<Math.min(concepts.length,8);i++) rotated.push(concepts[(conceptOffset+i)%concepts.length]);
+          conceptOffset = (conceptOffset + 4) % Math.max(concepts.length,1);
+          return rotated;
+        })() : undefined;
+        const batchDc = difficultyCounts ? {
+          easy:Math.max(1,Math.round(difficultyCounts.easy * batchSize / count)),
+          medium:Math.max(1,Math.round(difficultyCounts.medium * batchSize / count)),
+          hard:Math.max(0,Math.round(difficultyCounts.hard * batchSize / count)),
+        } : undefined;
+        const batch = await this._generateQuestionsBatch(topic, types, batchSize, batchConcepts, batchDc);
+        allQs.push(...batch);
+        remaining = count - allQs.length;
+        // Safety: if a batch returns 0, break to avoid infinite loop
+        if(batch.length === 0) break;
+      }
+      // Shuffle and trim to exact count
+      for(let i=allQs.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[allQs[i],allQs[j]]=[allQs[j],allQs[i]];}
+      return allQs.slice(0, count);
+    }
+    return this._generateQuestionsBatch(topic, types, count, conceptSubset, difficultyCounts);
+  },
+
+  async _generateQuestionsBatch(topic:Topic, types:QuizPreset['questionTypes'], count:number, conceptSubset?:Concept[], difficultyCounts?:{easy:number;medium:number;hard:number}):Promise<Question[]> {
     const t:string[] = [];
     if(types.multipleChoice) t.push('multiple_choice');
     if(types.fillInBlank) t.push('fill_in_blank');
@@ -2334,60 +2976,104 @@ Answer accurately using your full knowledge of ${topicTitle}. Be thorough but co
     if(types.scenario) t.push('scenario');
     if(!t.length) t.push('multiple_choice');
     const concepts = (conceptSubset&&conceptSubset.length>0) ? conceptSubset : (topic.concepts||[]);
-    const cText = concepts.map(c=>`- ${c.name}: ${c.description} (${c.difficulty})`).join('\n');
+    // Provide rich concept info for the AI to work with
+    const cText = concepts.map(c=>`- ${c.name}: ${c.description}`).join('\n');
     const difficultyInstruction = difficultyCounts
       ? `\nDIFFICULTY DISTRIBUTION (follow this exactly):\n- ${difficultyCounts.easy} easy questions (straightforward recall and basic understanding)\n- ${difficultyCounts.medium} medium questions (application and analysis)\n- ${difficultyCounts.hard} hard questions (synthesis, evaluation, and complex scenarios)\n`
       : '\n- Mix difficulty levels across the questions\n';
-    const p = `You are an expert educator creating quiz questions to test a student's understanding of "${topic.title}".
+    const p = `You are an expert educator creating ${count} quiz questions for "${topic.title}".
 
-CONCEPTS THE STUDENT HAS STUDIED:
+MATERIAL THE STUDENT HAS STUDIED:
 ${cText}
 
-Generate exactly ${count} high-quality quiz questions. Requirements:
-- Questions should test UNDERSTANDING, not just memorization
-- Use specific, factually accurate content from the subject matter
-- For multiple_choice: all 4 options should be plausible (no obviously wrong answers). The correct answer must be clearly and unambiguously correct.
-- For fill_in_blank: test key terminology or important facts. Leave a clear blank for the student to fill.
-- For short_response: ask questions that require the student to explain or apply knowledge in 1-3 sentences.
-- For scenario: present a realistic real-world situation, then ask a multiple choice question about what the best action/answer would be. SCENARIO QUESTIONS MUST ALWAYS INCLUDE exactly 4 "options" and a "correctAnswer" — they are multiple choice questions with a scenario context.
+Generate exactly ${count} questions. Each question must test REAL knowledge from the material above.
+
+CRITICAL RULES FOR EVERY QUESTION:
+1. The question text must be a REAL, specific, educational question — e.g., "What are the three elements required for promissory estoppel?", "Which type of contract involves only one party making a promise?", "In a bilateral contract, how many promises are exchanged?"
+2. NEVER generate vague questions like "Which of the following is an example of [concept name]?" or "What best describes [concept name]?" — these are lazy and do not test understanding
+3. The question must be answerable from the material without needing to see the concept name as a hint
+4. Each answer option must be 5-25 words long — not too short (single word) and not too long (full paragraphs)
+5. All 4 options must be similar in length and style — a student should NOT be able to guess the answer by picking the longest or most detailed option
+6. PROOFREAD everything: fix all typos, spelling errors, and grammar issues
+
+FOR MULTIPLE_CHOICE:
+- 4 options, one correct, three strong distractors
+- Distractors must be plausible: common misconceptions, similar-but-wrong facts, partial truths, or related concepts applied incorrectly
+- NEVER use: "None of the above", "All of the above", "An unrelated concept", "Not related to X", or any generic filler
+- Randomize the correct answer position (not always A)
+
+FOR SCENARIO: Present a real-world situation, then ask what the best response/answer is. Must have 4 options. Same quality rules as multiple_choice.
+FOR FILL_IN_BLANK: Test key terms or facts. Clear blank for one specific answer.
+FOR SHORT_RESPONSE: Ask for explanation or application in 1-3 sentences.
 ${difficultyInstruction}
-- Each explanation should teach something — explain WHY the answer is correct
-
-IMPORTANT: multiple_choice AND scenario questions MUST ALWAYS have exactly 4 options and a correctAnswer that matches one option exactly.
-
-Question types to include: ${t.join(', ')}
+Question types: ${t.join(', ')}
+Generate ONLY these types.
 
 Return ONLY valid JSON:
-{"questions":[
-  {"type":"multiple_choice","question":"Clear question?","options":["A","B","C","D"],"correctAnswer":"exact text of correct option","explanation":"Why this is correct","conceptName":"concept name","difficulty":"easy"},
-  {"type":"scenario","question":"You are a manager and X happens. What should you do?","options":["Option A","Option B","Option C","Option D"],"correctAnswer":"exact text of correct option","explanation":"Why this is the best approach","conceptName":"concept name","difficulty":"hard"},
-  {"type":"fill_in_blank","question":"The process of ___ involves X","options":[],"correctAnswer":"answer word","explanation":"Why","conceptName":"concept name","difficulty":"medium"},
-  {"type":"short_response","question":"Explain why X is important","options":[],"correctAnswer":"Key points the answer should cover","explanation":"Full explanation","conceptName":"concept name","difficulty":"medium"}
-]}`;
-    const r = await this.call(p);
-    try {
-      const m = r.match(/\{[\s\S]*\}/);
-      if(m) {
-        const parsed = JSON.parse(m[0]);
-        return (parsed.questions||[]).map((q:any,i:number)=>{
-          const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
-          let qType = q.type||'multiple_choice';
-          let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
-          const correctAns = safeStr(q.correctAnswer);
-          // Scenario questions MUST have options — if missing, convert to multiple_choice with the correct answer + generated distractors
-          if(qType==='scenario' && options.length<2){
-            qType='multiple_choice'; // fallback so UI still works
-            options = [correctAns, 'None of the above', 'All of the above', 'This cannot be determined'];
-          }
-          // Multiple choice must also have options
-          if(qType==='multiple_choice' && options.length<2){
-            options = [correctAns, 'None of the above', 'All of the above', 'This cannot be determined'];
-          }
-          return { id:`q_${Date.now()}_${i}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
-        });
+{"questions":[{"type":"multiple_choice","question":"Specific educational question?","options":["Option A (5-25 words)","Option B","Option C","Option D"],"correctAnswer":"exact text of correct option","explanation":"Why this is correct — teach something","conceptName":"concept name","difficulty":"easy"}]}`;
+
+    const _shuffle = <T,>(arr:T[]):T[] => { const a=[...arr]; for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; };
+
+    // Validate a question is actually good
+    const isValidQuestion = (q:any):boolean => {
+      if(!q.question || q.question.length < 15) return false;
+      const qText = (q.question||'').toLowerCase();
+      // Reject lazy question patterns
+      if(/which of the following is an example of\s+\w+\??$/i.test(qText)) return false;
+      if(/what best describes\s+["']?\w+["']?\??$/i.test(qText)) return false;
+      if(/which best describes\s+["']?\w+["']?\??$/i.test(qText)) return false;
+      const qType = q.type||'multiple_choice';
+      if(qType==='multiple_choice'||qType==='scenario') {
+        const opts = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
+        if(opts.length < 4) return false;
+        // Reject if any option is just 1-2 words (too short to be meaningful)
+        if(opts.some((o:string)=>o.split(/\s+/).length < 2)) return false;
+        // Reject if options contain generic filler
+        if(opts.some((o:string)=>/^(not related|an unrelated|none of the above|all of the above|the opposite|cannot be determined)/i.test(o.trim()))) return false;
+        // Reject if correct answer is not in options
+        const ca = safeStr(q.correctAnswer);
+        if(ca && !opts.some((o:string)=>o===ca)) return false;
       }
-    } catch(e){}
-    return concepts.slice(0,count).map((c,i)=>({ id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:`Which best describes "${c.name}"?`, options:[c.description,'An unrelated concept','The opposite','None of the above'], correctAnswer:c.description, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty }));
+      return true;
+    };
+
+    // Try AI generation with retry
+    for(let attempt=0;attempt<2;attempt++) {
+      try {
+        const r = await this.call(p);
+        const m = r.match(/\{[\s\S]*\}/);
+        if(m) {
+          const parsed = JSON.parse(m[0]);
+          const validQuestions = (parsed.questions||[])
+            .filter((q:any) => t.includes(q.type||'multiple_choice'))
+            .filter(isValidQuestion)
+            .map((q:any,i:number)=>{
+              const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
+              let qType = q.type||'multiple_choice';
+              let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
+              const correctAns = safeStr(q.correctAnswer);
+              // Shuffle options
+              if((qType==='multiple_choice'||qType==='scenario') && options.length>=2) {
+                options = _shuffle(options);
+              }
+              return { id:`q_${Date.now()}_${i}_${attempt}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
+            });
+          if(validQuestions.length >= Math.min(count, 3)) return validQuestions;
+        }
+      } catch(e){}
+    }
+    // Final fallback: generate questions using descriptions (only if AI completely fails)
+    // Use descriptions to form real questions, not concept names as answers
+    const shorten = (s:string, max:number=80) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
+    return _shuffle(concepts).slice(0,count).map((c,i)=>{
+      // Build a real question from the description
+      const desc = shorten(c.description, 80);
+      const others = concepts.filter(c2=>c2.id!==c.id);
+      const distractorDescs = _shuffle(others).slice(0,3).map(c2=>shorten(c2.description,80));
+      while(distractorDescs.length<3) distractorDescs.push(`A process that involves analyzing ${safeStr(topic.title)} from a different perspective`);
+      const opts = _shuffle([desc,...distractorDescs]);
+      return { id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:`In the context of ${topic.title}, which of the following correctly describes ${c.name}?`, options:opts, correctAnswer:desc, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty };
+    });
   },
 
   async evaluateShortAnswer(question:string, expected:string, answer:string):Promise<{correct:boolean;score:number;feedback:string}> {
@@ -2548,29 +3234,53 @@ IMPORTANT RULES:
     const unmastered = concepts.filter(c=>!c.mastered);
     const lowConf = concepts.filter(c=>!c.mastered&&c.confidenceScore<50);
     const needsWork = concepts.filter(c=>!c.mastered&&c.totalAttempts<3);
-    // Priority: untested > low confidence > unmastered > all
     const pool = needsWork.length>0?needsWork:lowConf.length>0?lowConf:unmastered.length>0?unmastered:concepts;
     const c = pool[Math.floor(Math.random()*pool.length)];
     if(!c) return {question:'What is this topic about?',answer:topic.title,options:[topic.title,'Unknown','Not sure','Something else']};
-    const p = `Create a multiple-choice quiz question about "${c.name}" (${c.description}) for the topic "${topic.title}".
-The question should test real knowledge. Provide 4 answer choices that are all plausible — one correct and three realistic but wrong.
-IMPORTANT: All 4 options must be real, specific answers — NEVER use generic labels like "correct", "wrong", "incorrect", "option1" etc.
-Return ONLY valid JSON: {"question":"Your specific question here?","answer":"The correct answer text","options":["The correct answer text","Plausible wrong answer 1","Plausible wrong answer 2","Plausible wrong answer 3"]}`;
-    const r = await this.call(p);
-    try {
-      const m = r.match(/\{[\s\S]*\}/);
-      if(m) {
-        const parsed = JSON.parse(m[0]);
-        // Validate that options aren't generic placeholders
-        const hasRealOptions = parsed.options?.length>=2 && !parsed.options.some((o:string)=>/^(correct|wrong|incorrect|option|not this)\d*$/i.test(o.trim()));
-        if(parsed.question&&parsed.answer&&hasRealOptions) return {...parsed,conceptId:c.id};
-      }
-    } catch(e){}
-    // Better fallback with real concept-based options
-    const others = (topic.concepts||[]).filter(x=>x.id!==c.id).slice(0,3);
-    const fallbackOpts = [c.description,...others.map(x=>x.description)];
-    while(fallbackOpts.length<4) fallbackOpts.push(`Not related to ${c.name}`);
-    return { question:`What best describes "${c.name}"?`, answer:c.description, options:fallbackOpts.slice(0,4), conceptId:c.id };
+    const otherConcepts = concepts.filter(x=>x.id!==c.id).slice(0,6);
+    const otherInfo = otherConcepts.map(x=>`${x.name}: ${x.description}`).join('; ');
+    const p = `Create ONE multiple-choice question about "${c.name}" for the topic "${topic.title}".
+
+CONCEPT INFO: ${c.name} — ${c.description}
+OTHER CONCEPTS: ${otherInfo}
+
+RULES:
+1. Write a SPECIFIC, educational question — e.g., "What are the three required elements of promissory estoppel?", "Which type of contract involves only one promise?"
+2. NEVER write lazy questions like "Which describes X?" or "What is an example of X?"
+3. Create exactly 4 options, each 5-20 words long, all similar length
+4. One correct answer, three plausible wrong answers (misconceptions, partial truths, related-but-wrong)
+5. NEVER use "None of the above", "Not related to", or any generic filler
+6. Correct answer position must be randomized
+7. Fix all typos and grammar
+
+Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct option text","options":["Option A","Option B","Option C","Option D"]}`;
+    // Try with retry
+    for(let attempt=0;attempt<2;attempt++) {
+      try {
+        const r = await this.call(p);
+        const m = r.match(/\{[\s\S]*\}/);
+        if(m) {
+          const parsed = JSON.parse(m[0]);
+          const opts = (parsed.options||[]).map((o:any)=>String(o||''));
+          // Validate: real options (not single words, not generic), question is specific
+          const hasGoodOpts = opts.length>=4
+            && opts.every((o:string)=>o.split(/\s+/).length>=2 && o.length>=5)
+            && !opts.some((o:string)=>/^(not related|none of|all of|the opposite)/i.test(o.trim()));
+          const hasGoodQ = parsed.question && parsed.question.length>=20
+            && !/which of the following is an example of\s+\w+\??$/i.test(parsed.question)
+            && !/what best describes\s+["']?\w+["']?\??$/i.test(parsed.question);
+          if(hasGoodQ && parsed.answer && hasGoodOpts) return {...parsed,options:opts,conceptId:c.id};
+        }
+      } catch(e){}
+    }
+    // Fallback: use shortened DESCRIPTIONS as options (meaningful content, not raw names)
+    const shorten = (s:string, max:number=60) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
+    const correctDesc = shorten(c.description);
+    const others = concepts.filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const distractorDescs = others.map(x=>shorten(x.description));
+    while(distractorDescs.length<3) distractorDescs.push(`A method for evaluating ${safeStr(topic.title)} outcomes`);
+    const allOpts = [correctDesc,...distractorDescs].sort(()=>Math.random()-0.5);
+    return { question:`In ${topic.title}, which of the following correctly describes ${c.name}?`, answer:correctDesc, options:allOpts.slice(0,4), conceptId:c.id };
   },
 
   async getWordleWords(topic:Topic,count:number=5):Promise<{word:string;hint:string;conceptId:string}[]> {
@@ -2627,11 +3337,12 @@ Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific qu
         }
       }
     } catch(e){}
-    // Better fallback with real concept-based options
-    const others = (topic.concepts||[]).filter(x=>x.id!==c.id).slice(0,3);
-    const fallbackOpts = [c.description,...others.map(x=>x.description)];
-    while(fallbackOpts.length<4) fallbackOpts.push(`Not related to ${c.name}`);
-    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:`What best describes "${c.name}"?`,answer:c.description,options:fallbackOpts.slice(0,4),conceptId:c.id};
+    // Fallback with concept descriptions as options
+    const shorten = (s:string,max:number=60)=>s.length>max?s.substring(0,max).replace(/\s+\S*$/,'...'):s;
+    const others = (topic.concepts||[]).filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const fallbackOpts = [shorten(c.description),...others.map(x=>shorten(x.description))];
+    while(fallbackOpts.length<4) fallbackOpts.push(`A process for analyzing ${safeStr(topic.title)} outcomes`);
+    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:`In ${topic.title}, which correctly describes ${c.name}?`,answer:shorten(c.description),options:fallbackOpts.sort(()=>Math.random()-0.5).slice(0,4),conceptId:c.id};
   },
 
   async getStudyEstimate(topic:Topic, goal:string, mode?:'quiz'|'games'|'mixed'):Promise<string> {
@@ -2956,7 +3667,7 @@ const _ttsFilePrefix = _ttsCacheDir ? `${_ttsCacheDir}gemini_tts_` : '';
 
 const activatePlaybackSession = async () => {
   if(Platform.OS==='web') {
-    _unlockWebAudio(); // Create/resume AudioContext during user gesture for Kokoro TTS playback
+    _unlockWebAudio(); // Create/resume AudioContext during user gesture for audio playback
     return;
   }
   try {
@@ -3234,7 +3945,7 @@ const ProgressBar = ({progress}:{progress:number}) => (
 );
 const Btn = ({title,onPress,theme,disabled,loading}:{title:string;onPress:()=>void;theme:ThemeColors;disabled?:boolean;loading?:boolean}) => (
   <TouchableOpacity onPress={onPress} disabled={disabled||loading} activeOpacity={0.8}>
-    <LinearGradient colors={disabled?['#4B5563','#374151']:[theme.primary,theme.secondary]} style={st.btn}>
+    <LinearGradient colors={disabled?['rgba(128,128,128,0.3)','rgba(128,128,128,0.25)']:[theme.primary,theme.secondary]} style={st.btn}>
       {loading?<ActivityIndicator color="white"/>:<Text style={st.btnText}>{title}</Text>}
     </LinearGradient>
   </TouchableOpacity>
@@ -3252,7 +3963,7 @@ const LoadingCard = ({message,sub,theme}:{message:string;sub?:string;theme:Theme
     <ActivityIndicator size="large" color={theme.primary}/>
     <Text style={{color:theme.text,fontSize:16,fontWeight:'600',marginTop:16}}>{message}</Text>
     {sub&&<Text style={{color:'#94A3B8',fontSize:13,marginTop:6,textAlign:'center'}}>{sub}</Text>}
-    <View style={{width:200,height:4,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2,marginTop:14,overflow:'hidden'}}>
+    <View style={{width:200,height:4,backgroundColor:'rgba(128,128,128,0.18)',borderRadius:2,marginTop:14,overflow:'hidden'}}>
       <Animated.View style={{height:'100%',backgroundColor:theme.primary,borderRadius:2,width:w}}/>
     </View>
   </View>;
@@ -3271,7 +3982,7 @@ const ErrorCard = ({message,onRetry,theme}:{message:string;onRetry:()=>void;them
 // ========== LEARN SCREEN ==========
 const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,theme}:{topics:Topic[];onAddTopic:(t:Topic)=>void;onUpdateTopic:(t:Topic)=>void;onDelete:(id:string)=>void;onSetTab:(t:string)=>void;profile:UserProfile;theme:ThemeColors}) => {
   // Navigation state
-  const [screen,setScreen] = useState<'home'|'create'|'detail'|'chat'|'discover'|'section-overview'>('home');
+  const [screen,setScreen] = useState<'home'|'create'|'detail'|'chat'|'discover'|'section-overview'|'study-guide-select'|'study-guide'>('home');
   const [selTopic,setSelTopic] = useState<Topic|null>(null);
   const [selSection,setSelSection] = useState<Section|null>(null);
 
@@ -3305,6 +4016,21 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   // Topic search
   const [searchQuery,setSearchQuery] = useState('');
 
+  // Study guide state (multi-topic)
+  const [sgSelectedTopicIds,setSgSelectedTopicIds] = useState<string[]>([]);
+  const [sgSelectedSectionIds,setSgSelectedSectionIds] = useState<string[]>([]);
+  const [studyGuideSections,setStudyGuideSections] = useState<StudyGuideSection[]>([]);
+  const [savedStudyGuides,setSavedStudyGuides] = useState<SavedStudyGuide[]>([]);
+  const [activeStudyGuideId,setActiveStudyGuideId] = useState<string|null>(null);
+  const [studyGuideLoading,setStudyGuideLoading] = useState(false);
+
+  // Load saved study guides on mount
+  useEffect(()=>{
+    Store.load<SavedStudyGuide[]>(SK.STUDY_GUIDES,[]).then(sgs=>{
+      if(sgs.length>0) setSavedStudyGuides(sgs);
+    });
+  },[]);
+
   // Topic editing
   const [editingTitle,setEditingTitle] = useState(false);
   const [editTitleValue,setEditTitleValue] = useState('');
@@ -3316,21 +4042,18 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const [audioSpeed,setAudioSpeed] = useState<number>(1.0);
   const [showAudioControls,setShowAudioControls] = useState(false);
   const [audioProgress,setAudioProgress] = useState(0); // 0-100 for seekable bar
-  const [audioGenProgress,setAudioGenProgress] = useState(0); // 0-100 generation progress
   const [audioDuration,setAudioDuration] = useState(0); // total seconds
   const [audioCurrentTime,setAudioCurrentTime] = useState(0); // current position seconds
   const audioSpeedRef = useRef<number>(1.0);
   const audioGenRef = useRef<number>(0); // generation counter to prevent stale callbacks
-  const audioBufferRef = useRef<AudioBuffer|null>(null); // concatenated full audio
-  const audioSourceRef = useRef<AudioBufferSourceNode|null>(null); // current playing source
-  const audioGainRef = useRef<GainNode|null>(null);
-  const audioStartOffsetRef = useRef<number>(0); // offset in buffer where playback started
-  const audioCtxStartTimeRef = useRef<number>(0); // AudioContext.currentTime at source.start()
   const audioDurationRef = useRef<number>(0);
   const audioPausedAtRef = useRef<number>(0); // position when paused
   const audioPositionIntervalRef = useRef<any>(null); // setInterval ID for progress updates
-  const audioStoppedManuallyRef = useRef<boolean>(false); // distinguish manual stop from natural end
   const audioProgressBarWidthRef = useRef<number>(0); // for tap-to-seek functionality
+  const audioChunksRef = useRef<string[]>([]);
+  const audioChunkIndexRef = useRef<number>(0);
+  const audioTotalWordsRef = useRef<number>(0);
+  const audioChunkWordCountsRef = useRef<number[]>([]);
   const clarifyRequestInFlightRef = useRef(false);
   const buildCurriculumInFlightRef = useRef(false);
   const uploadInFlightRef = useRef(false);
@@ -3342,7 +4065,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
   const slideAnim = useRef(new Animated.Value(0)).current;
   const fadeAnim = useRef(new Animated.Value(1)).current;
 
-  const transitionToScreen = (target:'home'|'create'|'detail'|'chat'|'discover'|'section-overview', direction:'forward'|'back'='forward') => {
+  const transitionToScreen = (target:'home'|'create'|'detail'|'chat'|'discover'|'section-overview'|'study-guide-select'|'study-guide', direction:'forward'|'back'='forward') => {
     const startX = direction==='forward'?Dimensions.get('window').width:-Dimensions.get('window').width;
     slideAnim.setValue(startX);
     fadeAnim.setValue(0);
@@ -4099,6 +4822,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
               out.push(pageText);
               readablePages += 1;
             }
+            // Yield to main thread every 5 pages to prevent "page not responsive"
+            if(p % 5 === 0) await new Promise(r => setTimeout(r, 0));
           }
           return { text:normalizeUploadedNotes(out.join('\n\n')), readablePages };
         } finally {
@@ -4177,67 +4902,6 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     await buildCurriculum([{role:'ai',text:'Creating comprehensive curriculum covering all aspects.'}]);
   };
 
-  const applyFamiliarityLevel = (topic:Topic, level:'low'|'medium'|'high') => {
-    const current = selTopicRef.current;
-    if(!current || current.id!==topic.id) return;
-    if(level==='low') return;
-    const baseline = level==='high' ? 80 : 45;
-    const unlocked = true;
-    const updSections = current.sections.map(s=>({
-      ...s,
-      unlocked,
-      concepts:s.concepts.map(c=>({...c,confidenceScore:Math.max(c.confidenceScore,baseline)})),
-    }));
-    const updConcepts = updSections.flatMap(s=>s.concepts);
-    const updTopic:Topic = {...current, sections:updSections, concepts:updConcepts};
-    setSelTopic(updTopic);
-    selTopicRef.current = updTopic;
-    onUpdateTopic(updTopic);
-    if(level==='medium') {
-      Alert.alert('🥉 Bronze Track Ready','All sections unlocked. Start with Quiz, Games, or Podcast to optimize your knowledge.');
-    } else {
-      Alert.alert('🥈 Silver Track Ready','All sections unlocked with advanced pacing. Use Quiz, Games, or Podcast to push toward Gold and Trait mastery.');
-    }
-  };
-
-  // Ask user about familiarity level and adjust topic accordingly
-  const askFamiliarity = (topic:Topic) => {
-    // Navigate to detail screen immediately
-    transitionToScreen('detail','forward');
-    // Then show the familiarity prompt
-    setTimeout(() => {
-      if(Platform.OS==='web') {
-        const g:any = globalThis as any;
-        const pickRaw = typeof g.prompt==='function'
-          ? safeStr(g.prompt('How familiar are you with this topic? Type: low, medium, or high', 'low'))
-          : 'low';
-        const pick = pickRaw.toLowerCase().trim();
-        if(pick.startsWith('h')) applyFamiliarityLevel(topic,'high');
-        else if(pick.startsWith('m')) applyFamiliarityLevel(topic,'medium');
-        else applyFamiliarityLevel(topic,'low');
-        return;
-      }
-      Alert.alert(
-        'How familiar are you with this topic?',
-        'This helps us personalize your learning experience.',
-        [
-          {
-            text: '🟢 Low — Start from scratch',
-            onPress: () => applyFamiliarityLevel(topic,'low'),
-          },
-          {
-            text: '🟡 Medium — I know the basics',
-            onPress: () => applyFamiliarityLevel(topic,'medium'),
-          },
-          {
-            text: '🔵 High — I\'m experienced',
-            onPress: () => applyFamiliarityLevel(topic,'high'),
-          },
-        ],
-        { cancelable: false }
-      );
-    }, 500);
-  };
 
   // Build the curriculum from conversation context
   const buildCurriculum = async (msgs:ClarifyMessage[], notesOverride?:UploadedNotesState|null) => {
@@ -4311,8 +4975,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     setSelTopic(newTopic);
     selTopicRef.current = newTopic;
     setTopicInput(''); setClarifyMsgs([]); setClarifyInput(''); setUploadedNotes(null); setExtractionReport(null); setCreating(false); setClarifyLoading(false);
-    // Ask familiarity level first — this may update the topic's unlock/medal state
-	    askFamiliarity(newTopic);
+    transitionToScreen('detail','forward');
 	    // Auto-generate Section 1 overview in background
 	    // (proactive cooldown from curriculum call handles rate-limit timing automatically)
 	    if(sections.length>0){
@@ -4692,7 +5355,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     // Paragraphs are separated by double newlines or sentence-ending punctuation groups.
     const rawParagraphs = text.split(/\n\s*\n|\r\n\s*\r\n/).map(p=>p.trim()).filter(Boolean);
     const chunks:string[] = [];
-    const MAX_CHUNK_WORDS = 50; // Kokoro WASM has no character limit — use larger chunks for smoother narration
+    const MAX_CHUNK_WORDS = 35; // Keep chunks short to avoid Chrome's ~15s speechSynthesis cutoff bug
     for(const para of rawParagraphs) {
       const words = para.split(/\s+/).filter(Boolean);
       if(words.length <= MAX_CHUNK_WORDS) {
@@ -4735,122 +5398,269 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     return chunks.length > 0 ? chunks : [''];
   };
 
-  // ===== Audiobook Playback Engine (pre-generate-then-play) =====
-  // Get current playback position in seconds
-  const getAudioPosition = ():number => {
-    if(!audioSourceRef.current || !_webAudioCtx) return audioPausedAtRef.current;
-    const elapsed = (_webAudioCtx.currentTime - audioCtxStartTimeRef.current) * audioSourceRef.current.playbackRate.value;
-    return Math.min(audioStartOffsetRef.current + elapsed, audioDurationRef.current);
+  // ===== Audiobook Playback Engine =====
+  // Fraction-based tracking: position = (completedChunks + partialChunk) / totalChunks × duration.
+  // Chrome keepalive workaround for the ~15s speechSynthesis cutoff bug.
+  // All controls use audioPlayingRef (not React state) to avoid stale closures.
+  const WPM_ESTIMATE = 150;
+  const audioPlayingRef = useRef<boolean>(false);
+  const audioChunkStartRef = useRef<number>(0);
+  const audioChunkDurationEstRef = useRef<number>(0);
+  const chromeKeepAliveRef = useRef<any>(null);
+
+  // Safe number helper: returns 0 for NaN/Infinity/undefined
+  const safeNum = (n:any):number => { const v = Number(n); return Number.isFinite(v) ? v : 0; };
+
+  const estimateChunkDuration = (chunkIdx:number):number => {
+    const words = safeNum(audioChunkWordCountsRef.current[chunkIdx]);
+    const speed = audioSpeedRef.current || 1;
+    return Math.max(0.5, (words / WPM_ESTIMATE) * 60 / speed);
   };
 
-  // Start/stop position tracking (updates UI every 250ms)
+  const getAudioPosition = ():number => {
+    if(!audioPlayingRef.current) return safeNum(audioPausedAtRef.current);
+    const chunks = audioChunksRef.current;
+    const duration = safeNum(audioDurationRef.current);
+    if(!chunks.length || duration <= 0) return 0;
+    const currentIdx = Math.max(0, Math.min(safeNum(audioChunkIndexRef.current), chunks.length - 1));
+    const completedFrac = currentIdx / chunks.length;
+    const chunkElapsed = Math.max(0, (Date.now() - (audioChunkStartRef.current || Date.now())) / 1000);
+    const chunkDur = safeNum(audioChunkDurationEstRef.current) || estimateChunkDuration(currentIdx);
+    const chunkFrac = chunkDur > 0 ? Math.min(1, chunkElapsed / chunkDur) : 0;
+    const totalFrac = Math.min(1, completedFrac + (1 / chunks.length) * chunkFrac);
+    return safeNum(totalFrac * duration);
+  };
+
   const startPositionTracking = () => {
     if(audioPositionIntervalRef.current) clearInterval(audioPositionIntervalRef.current);
     audioPositionIntervalRef.current = setInterval(() => {
+      if(!audioPlayingRef.current) return;
       const pos = getAudioPosition();
+      const dur = safeNum(audioDurationRef.current);
       setAudioCurrentTime(pos);
-      setAudioProgress(audioDurationRef.current > 0 ? Math.round((pos / audioDurationRef.current) * 100) : 0);
+      setAudioProgress(dur > 0 ? Math.min(100, Math.round((pos / dur) * 100)) : 0);
     }, 250);
   };
   const stopPositionTracking = () => {
     if(audioPositionIntervalRef.current) { clearInterval(audioPositionIntervalRef.current); audioPositionIntervalRef.current = null; }
   };
 
-  // Start playback from a specific offset (seconds) into the full audio buffer
-  const startPlaybackFromOffset = (offsetSeconds:number) => {
-    const buffer = audioBufferRef.current;
-    const ctx = _ensureAudioCtx();
-    if(!buffer || !ctx) return;
-    if(audioSourceRef.current) {
-      audioStoppedManuallyRef.current = true;
-      try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
-      audioSourceRef.current = null;
+  // Chrome keepalive: pause/resume every 10s to prevent the ~15s speech cutoff bug
+  const startChromeKeepAlive = () => {
+    stopChromeKeepAlive();
+    if(Platform.OS !== 'web' || typeof window === 'undefined' || !window.speechSynthesis) return;
+    chromeKeepAliveRef.current = setInterval(() => {
+      if(window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+        window.speechSynthesis.pause();
+        window.speechSynthesis.resume();
+      }
+    }, 10000);
+  };
+  const stopChromeKeepAlive = () => {
+    if(chromeKeepAliveRef.current) { clearInterval(chromeKeepAliveRef.current); chromeKeepAliveRef.current = null; }
+  };
+
+  const timeToChunkIndex = (seconds:number):number => {
+    const chunks = audioChunksRef.current;
+    const duration = safeNum(audioDurationRef.current);
+    if(!chunks.length || duration <= 0) return 0;
+    const s = safeNum(seconds);
+    const frac = Math.max(0, Math.min(1, s / duration));
+    const idx = Math.floor(frac * chunks.length);
+    return Math.max(0, Math.min(idx, chunks.length - 1));
+  };
+
+  const stopSpeech = () => {
+    stopChromeKeepAlive();
+    if(Platform.OS === 'web' && typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
     }
-    if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
-    const offset = Math.max(0, Math.min(offsetSeconds, buffer.duration - 0.01));
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.playbackRate.value = audioSpeedRef.current;
-    if(!audioGainRef.current) { audioGainRef.current = ctx.createGain(); audioGainRef.current.connect(ctx.destination); }
-    audioGainRef.current.gain.value = 1.0;
-    source.connect(audioGainRef.current);
-    source.onended = () => {
-      if(audioStoppedManuallyRef.current) { audioStoppedManuallyRef.current = false; return; }
-      stopPositionTracking();
-      audioSourceRef.current = null;
-      setAudioPlaying(false);
-      setAudioProgress(100);
-      setAudioCurrentTime(audioDurationRef.current);
+    try { ExpoSpeech.stop(); } catch(_){}
+  };
+
+  const finishAudioPlayback = () => {
+    stopPositionTracking();
+    stopChromeKeepAlive();
+    audioPlayingRef.current = false;
+    setAudioPlaying(false);
+    setAudioProgress(100);
+    setAudioCurrentTime(safeNum(audioDurationRef.current));
+  };
+
+  // Core: speak one chunk, then chain to next.
+  // Uses a loop (not recursion) to skip empty chunks — prevents stack overflow.
+  const speakFromChunk = (rawIndex:number, gen:number) => {
+    if(gen !== audioGenRef.current) return;
+    const chunks = audioChunksRef.current;
+
+    // Loop past any empty chunks (iterative, not recursive)
+    let idx = Math.max(0, safeNum(rawIndex));
+    while(idx < chunks.length && !(chunks[idx]?.trim())) { idx++; }
+
+    if(idx >= chunks.length) { finishAudioPlayback(); return; }
+
+    audioChunkIndexRef.current = idx;
+    const text = chunks[idx].trim();
+    audioChunkStartRef.current = Date.now();
+    audioChunkDurationEstRef.current = estimateChunkDuration(idx);
+    const voiceId = _audiobookVoiceName || AUDIOBOOK_DEFAULT_VOICE;
+
+    const onChunkDone = () => {
+      if(gen !== audioGenRef.current) return;
+      speakFromChunk(idx + 1, gen);
     };
-    audioStartOffsetRef.current = offset;
-    audioCtxStartTimeRef.current = ctx.currentTime;
-    source.start(0, offset);
-    audioSourceRef.current = source;
-    audioPausedAtRef.current = 0;
-    setAudioPlaying(true);
-    setAudioStarting(false);
-    startPositionTracking();
+    const onChunkError = (e?:any) => {
+      if(gen !== audioGenRef.current) return;
+      console.warn('[Audiobook] Speech error chunk', idx, ':', e?.message || e?.error || e);
+      setTimeout(() => {
+        if(gen !== audioGenRef.current) return;
+        speakFromChunk(idx + 1, gen);
+      }, 100);
+    };
+
+    if(Platform.OS === 'web' && typeof window !== 'undefined' && window.speechSynthesis) {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = audioSpeedRef.current || 1;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      const voices = window.speechSynthesis.getVoices();
+      const voice = voices.find(v => v.name === voiceId)
+        || voices.find(v => v.name.includes('Samantha'))
+        || voices.find(v => v.lang.startsWith('en'))
+        || voices[0];
+      if(voice) utterance.voice = voice;
+      utterance.onend = onChunkDone;
+      utterance.onerror = (e:any) => {
+        if(e?.error === 'canceled' || e?.error === 'interrupted') return;
+        onChunkError(e);
+      };
+      // Do NOT call cancel() here — stopSpeech() already did it before seekTo/resume/etc.
+      // Calling cancel() right before speak() can kill the new utterance on Chrome.
+      window.speechSynthesis.speak(utterance);
+      startChromeKeepAlive();
+    } else {
+      ExpoSpeech.speak(text, {
+        voice: voiceId,
+        rate: audioSpeedRef.current || 1,
+        pitch: 1.0,
+        onDone: onChunkDone,
+        onError: onChunkError,
+        onStopped: () => { /* manual stop — don't advance */ },
+      });
+    }
   };
 
   const seekTo = (seconds:number) => {
-    const clamped = Math.max(0, Math.min(seconds, audioDurationRef.current));
-    if(audioSourceRef.current && _webAudioCtx) {
-      startPlaybackFromOffset(clamped);
-    } else if(audioBufferRef.current) {
-      audioPausedAtRef.current = clamped;
-      setAudioCurrentTime(clamped);
-      setAudioProgress(audioDurationRef.current > 0 ? Math.round((clamped / audioDurationRef.current) * 100) : 0);
+    const duration = safeNum(audioDurationRef.current);
+    if(duration <= 0) return;
+    const clamped = Math.max(0, Math.min(safeNum(seconds), duration));
+    const targetChunk = timeToChunkIndex(clamped);
+    const wasPlaying = audioPlayingRef.current;
+
+    const gen = ++audioGenRef.current;
+    stopSpeech();
+    audioChunkIndexRef.current = targetChunk;
+    audioChunkStartRef.current = Date.now();
+    audioChunkDurationEstRef.current = estimateChunkDuration(targetChunk);
+    audioPausedAtRef.current = clamped;
+    setAudioCurrentTime(clamped);
+    setAudioProgress(Math.round((clamped / duration) * 100));
+
+    if(wasPlaying) {
+      // Small delay after cancel() so Chrome fully releases the previous utterance
+      setTimeout(() => {
+        if(gen !== audioGenRef.current) return;
+        speakFromChunk(targetChunk, gen);
+      }, 60);
     }
   };
 
   const stopAudio = () => {
     audioGenRef.current++;
-    _kokoroCancelAll();
+    stopSpeech();
     stopPositionTracking();
-    if(audioSourceRef.current) {
-      audioStoppedManuallyRef.current = true;
-      try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
-      audioSourceRef.current = null;
-    }
-    audioBufferRef.current = null;
+    audioPlayingRef.current = false;
+    audioChunksRef.current = [];
+    audioChunkIndexRef.current = 0;
+    audioChunkStartRef.current = 0;
+    audioChunkDurationEstRef.current = 0;
     audioDurationRef.current = 0;
     audioPausedAtRef.current = 0;
     setAudioPlaying(false);
     setAudioStarting(false);
     setShowAudioControls(false);
     setAudioProgress(0);
-    setAudioGenProgress(0);
     setAudioCurrentTime(0);
     setAudioDuration(0);
   };
 
   const pauseAudio = () => {
-    if(!audioSourceRef.current) return;
-    audioPausedAtRef.current = getAudioPosition();
-    audioStoppedManuallyRef.current = true;
-    try { audioSourceRef.current.onended = null; audioSourceRef.current.stop(); } catch(_){}
-    audioSourceRef.current = null;
+    ++audioGenRef.current;
+    const pos = getAudioPosition(); // capture BEFORE setting playing=false
+    stopSpeech();
+    audioPausedAtRef.current = pos;
+    audioPlayingRef.current = false;
     stopPositionTracking();
     setAudioPlaying(false);
-    setAudioCurrentTime(audioPausedAtRef.current);
+    setAudioCurrentTime(pos);
   };
 
   const resumeAudio = () => {
-    if(audioBufferRef.current) startPlaybackFromOffset(audioPausedAtRef.current);
+    if(!audioChunksRef.current.length) return;
+    const gen = ++audioGenRef.current;
+    audioPlayingRef.current = true;
+    audioChunkStartRef.current = Date.now();
+    audioChunkDurationEstRef.current = estimateChunkDuration(safeNum(audioChunkIndexRef.current));
+    setAudioPlaying(true);
+    startPositionTracking();
+    // Small delay so React state updates propagate and cancel() clears
+    setTimeout(() => {
+      if(gen !== audioGenRef.current) return;
+      speakFromChunk(audioChunkIndexRef.current, gen);
+    }, 60);
   };
 
-  const skipForward = () => seekTo(getAudioPosition() + 10);
-  const skipBackward = () => seekTo(getAudioPosition() - 10);
+  const skipForward = () => {
+    const pos = getAudioPosition();
+    const dur = safeNum(audioDurationRef.current);
+    if(dur <= 0) return;
+    seekTo(Math.min(pos + 10, dur));
+  };
+  const skipBackward = () => {
+    const pos = getAudioPosition();
+    seekTo(Math.max(0, pos - 10));
+  };
 
   const changeSpeed = (spd:number) => {
+    const wasPlaying = audioPlayingRef.current;
+    const currentPos = getAudioPosition();
+    const oldDuration = safeNum(audioDurationRef.current);
+    const currentFrac = oldDuration > 0 ? Math.max(0, Math.min(1, currentPos / oldDuration)) : 0;
     setAudioSpeed(spd);
     audioSpeedRef.current = spd;
-    if(audioSourceRef.current) startPlaybackFromOffset(getAudioPosition());
+    const totalWords = safeNum(audioTotalWordsRef.current);
+    const newDuration = Math.max(1, (totalWords / WPM_ESTIMATE) * 60 / spd);
+    audioDurationRef.current = newDuration;
+    setAudioDuration(newDuration);
+    const newPos = currentFrac * newDuration;
+    audioPausedAtRef.current = newPos;
+    setAudioCurrentTime(newPos);
+    setAudioProgress(Math.round(currentFrac * 100));
+    if(wasPlaying) {
+      const gen = ++audioGenRef.current;
+      stopSpeech();
+      audioChunkStartRef.current = Date.now();
+      audioChunkDurationEstRef.current = estimateChunkDuration(safeNum(audioChunkIndexRef.current));
+      setTimeout(() => {
+        if(gen !== audioGenRef.current) return;
+        speakFromChunk(audioChunkIndexRef.current, gen);
+      }, 80);
+    }
   };
 
-  // ===== Pre-generate all audio then play =====
+  // ===== Main play function =====
   const playFullLesson = async (overview:SectionOverview) => {
-    if(audioStarting || audioPlaying) return;
+    if(audioStarting || audioPlayingRef.current) return;
 
     const fullText = AI._normalizeReadableText(
       safeStr(overview.lesson||'').replace(/[#*_~`]/g,''),
@@ -4863,70 +5673,28 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
     stopAudio();
     const gen = ++audioGenRef.current;
-    setAudioStarting(true);
-    setShowAudioControls(true);
-    setAudioGenProgress(0);
 
-    // Ensure Kokoro model is ready (first time downloads ~87MB, cached after)
-    if(Platform.OS === 'web' && !_kokoroReady) {
-      try { await _initKokoroWorker(); }
-      catch(e:any) {
-        setAudioStarting(false);
-        Alert.alert('Voice Model Error', 'Could not load the voice model. Please check your internet connection and try again.');
-        return;
-      }
-      if(gen !== audioGenRef.current) return;
-    }
+    audioChunksRef.current = chunks;
+    audioChunkIndexRef.current = 0;
+    audioChunkWordCountsRef.current = chunks.map(c => c.split(/\s+/).filter(Boolean).length);
+    audioTotalWordsRef.current = audioChunkWordCountsRef.current.reduce((s,w) => s+w, 0);
+    audioChunkStartRef.current = Date.now();
+    audioChunkDurationEstRef.current = estimateChunkDuration(0);
+
+    const estDuration = Math.max(1, (audioTotalWordsRef.current / WPM_ESTIMATE) * 60 / audioSpeedRef.current);
+    audioDurationRef.current = estDuration;
+    audioPausedAtRef.current = 0;
+    setAudioDuration(estDuration);
+    setShowAudioControls(true);
+    audioPlayingRef.current = true;
+    setAudioPlaying(true);
+    setAudioStarting(false);
+    setAudioCurrentTime(0);
+    setAudioProgress(0);
 
     await activatePlaybackSession();
-
-    // Generate ALL chunks sequentially with progress tracking
-    const voice = ApiKeys.getAudiobookVoice() || KOKORO_DEFAULT_VOICE;
-    const wavBuffers:ArrayBuffer[] = [];
-    for(let i = 0; i < chunks.length; i++) {
-      if(gen !== audioGenRef.current) return;
-      const text = chunks[i].trim();
-      if(!text) { setAudioGenProgress(Math.round(((i+1)/chunks.length)*100)); continue; }
-      try {
-        const wav = await _kokoroGenerate(text, voice);
-        wavBuffers.push(wav);
-      } catch(e:any) {
-        console.warn('[Audiobook] Generation failed chunk', i, ':', e?.message);
-      }
-      setAudioGenProgress(Math.round(((i+1)/chunks.length)*100));
-    }
-    if(gen !== audioGenRef.current) return;
-
-    if(wavBuffers.length === 0) {
-      setAudioStarting(false);
-      Alert.alert('Generation Failed', 'Could not generate audio. Please try again.');
-      return;
-    }
-
-    // Decode and concatenate into a single AudioBuffer
-    const ctx = _ensureAudioCtx();
-    if(!ctx) { setAudioStarting(false); return; }
-
-    const audioBuffers:AudioBuffer[] = [];
-    for(const wav of wavBuffers) {
-      try { audioBuffers.push(await ctx.decodeAudioData(wav.slice(0))); }
-      catch(e:any) { console.warn('[Audiobook] WAV decode failed:', e?.message); }
-    }
-    if(gen !== audioGenRef.current) return;
-
-    if(audioBuffers.length === 0) {
-      setAudioStarting(false);
-      Alert.alert('Audio Error', 'Could not decode audio.');
-      return;
-    }
-
-    const fullBuffer = _concatenateAudioBuffers(audioBuffers, ctx);
-    audioBufferRef.current = fullBuffer;
-    audioDurationRef.current = fullBuffer.duration;
-    setAudioDuration(fullBuffer.duration);
-    setAudioGenProgress(100);
-
-    startPlaybackFromOffset(0);
+    speakFromChunk(0, gen);
+    startPositionTracking();
   };
 
 
@@ -4963,6 +5731,129 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
       }
       endSectionOverviewLoad();
     }
+  };
+
+  // ===== Multi-Topic Study Guide Generation =====
+
+  const generateMultiTopicStudyGuide = async () => {
+    setStudyGuideLoading(true);
+    try {
+      const allSections:StudyGuideSection[] = [];
+      // Track all segment titles already generated to prevent repetition across sections
+      const coveredTitles:string[] = [];
+      for(const topic of topics) {
+        if(!sgSelectedTopicIds.includes(topic.id)) continue;
+        const selectedSections = (topic.sections||[]).filter(s=>sgSelectedSectionIds.includes(s.id));
+        const sourceContent = topic.source==='file' ? cleanStoredSourceForAI(topic.originalContent) : undefined;
+        for(const section of selectedSections) {
+          const lessonText = section.overview?.loaded ? section.overview.lesson : undefined;
+          try {
+            // Pass already-covered titles so AI skips duplicates
+            const segments = await AI.generateStudyGuideSegments(section, topic.title, lessonText, sourceContent, coveredTitles.length > 0 ? coveredTitles : undefined);
+            for(const seg of segments) {
+              // Double-check: skip segments whose title closely matches one already generated
+              const normalizedTitle = seg.title.toLowerCase().replace(/[^a-z0-9]/g,'');
+              const isDuplicate = coveredTitles.some(ct => {
+                const normalizedCt = ct.toLowerCase().replace(/[^a-z0-9]/g,'');
+                // Exact match or one title contains the other (e.g. "SWOT Analysis" vs "SWOT Analysis Framework")
+                return normalizedCt === normalizedTitle
+                  || (normalizedTitle.length > 8 && normalizedCt.includes(normalizedTitle))
+                  || (normalizedCt.length > 8 && normalizedTitle.includes(normalizedCt));
+              });
+              if(isDuplicate) continue;
+              coveredTitles.push(seg.title);
+              allSections.push({
+                id:`sg_${section.id}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+                sectionId:section.id,
+                sectionTitle:section.title,
+                conceptTitle:seg.title,
+                topicId:topic.id,
+                topicTitle:topic.title,
+                content:seg.content,
+                keyPoints:[],
+                status:'none',
+              });
+            }
+          } catch(e) {
+            console.warn(`Failed to generate study guide for section ${section.title}:`,e);
+          }
+        }
+      }
+      if(allSections.length===0) {
+        Alert.alert('Error','Failed to generate study guide. Please check your API key and try again.');
+        setStudyGuideLoading(false);
+        return;
+      }
+      // Build topic names for the guide name
+      const topicNames = topics.filter(t=>sgSelectedTopicIds.includes(t.id)).map(t=>t.title);
+      const guideName = topicNames.length===1 ? topicNames[0] : `${topicNames.length} Topics`;
+      const newGuide:SavedStudyGuide = {
+        id:`guide_${Date.now()}`,
+        name:guideName,
+        sections:allSections,
+        createdAt:Date.now(),
+        lastAccessedAt:Date.now(),
+      };
+      setStudyGuideSections(allSections);
+      setActiveStudyGuideId(newGuide.id);
+      setSavedStudyGuides(prev=>{
+        const updated = [newGuide,...prev];
+        Store.save(SK.STUDY_GUIDES,updated);
+        return updated;
+      });
+      transitionToScreen('study-guide','forward');
+    } catch(e) {
+      Alert.alert('Error','Failed to generate study guide. Please check your API key and try again.');
+    } finally {
+      setStudyGuideLoading(false);
+    }
+  };
+
+  const resumeStudyGuide = (guide:SavedStudyGuide) => {
+    setStudyGuideSections(guide.sections);
+    setActiveStudyGuideId(guide.id);
+    // Update last accessed
+    setSavedStudyGuides(prev=>{
+      const updated = prev.map(g=>g.id===guide.id?{...g,lastAccessedAt:Date.now()}:g);
+      Store.save(SK.STUDY_GUIDES,updated);
+      return updated;
+    });
+    transitionToScreen('study-guide','forward');
+  };
+
+  const saveStudyGuideProgress = (sections:StudyGuideSection[]) => {
+    if(!activeStudyGuideId) return;
+    setSavedStudyGuides(prev=>{
+      const updated = prev.map(g=>g.id===activeStudyGuideId?{...g,sections,lastAccessedAt:Date.now()}:g);
+      Store.save(SK.STUDY_GUIDES,updated);
+      return updated;
+    });
+  };
+
+  const deleteStudyGuide = (guideId:string) => {
+    // Clear active guide if we're deleting it
+    if(activeStudyGuideId===guideId) {
+      setActiveStudyGuideId(null);
+      setStudyGuideSections([]);
+      if(screen==='study-guide') transitionToScreen('study-guide-select','back');
+    }
+    setSavedStudyGuides(prev=>{
+      const updated = prev.filter(g=>g.id!==guideId);
+      Store.save(SK.STUDY_GUIDES,updated);
+      return updated;
+    });
+  };
+
+  const cycleStudyGuideSectionStatus = (sectionId:string) => {
+    setStudyGuideSections(prev=>{
+      const updated = prev.map(s=>{
+        if(s.id!==sectionId) return s;
+        const next:StudyGuideItemStatus = s.status==='none'?'familiar':s.status==='familiar'?'known':'none';
+        return {...s,status:next};
+      });
+      saveStudyGuideProgress(updated);
+      return updated;
+    });
   };
 
   // Send chat message
@@ -5153,13 +6044,331 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     );
   };
 
+  // ===== STUDY GUIDE SELECT VIEW =====
+  if(screen==='study-guide-select') {
+    const sgTopics = topics.filter(t=>(t.sections||[]).length>0);
+    const allSgSectionIds = sgTopics.filter(t=>sgSelectedTopicIds.includes(t.id)).flatMap(t=>(t.sections||[]).map(s=>s.id));
+    const allSgSelected = allSgSectionIds.length>0 && allSgSectionIds.every(id=>sgSelectedSectionIds.includes(id));
+    const totalSelectedSections = sgSelectedSectionIds.length;
+    const totalSelectedConcepts = sgTopics.filter(t=>sgSelectedTopicIds.includes(t.id)).flatMap(t=>(t.sections||[]).filter(s=>sgSelectedSectionIds.includes(s.id))).reduce((sum,s)=>sum+(s.concepts||[]).length,0);
+
+    const toggleSgTopic = (topicId:string) => {
+      const topic = sgTopics.find(t=>t.id===topicId);
+      if(!topic) return;
+      const sectionIds = (topic.sections||[]).map(s=>s.id);
+      if(sgSelectedTopicIds.includes(topicId)) {
+        setSgSelectedTopicIds(prev=>prev.filter(id=>id!==topicId));
+        setSgSelectedSectionIds(prev=>prev.filter(id=>!sectionIds.includes(id)));
+      } else {
+        setSgSelectedTopicIds(prev=>[...prev,topicId]);
+        setSgSelectedSectionIds(prev=>[...prev,...sectionIds.filter(id=>!prev.includes(id))]);
+      }
+    };
+    const toggleSgSection = (topicId:string, sectionId:string) => {
+      const topic = sgTopics.find(t=>t.id===topicId);
+      if(!topic) return;
+      const sectionIds = (topic.sections||[]).map(s=>s.id);
+      if(sgSelectedSectionIds.includes(sectionId)) {
+        const newSections = sgSelectedSectionIds.filter(id=>id!==sectionId);
+        setSgSelectedSectionIds(newSections);
+        if(!sectionIds.some(id=>newSections.includes(id))) {
+          setSgSelectedTopicIds(prev=>prev.filter(id=>id!==topicId));
+        }
+      } else {
+        setSgSelectedSectionIds(prev=>[...prev,sectionId]);
+        if(!sgSelectedTopicIds.includes(topicId)) {
+          setSgSelectedTopicIds(prev=>[...prev,topicId]);
+        }
+      }
+    };
+    const toggleAllSg = () => {
+      if(allSgSelected) { setSgSelectedTopicIds([]); setSgSelectedSectionIds([]); }
+      else { setSgSelectedTopicIds(sgTopics.map(t=>t.id)); setSgSelectedSectionIds(sgTopics.flatMap(t=>(t.sections||[]).map(s=>s.id))); }
+    };
+
+    return (
+      <Animated.View style={[st.screen,{backgroundColor:theme.background,transform:[{translateX:slideAnim}],opacity:fadeAnim}]}>
+      <ScrollView style={{flex:1}} contentContainerStyle={st.screenC} keyboardShouldPersistTaps="handled">
+        <Back onPress={()=>transitionToScreen('home','back')} theme={theme}/>
+        <Text style={[st.title,{color:theme.text}]}>Study Guide</Text>
+        <Text style={st.sub}>Concise review of everything you need to know</Text>
+
+        {/* Saved Study Guides */}
+        {savedStudyGuides.length>0&&(
+          <>
+            <Text style={{color:'#64748B',fontSize:12,fontWeight:'700',letterSpacing:0.5,marginBottom:10,marginTop:4}}>SAVED GUIDES</Text>
+            {savedStudyGuides.map(guide=>{
+              const knownCount = guide.sections.filter(s=>s.status==='known').length;
+              const familiarCount = guide.sections.filter(s=>s.status==='familiar').length;
+              const total = guide.sections.length;
+              const pct = total>0?Math.round(((knownCount + familiarCount*0.5)/total)*100):0;
+              return (
+                <View key={guide.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10}]}>
+                  <TouchableOpacity onPress={()=>resumeStudyGuide(guide)}>
+                    <View style={{flexDirection:'row',alignItems:'center'}}>
+                      <View style={{width:40,height:40,borderRadius:10,backgroundColor:'rgba(16,185,129,0.15)',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                        <Text style={{fontSize:18}}>📖</Text>
+                      </View>
+                      <View style={{flex:1}}>
+                        <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>{safeStr(guide.name)}</Text>
+                        <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>{total} sections · {pct}% reviewed</Text>
+                      </View>
+                      <I.Right s={18} c='#64748B'/>
+                    </View>
+                    <View style={{height:4,backgroundColor:'rgba(128,128,128,0.12)',borderRadius:2,marginTop:10}}>
+                      <View style={{height:'100%',borderRadius:2,backgroundColor:'#10B981',width:`${pct}%`}}/>
+                    </View>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={()=>{
+                    if(Platform.OS==='web') {
+                      const g:any = globalThis as any;
+                      const ok = typeof g.confirm==='function' ? g.confirm(`Delete "${guide.name}"?\n\nThis cannot be undone.`) : true;
+                      if(ok) deleteStudyGuide(guide.id);
+                    } else {
+                      Alert.alert('Delete Study Guide',`Delete "${guide.name}"? This cannot be undone.`,[{text:'Cancel',style:'cancel'},{text:'Delete',style:'destructive',onPress:()=>deleteStudyGuide(guide.id)}]);
+                    }
+                  }} style={{alignSelf:'flex-end',marginTop:8,paddingVertical:6,paddingHorizontal:12,borderRadius:8,backgroundColor:'rgba(239,68,68,0.1)'}}>
+                    <Text style={{color:'#EF4444',fontSize:12,fontWeight:'600'}}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+            <View style={{height:1,backgroundColor:'rgba(128,128,128,0.12)',marginVertical:14}}/>
+          </>
+        )}
+
+        {/* Create New */}
+        <Text style={{color:'#64748B',fontSize:12,fontWeight:'700',letterSpacing:0.5,marginBottom:10}}>CREATE NEW GUIDE</Text>
+
+        {sgTopics.length===0&&(
+          <View style={{alignItems:'center',paddingVertical:40}}>
+            <Text style={{fontSize:48}}>📚</Text>
+            <Text style={{color:theme.text,fontSize:18,fontWeight:'600',marginTop:16}}>No topics available</Text>
+            <Text style={{color:'#94A3B8',fontSize:14,marginTop:8,textAlign:'center'}}>Create a topic first, then come back to build a study guide.</Text>
+          </View>
+        )}
+
+        {sgTopics.length>0&&(
+          <TouchableOpacity style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',paddingVertical:14,paddingHorizontal:16,backgroundColor:theme.card,borderRadius:14,marginBottom:14}} onPress={toggleAllSg}>
+            <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>Select All</Text>
+            <View style={{width:24,height:24,borderRadius:6,borderWidth:2,borderColor:allSgSelected?theme.primary:'#475569',backgroundColor:allSgSelected?theme.primary:'transparent',alignItems:'center',justifyContent:'center'}}>
+              {allSgSelected&&<I.Check s={16} c='white'/>}
+            </View>
+          </TouchableOpacity>
+        )}
+
+        {sgTopics.map(topic=>{
+          const isTopicSelected = sgSelectedTopicIds.includes(topic.id);
+          const topicSections = topic.sections||[];
+          const selectedCount = topicSections.filter(s=>sgSelectedSectionIds.includes(s.id)).length;
+          return (
+            <View key={topic.id} style={{marginBottom:14}}>
+              <TouchableOpacity style={[st.card,{backgroundColor:theme.card,marginBottom:0,borderWidth:2,borderColor:isTopicSelected?theme.primary:'transparent'}]} onPress={()=>toggleSgTopic(topic.id)}>
+                <View style={{flexDirection:'row',alignItems:'center'}}>
+                  <View style={{width:32,height:32,borderRadius:8,backgroundColor:isTopicSelected?theme.primary:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                    {isTopicSelected?<I.Check s={18} c='white'/>:<I.Book s={18} c='#64748B'/>}
+                  </View>
+                  <View style={{flex:1}}>
+                    <Text style={{color:theme.text,fontSize:16,fontWeight:'600'}}>{safeStr(topic.title)}</Text>
+                    <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>{topicSections.length} sections · {selectedCount} selected</Text>
+                  </View>
+                  <MedalBadge medal={topic.medal} size={22}/>
+                </View>
+              </TouchableOpacity>
+              {isTopicSelected&&topicSections.map((sec,si)=>{
+                const isSectionSelected = sgSelectedSectionIds.includes(sec.id);
+                const hasOverview = sec.overview?.loaded;
+                return (
+                  <TouchableOpacity key={sec.id} style={{flexDirection:'row',alignItems:'center',paddingVertical:12,paddingHorizontal:20,marginLeft:20,borderLeftWidth:2,borderLeftColor:'rgba(99,102,241,0.3)'}} onPress={()=>toggleSgSection(topic.id,sec.id)}>
+                    <View style={{width:22,height:22,borderRadius:6,borderWidth:2,borderColor:isSectionSelected?'#10B981':'#475569',backgroundColor:isSectionSelected?'#10B981':'transparent',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                      {isSectionSelected&&<I.Check s={14} c='white'/>}
+                    </View>
+                    <View style={{flex:1}}>
+                      <Text style={{color:isSectionSelected?theme.text:'#94A3B8',fontSize:14,fontWeight:'500'}}>{si+1}. {safeStr(sec.title)}</Text>
+                      <Text style={{color:'#64748B',fontSize:11}}>{(sec.concepts||[]).length} concepts{hasOverview?' · Overview ready':''}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          );
+        })}
+
+        {totalSelectedSections>0&&(
+          <View style={{marginTop:8}}>
+            <View style={{backgroundColor:'rgba(16,185,129,0.1)',borderRadius:12,padding:14,marginBottom:14,flexDirection:'row',alignItems:'center'}}>
+              <Text style={{fontSize:16,marginRight:10}}>📋</Text>
+              <Text style={{color:'#94A3B8',fontSize:13,flex:1}}>{totalSelectedSections} section{totalSelectedSections!==1?'s':''} · {totalSelectedConcepts} concept{totalSelectedConcepts!==1?'s':''} selected</Text>
+            </View>
+            <Btn title={studyGuideLoading?'Generating Study Guide...':'Generate Study Guide'} onPress={generateMultiTopicStudyGuide} theme={theme} loading={studyGuideLoading} disabled={studyGuideLoading}/>
+          </View>
+        )}
+      </ScrollView>
+      </Animated.View>
+    );
+  }
+
+  // ===== STUDY GUIDE VIEW =====
+  if(screen==='study-guide'&&studyGuideSections.length>0) {
+    const noneCount = studyGuideSections.filter(s=>s.status==='none').length;
+    const familiarCount = studyGuideSections.filter(s=>s.status==='familiar').length;
+    const knownCount = studyGuideSections.filter(s=>s.status==='known').length;
+    const totalSecs = studyGuideSections.length;
+    const progressPct = totalSecs>0?Math.round(((knownCount + familiarCount*0.5)/totalSecs)*100):0;
+    const statusColor = (s:StudyGuideItemStatus) => s==='none'?'#EF4444':s==='familiar'?'#F59E0B':'#10B981';
+    const statusLabel = (s:StudyGuideItemStatus) => s==='none'?'Not reviewed':s==='familiar'?'Familiar':'Know it';
+
+    // Render markdown-lite: **bold**, ## headings, and paragraphs
+    const renderContent = (text:string) => {
+      const lines = text.split('\n');
+      const elements:React.ReactNode[] = [];
+      lines.forEach((line,i) => {
+        const trimmed = line.trim();
+        if(!trimmed) { elements.push(<View key={`sp_${i}`} style={{height:10}}/>); return; }
+        if(trimmed.startsWith('## ')) {
+          elements.push(<Text key={`h_${i}`} style={{color:theme.text,fontSize:17,fontWeight:'700',marginTop:14,marginBottom:6,lineHeight:24}}>{trimmed.replace('## ','')}</Text>);
+          return;
+        }
+        if(trimmed==='---'||trimmed==='***') {
+          elements.push(<View key={`hr_${i}`} style={{height:1,backgroundColor:'rgba(128,128,128,0.15)',marginVertical:10}}/>);
+          return;
+        }
+        // Bullet points
+        const isBullet = trimmed.startsWith('- ')||trimmed.startsWith('• ');
+        const bulletText = isBullet ? trimmed.slice(2) : trimmed;
+        // Parse **bold** and *italic* within text
+        const parseInline = (text:string) => {
+          // Split on **bold** first, then *italic* within remaining parts
+          const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+          return parts.map((part,j)=>{
+            if(part.startsWith('**')&&part.endsWith('**')) {
+              return <Text key={j} style={{fontWeight:'700',color:theme.text}}>{part.slice(2,-2)}</Text>;
+            }
+            if(part.startsWith('*')&&part.endsWith('*')&&!part.startsWith('**')) {
+              return <Text key={j} style={{fontStyle:'italic',color:theme.text,opacity:0.85}}>{part.slice(1,-1)}</Text>;
+            }
+            return part;
+          });
+        };
+        if(isBullet) {
+          elements.push(
+            <View key={`b_${i}`} style={{flexDirection:'row',paddingLeft:4,marginBottom:2}}>
+              <Text style={{color:theme.primary,fontSize:15,marginRight:8,lineHeight:24}}>•</Text>
+              <Text style={{color:theme.text,fontSize:15,lineHeight:24,opacity:0.92,flex:1}}>{parseInline(bulletText)}</Text>
+            </View>
+          );
+        } else {
+          elements.push(
+            <Text key={`p_${i}`} style={{color:theme.text,fontSize:15,lineHeight:24,opacity:0.92}}>
+              {parseInline(bulletText)}
+            </Text>
+          );
+        }
+      });
+      return elements;
+    };
+
+    // Group sections by topic
+    const topicGroups:{topicTitle:string;sections:StudyGuideSection[]}[] = [];
+    studyGuideSections.forEach(s=>{
+      const existing = topicGroups.find(g=>g.topicTitle===s.topicTitle);
+      if(existing) existing.sections.push(s);
+      else topicGroups.push({topicTitle:s.topicTitle,sections:[s]});
+    });
+
+    return (
+      <Animated.View style={[st.screen,{backgroundColor:theme.background,transform:[{translateX:slideAnim}],opacity:fadeAnim}]}>
+      <ScrollView style={{flex:1}} contentContainerStyle={[st.screenC,{paddingBottom:60}]} keyboardShouldPersistTaps="handled">
+        <Back onPress={()=>transitionToScreen('study-guide-select','back')} theme={theme}/>
+        <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+          <Text style={[st.title,{color:theme.text,marginBottom:0}]}>Study Guide</Text>
+          {activeStudyGuideId&&<TouchableOpacity onPress={()=>{
+            if(Platform.OS==='web') {
+              const g:any = globalThis as any;
+              const ok = typeof g.confirm==='function' ? g.confirm('Delete this study guide?\n\nThis cannot be undone.') : true;
+              if(ok) deleteStudyGuide(activeStudyGuideId);
+            } else {
+              Alert.alert('Delete Study Guide','Delete this guide? This cannot be undone.',[{text:'Cancel',style:'cancel'},{text:'Delete',style:'destructive',onPress:()=>deleteStudyGuide(activeStudyGuideId)}]);
+            }
+          }} style={{paddingVertical:8,paddingHorizontal:14,borderRadius:10,backgroundColor:'rgba(239,68,68,0.12)',borderWidth:1,borderColor:'rgba(239,68,68,0.3)'}}>
+            <Text style={{color:'#EF4444',fontSize:13,fontWeight:'600'}}>Delete</Text>
+          </TouchableOpacity>}
+        </View>
+
+        {/* Progress bar */}
+        <View style={{marginBottom:16}}>
+          <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <Text style={{color:theme.text,fontSize:14,fontWeight:'600'}}>{progressPct}% reviewed</Text>
+            <Text style={{color:'#64748B',fontSize:12}}>{knownCount}/{totalSecs} sections mastered</Text>
+          </View>
+          <View style={{flexDirection:'row',height:6,borderRadius:3,overflow:'hidden',backgroundColor:'rgba(128,128,128,0.15)'}}>
+            {knownCount>0&&<View style={{flex:knownCount,backgroundColor:'#10B981'}}/>}
+            {familiarCount>0&&<View style={{flex:familiarCount,backgroundColor:'#F59E0B'}}/>}
+            {noneCount>0&&<View style={{flex:noneCount,backgroundColor:'rgba(128,128,128,0.25)'}}/>}
+          </View>
+        </View>
+
+        {/* Continuous reading content */}
+        {topicGroups.map((group,gi)=>(
+          <View key={`tg_${gi}`}>
+            {topicGroups.length>1&&(
+              <View style={{backgroundColor:'rgba(99,102,241,0.1)',paddingVertical:10,paddingHorizontal:16,borderRadius:10,marginBottom:14}}>
+                <Text style={{color:theme.primary,fontSize:13,fontWeight:'700',letterSpacing:0.5}}>{safeStr(group.topicTitle).toUpperCase()}</Text>
+              </View>
+            )}
+            {group.sections.map((section) => (
+              <View key={section.id} style={{marginBottom:24}}>
+                {/* Section header — show concept title if available, otherwise section title */}
+                <View style={{flexDirection:'row',alignItems:'center',marginBottom:12,gap:10}}>
+                  <View style={{width:4,height:24,borderRadius:2,backgroundColor:statusColor(section.status)}}/>
+                  <View style={{flex:1}}>
+                    <Text style={{color:theme.text,fontSize:19,fontWeight:'800'}}>{safeStr(section.conceptTitle||section.sectionTitle)}</Text>
+                    {section.conceptTitle&&<Text style={{color:'#64748B',fontSize:11,marginTop:2}}>{safeStr(section.sectionTitle)}</Text>}
+                  </View>
+                </View>
+
+                {/* Main content — continuous reading */}
+                <View style={{paddingLeft:14,borderLeftWidth:1,borderLeftColor:'rgba(128,128,128,0.12)'}}>
+                  {renderContent(section.content)}
+                </View>
+
+                {/* Status toggle */}
+                <TouchableOpacity onPress={()=>cycleStudyGuideSectionStatus(section.id)} style={{flexDirection:'row',alignItems:'center',justifyContent:'center',paddingVertical:10,borderRadius:10,backgroundColor:`${statusColor(section.status)}10`,marginTop:12}}>
+                  <View style={{width:10,height:10,borderRadius:5,backgroundColor:statusColor(section.status),marginRight:8}}/>
+                  <Text style={{color:statusColor(section.status),fontSize:13,fontWeight:'600'}}>{statusLabel(section.status)}</Text>
+                  <Text style={{color:'#64748B',fontSize:11,marginLeft:6}}>— tap to update</Text>
+                </TouchableOpacity>
+
+                {/* Divider between sections */}
+                <View style={{height:1,backgroundColor:'rgba(128,128,128,0.12)',marginTop:20}}/>
+              </View>
+            ))}
+          </View>
+        ))}
+
+        {noneCount===0&&totalSecs>0&&(
+          <View style={[st.card,{backgroundColor:'rgba(16,185,129,0.1)',borderWidth:1,borderColor:'#10B981',alignItems:'center'}]}>
+            <Text style={{fontSize:32,marginBottom:8}}>🏆</Text>
+            <Text style={{color:'#10B981',fontSize:18,fontWeight:'700',textAlign:'center'}}>
+              {familiarCount===0?'Study Guide Complete!':'Almost there!'}
+            </Text>
+            <Text style={{color:'#94A3B8',fontSize:14,marginTop:4,textAlign:'center'}}>
+              {familiarCount===0?'You\'ve reviewed everything. Great mastery!':`${familiarCount} section${familiarCount!==1?'s':''} still marked as familiar.`}
+            </Text>
+          </View>
+        )}
+      </ScrollView>
+      </Animated.View>
+    );
+  }
+
   // ===== CHAT VIEW =====
   if(screen==='chat'&&selTopic) {
     const chatMsgs = selTopic.chatHistory;
     return (
       <Animated.View style={[st.screen,{backgroundColor:theme.background,transform:[{translateX:slideAnim}],opacity:fadeAnim}]}>
       <KeyboardAvoidingView style={{flex:1}} behavior={Platform.OS==='ios'?'padding':'height'}>
-        <View style={{paddingTop:60,paddingHorizontal:20,flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingBottom:12,borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.08)'}}>
+        <View style={{paddingTop:60,paddingHorizontal:20,flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingBottom:12,borderBottomWidth:1,borderBottomColor:'rgba(128,128,128,0.15)'}}>
           <TouchableOpacity onPress={()=>{transitionToScreen(selSection?'section-overview':'detail','back');}}><I.Left s={28} c={theme.text}/></TouchableOpacity>
           <View style={{alignItems:'center',flex:1}}>
             <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Ask Questions</Text>
@@ -5179,24 +6388,59 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
                 'What should I focus on first?',
                 'How is this used in practice?',
               ].map((q,i)=>(
-                <TouchableOpacity key={i} onPress={()=>{setChatInput(q);}} style={{backgroundColor:theme.card,borderRadius:12,padding:12,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+                <TouchableOpacity key={i} onPress={()=>{setChatInput(q);}} style={{backgroundColor:theme.card,borderRadius:12,padding:12,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
                   <Text style={{color:theme.primary,fontSize:14}}>{q}</Text>
                 </TouchableOpacity>
               ))}
             </View>
           </View>}
-          {chatMsgs.map(m=>(
-            <View key={m.id} style={{marginBottom:14,alignSelf:m.role==='user'?'flex-end':'flex-start',maxWidth:'82%'}}>
-              <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(255,255,255,0.08)'}}>
-                <Text style={{color:m.role==='user'?'white':theme.text,fontSize:15,lineHeight:22}}>{m.text}</Text>
+          {chatMsgs.map(m=>{
+            const textColor = m.role==='user'?'white':theme.text;
+            // Render markdown-lite for AI responses
+            const renderChatText = (text:string) => {
+              if(m.role==='user') return <Text style={{color:textColor,fontSize:15,lineHeight:22}}>{text}</Text>;
+              const lines = text.split('\n');
+              return lines.map((line,li) => {
+                const trimmed = line.trim();
+                if(!trimmed) return <View key={li} style={{height:6}}/>;
+                if(trimmed==='---'||trimmed==='***') return <View key={li} style={{height:1,backgroundColor:'rgba(128,128,128,0.18)',marginVertical:8}}/>;
+                // Headings: ### or ##
+                const headingMatch = trimmed.match(/^#{1,3}\s+(.+)/);
+                if(headingMatch) return <Text key={li} style={{color:textColor,fontSize:16,fontWeight:'700',marginTop:li>0?10:0,marginBottom:4,lineHeight:22}}>{headingMatch[1]}</Text>;
+                // Bullet points
+                const bulletMatch = trimmed.match(/^[-•]\s+(.+)/);
+                const isBullet = !!bulletMatch;
+                const lineText = isBullet ? bulletMatch![1] : trimmed;
+                // Parse inline: **bold**, *italic*, ***bold-italic***
+                const parts = lineText.split(/(\*{1,3}[^*]+\*{1,3})/g);
+                const rendered = parts.map((part,pi) => {
+                  if(part.startsWith('***')&&part.endsWith('***')) return <Text key={pi} style={{fontWeight:'700',fontStyle:'italic'}}>{part.slice(3,-3)}</Text>;
+                  if(part.startsWith('**')&&part.endsWith('**')) return <Text key={pi} style={{fontWeight:'700'}}>{part.slice(2,-2)}</Text>;
+                  if(part.startsWith('*')&&part.endsWith('*')&&part.length>2) return <Text key={pi} style={{fontStyle:'italic'}}>{part.slice(1,-1)}</Text>;
+                  return part;
+                });
+                if(isBullet) return (
+                  <View key={li} style={{flexDirection:'row',paddingLeft:4,marginBottom:3}}>
+                    <Text style={{color:'#64748B',fontSize:15,marginRight:8}}>•</Text>
+                    <Text style={{color:textColor,fontSize:15,lineHeight:22,flex:1}}>{rendered}</Text>
+                  </View>
+                );
+                return <Text key={li} style={{color:textColor,fontSize:15,lineHeight:22,marginBottom:3}}>{rendered}</Text>;
+              });
+            };
+            return (
+              <View key={m.id} style={{marginBottom:14,alignSelf:m.role==='user'?'flex-end':'flex-start',maxWidth:'82%'}}>
+                <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(128,128,128,0.15)'}}>
+                  {renderChatText(m.text)}
+                </View>
               </View>
-            </View>
-          ))}
+            );
+          })}
           {chatLoading&&<View style={{alignSelf:'flex-start',backgroundColor:theme.card,borderRadius:16,padding:14}}><ActivityIndicator color={theme.primary}/></View>}
         </ScrollView>
         <View style={{flexDirection:'row',paddingHorizontal:20,paddingBottom:30,paddingTop:10,gap:10}}>
           <TextInput style={{flex:1,backgroundColor:theme.card,borderRadius:14,paddingHorizontal:16,paddingVertical:12,color:theme.text,fontSize:15}} placeholder="Type your question..." placeholderTextColor="#64748B" value={chatInput} onChangeText={setChatInput} onSubmitEditing={sendChat}/>
-          <TouchableOpacity onPress={sendChat} disabled={chatLoading||!chatInput.trim()} style={{width:48,height:48,borderRadius:24,backgroundColor:chatInput.trim()?theme.primary:'#374151',alignItems:'center',justifyContent:'center'}}>
+          <TouchableOpacity onPress={sendChat} disabled={chatLoading||!chatInput.trim()} accessibilityLabel="Send message" style={{width:48,height:48,borderRadius:24,backgroundColor:chatInput.trim()?theme.primary:'rgba(128,128,128,0.25)',alignItems:'center',justifyContent:'center'}}>
             <I.Send s={20} c="white"/>
           </TouchableOpacity>
         </View>
@@ -5220,9 +6464,9 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           {/* Editable Title (Step 6) */}
           {editingTitle?(
             <View style={{width:'100%',marginTop:12}}>
-              <TextInput style={{color:theme.text,fontSize:22,fontWeight:'700',textAlign:'center',backgroundColor:'rgba(255,255,255,0.05)',borderRadius:10,paddingHorizontal:16,paddingVertical:8,borderWidth:1,borderColor:theme.primary}} value={editTitleValue} onChangeText={setEditTitleValue} autoFocus maxLength={100}/>
+              <TextInput style={{color:theme.text,fontSize:22,fontWeight:'700',textAlign:'center',backgroundColor:'rgba(128,128,128,0.1)',borderRadius:10,paddingHorizontal:16,paddingVertical:8,borderWidth:1,borderColor:theme.primary}} value={editTitleValue} onChangeText={setEditTitleValue} autoFocus maxLength={100}/>
               <View style={{flexDirection:'row',justifyContent:'center',gap:12,marginTop:10}}>
-                <TouchableOpacity onPress={()=>setEditingTitle(false)} style={{paddingHorizontal:16,paddingVertical:8,borderRadius:8,backgroundColor:'rgba(255,255,255,0.08)'}}>
+                <TouchableOpacity onPress={()=>setEditingTitle(false)} style={{paddingHorizontal:16,paddingVertical:8,borderRadius:8,backgroundColor:'rgba(128,128,128,0.15)'}}>
                   <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity onPress={()=>{
@@ -5272,8 +6516,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           <View style={[st.card,{backgroundColor:theme.card}]}>
             <Text style={{color:theme.text,fontSize:14,fontWeight:'600',marginBottom:8}}>Set a study goal for this session</Text>
             <View style={{flexDirection:'row',gap:10}}>
-              <TextInput style={{flex:1,backgroundColor:'rgba(255,255,255,0.05)',borderRadius:12,paddingHorizontal:14,paddingVertical:10,color:theme.text,fontSize:14}} placeholder="e.g., Reach silver in Section 1..." placeholderTextColor="#64748B" value={goalInput} onChangeText={setGoalInput}/>
-              <TouchableOpacity onPress={setStudyGoalFn} disabled={!goalInput.trim()} style={{backgroundColor:goalInput.trim()?theme.primary:'#374151',borderRadius:12,paddingHorizontal:16,justifyContent:'center'}}>
+              <TextInput style={{flex:1,backgroundColor:'rgba(128,128,128,0.1)',borderRadius:12,paddingHorizontal:14,paddingVertical:10,color:theme.text,fontSize:14}} placeholder="e.g., Reach silver in Section 1..." placeholderTextColor="#64748B" value={goalInput} onChangeText={setGoalInput}/>
+              <TouchableOpacity onPress={setStudyGoalFn} disabled={!goalInput.trim()} style={{backgroundColor:goalInput.trim()?theme.primary:'rgba(128,128,128,0.25)',borderRadius:12,paddingHorizontal:16,justifyContent:'center'}}>
                 <Text style={{color:'white',fontWeight:'600',fontSize:13}}>Set</Text>
               </TouchableOpacity>
             </View>
@@ -5282,16 +6526,16 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
         {/* Quick Actions */}
         <View style={{flexDirection:'row',gap:10,marginBottom:8}}>
-          <TouchableOpacity onPress={()=>transitionToScreen('chat','forward')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+          <TouchableOpacity onPress={()=>transitionToScreen('chat','forward')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <I.Quiz s={24} c={theme.primary}/><Text style={{color:theme.text,fontSize:12,fontWeight:'600',marginTop:6}}>Ask AI</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={()=>onSetTab('quiz')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+          <TouchableOpacity onPress={()=>onSetTab('quiz')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <I.Quiz s={24} c="#10B981"/><Text style={{color:theme.text,fontSize:12,fontWeight:'600',marginTop:6}}>Quiz</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={()=>onSetTab('games')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+          <TouchableOpacity onPress={()=>onSetTab('games')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <I.Game s={24} c="#F59E0B"/><Text style={{color:theme.text,fontSize:12,fontWeight:'600',marginTop:6}}>Games</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={()=>onSetTab('podcast')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+          <TouchableOpacity onPress={()=>onSetTab('podcast')} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <I.Mic s={24} c="#EC4899"/><Text style={{color:theme.text,fontSize:12,fontWeight:'600',marginTop:6}}>Podcast</Text>
           </TouchableOpacity>
         </View>
@@ -5368,7 +6612,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
         {overview?.loaded&&(
           <View style={{marginBottom:16}}>
             {!showAudioControls?(
-              <TouchableOpacity onPress={()=>{setShowAudioControls(true);playFullLesson(overview);}} style={{flexDirection:'row',alignItems:'center',gap:10,backgroundColor:theme.card,padding:14,borderRadius:14,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+              <TouchableOpacity onPress={()=>{setShowAudioControls(true);playFullLesson(overview);}} style={{flexDirection:'row',alignItems:'center',gap:10,backgroundColor:theme.card,padding:14,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
                 <View style={{width:36,height:36,borderRadius:18,backgroundColor:'rgba(139,92,246,0.15)',alignItems:'center',justifyContent:'center'}}>
                   <I.Mic s={18} c="#8B5CF6"/>
                 </View>
@@ -5389,61 +6633,42 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
                 {/* Playback controls: back 10s, play/pause, forward 10s */}
                 <View style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:16,marginBottom:14}}>
-                  <TouchableOpacity onPress={skipBackward} disabled={audioStarting || !audioBufferRef.current} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',opacity:audioBufferRef.current?1:0.4}}>
+                  <TouchableOpacity onPress={skipBackward} disabled={audioStarting || !audioChunksRef.current.length} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',opacity:audioChunksRef.current.length?1:0.4}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>-10s</Text>
                   </TouchableOpacity>
                   <TouchableOpacity disabled={audioStarting} onPress={()=>{
                     if(audioStarting) return;
                     if(audioPlaying){pauseAudio();}
-                    else if(audioBufferRef.current){resumeAudio();}
+                    else if(audioChunksRef.current.length){resumeAudio();}
                     else{playFullLesson(overview);}
-                  }} style={{width:56,height:56,borderRadius:28,backgroundColor:audioStarting?'#6B7280':audioPlaying?'#EF4444':'#8B5CF6',alignItems:'center',justifyContent:'center',opacity:audioStarting?0.7:1}}>
-                    {audioStarting?<ActivityIndicator size="small" color="white"/>:audioPlaying?<I.Stop s={22} c="white"/>:<I.Play s={22} c="white"/>}
+                  }} style={{width:56,height:56,borderRadius:28,backgroundColor:audioStarting?'#6B7280':audioPlaying?'#8B5CF6':'#8B5CF6',alignItems:'center',justifyContent:'center',opacity:audioStarting?0.7:1}}>
+                    {audioStarting?<ActivityIndicator size="small" color="white"/>:audioPlaying?<I.Pause s={22} c="white"/>:<I.Play s={22} c="white"/>}
                   </TouchableOpacity>
-                  <TouchableOpacity onPress={skipForward} disabled={audioStarting || !audioBufferRef.current} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',opacity:audioBufferRef.current?1:0.4}}>
+                  <TouchableOpacity onPress={skipForward} disabled={audioStarting || !audioChunksRef.current.length} style={{width:44,height:44,borderRadius:22,backgroundColor:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',opacity:audioChunksRef.current.length?1:0.4}}>
                     <Text style={{color:theme.text,fontSize:11,fontWeight:'700'}}>+10s</Text>
                   </TouchableOpacity>
                 </View>
 
-                {/* Generation progress — shown while generating all chunks */}
+                {/* Loading indicator — shown while preparing speech */}
                 {audioStarting&&(
                   <View style={{marginBottom:12}}>
                     <View style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',marginBottom:4}}>
                       <Text style={{color:'#8B5CF6',fontSize:13,fontWeight:'600'}}>
-                        {audioGenProgress > 0 ? `Generating audio... ${audioGenProgress}%` : 'Loading voice model...'}
+                        Preparing audio...
                       </Text>
                       <TouchableOpacity onPress={stopAudio} hitSlop={{top:8,bottom:8,left:8,right:8}}>
                         <Text style={{color:'#EF4444',fontSize:12,fontWeight:'600'}}>Cancel</Text>
                       </TouchableOpacity>
                     </View>
-                    <View style={{height:4,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2}}>
-                      <View style={{height:'100%',borderRadius:2,backgroundColor:'#8B5CF6',width:`${audioGenProgress}%`}}/>
-                    </View>
-                    {audioGenProgress === 0 && (
-                      <Text style={{color:'#64748B',fontSize:11,marginTop:4}}>First time downloads voice model (~87MB, cached after)</Text>
-                    )}
                   </View>
                 )}
 
-                {/* Seekable progress bar with time display */}
+                {/* Progress bar with time display */}
                 {audioDuration>0&&!audioStarting&&(
                   <View style={{marginBottom:12}}>
-                    <TouchableOpacity
-                      activeOpacity={0.7}
-                      onPress={(e:any)=>{
-                        const {locationX} = e.nativeEvent;
-                        if(audioProgressBarWidthRef.current && audioDurationRef.current > 0) {
-                          const seekSeconds = (locationX / audioProgressBarWidthRef.current) * audioDurationRef.current;
-                          seekTo(seekSeconds);
-                        }
-                      }}
-                    >
-                      <View style={{height:8,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:4}}
-                        onLayout={(e)=>{ audioProgressBarWidthRef.current = e.nativeEvent.layout.width; }}
-                      >
-                        <View style={{height:'100%',borderRadius:4,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
-                      </View>
-                    </TouchableOpacity>
+                    <View style={{height:8,backgroundColor:'rgba(128,128,128,0.18)',borderRadius:4}}>
+                      <View style={{height:'100%',borderRadius:4,backgroundColor:'#8B5CF6',width:`${audioProgress}%`}}/>
+                    </View>
                     <View style={{flexDirection:'row',justifyContent:'space-between',marginTop:4}}>
                       <Text style={{color:'#94A3B8',fontSize:11,fontFamily:Platform.OS==='web'?'monospace':undefined}}>{_formatAudioTime(audioCurrentTime)}</Text>
                       <Text style={{color:'#94A3B8',fontSize:11,fontFamily:Platform.OS==='web'?'monospace':undefined}}>{_formatAudioTime(audioDuration)}</Text>
@@ -5451,11 +6676,11 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
                   </View>
                 )}
 
-                {/* Speed selector — playbackRate is applied directly on AudioBufferSourceNode */}
+                {/* Speed selector — rate is passed to expo-speech */}
                 <Text style={{color:'#64748B',fontSize:11,fontWeight:'600',letterSpacing:1,marginBottom:6}}>SPEED</Text>
                 <View style={{flexDirection:'row',gap:6}}>
                   {[1.0,1.25,1.5,1.75,2.0].map(spd=>(
-                    <TouchableOpacity key={spd} onPress={()=>changeSpeed(spd)} style={{flex:1,backgroundColor:audioSpeed===spd?'rgba(139,92,246,0.2)':'rgba(255,255,255,0.05)',borderRadius:8,paddingVertical:8,alignItems:'center',borderWidth:1,borderColor:audioSpeed===spd?'#8B5CF6':'rgba(255,255,255,0.08)'}}>
+                    <TouchableOpacity key={spd} onPress={()=>changeSpeed(spd)} style={{flex:1,backgroundColor:audioSpeed===spd?'rgba(139,92,246,0.2)':'rgba(128,128,128,0.1)',borderRadius:8,paddingVertical:8,alignItems:'center',borderWidth:1,borderColor:audioSpeed===spd?'#8B5CF6':'rgba(128,128,128,0.15)'}}>
                       <Text style={{color:audioSpeed===spd?'#8B5CF6':theme.text,fontSize:12,fontWeight:'700'}}>{spd}x</Text>
                     </TouchableOpacity>
                   ))}
@@ -5481,7 +6706,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
             </Text>
             <Text style={{color:'#94A3B8',fontSize:14,textAlign:'center',marginBottom:16}}>
               {sectionOverviewError==='no_api_key'
-                ? 'Add your Cerebras API key in Profile > API Keys to generate lessons.'
+                ? 'Add an AI provider key in Profile > API Keys to generate lessons.'
                 : 'The AI could not generate this lesson. Check your connection and try again.'}
             </Text>
             <TouchableOpacity onPress={()=>{setSectionOverviewError(null);loadSectionOverview(selSection,true);}} style={{backgroundColor:theme.primary,paddingHorizontal:28,paddingVertical:12,borderRadius:12}}>
@@ -5568,6 +6793,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
             ))}
           </View>
 
+
           {/* Actions */}
           <View style={{gap:12,marginTop:8}}>
             <TouchableOpacity
@@ -5584,7 +6810,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
               <Text style={{color:'white',fontSize:16,fontWeight:'700'}}>✓ I've read this section</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity onPress={()=>{transitionToScreen('chat','forward');}} style={{flexDirection:'row',alignItems:'center',gap:12,backgroundColor:theme.card,padding:16,borderRadius:14,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+            <TouchableOpacity onPress={()=>{transitionToScreen('chat','forward');}} style={{flexDirection:'row',alignItems:'center',gap:12,backgroundColor:theme.card,padding:16,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
               <I.Quiz s={22} c={theme.primary}/><View style={{flex:1}}><Text style={{color:theme.text,fontWeight:'600'}}>Ask a Question</Text><Text style={{color:'#64748B',fontSize:12}}>AI has full context of this lesson</Text></View><I.Right s={20} c="#64748B"/>
             </TouchableOpacity>
 
@@ -5624,7 +6850,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           {renderExtractionReportCard()}
           {clarifyMsgs.map((m,i)=>(
             <View key={i} style={{marginBottom:14,alignSelf:m.role==='user'?'flex-end':'flex-start',maxWidth:'82%'}}>
-              <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(255,255,255,0.08)'}}>
+              <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(128,128,128,0.15)'}}>
                 <Text style={{color:m.role==='user'?'white':theme.text,fontSize:15,lineHeight:22}}>{m.text}</Text>
               </View>
             </View>
@@ -5650,7 +6876,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           </TouchableOpacity>}
           <View style={{flexDirection:'row',gap:10}}>
             <TextInput style={{flex:1,backgroundColor:theme.card,borderRadius:14,paddingHorizontal:16,paddingVertical:12,color:theme.text,fontSize:15}} placeholder={clarifyPlaceholder} placeholderTextColor="#64748B" value={clarifyInput} onChangeText={setClarifyInput} onSubmitEditing={sendClarify}/>
-            <TouchableOpacity onPress={sendClarify} disabled={clarifyLoading||!clarifyInput.trim()} style={{width:48,height:48,borderRadius:24,backgroundColor:clarifyInput.trim()?theme.primary:'#374151',alignItems:'center',justifyContent:'center'}}>
+            <TouchableOpacity onPress={sendClarify} disabled={clarifyLoading||!clarifyInput.trim()} accessibilityLabel="Send message" style={{width:48,height:48,borderRadius:24,backgroundColor:clarifyInput.trim()?theme.primary:'rgba(128,128,128,0.25)',alignItems:'center',justifyContent:'center'}}>
               <I.Send s={20} c="white"/>
             </TouchableOpacity>
           </View>
@@ -5665,7 +6891,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     return (
       <Animated.View style={[st.screen,{backgroundColor:theme.background,transform:[{translateX:slideAnim}],opacity:fadeAnim}]}>
       <KeyboardAvoidingView style={{flex:1}} behavior={Platform.OS==='ios'?'padding':'height'}>
-        <View style={{paddingTop:60,paddingHorizontal:20,flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingBottom:12,borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.08)'}}>
+        <View style={{paddingTop:60,paddingHorizontal:20,flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingBottom:12,borderBottomWidth:1,borderBottomColor:'rgba(128,128,128,0.15)'}}>
           <TouchableOpacity onPress={()=>{transitionToScreen('home','back');setDiscoverMsgs([]);setDiscoverSuggestions([]);}}><I.Left s={28} c={theme.text}/></TouchableOpacity>
           <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Discover Topics</Text>
           <View style={{width:28}}/>
@@ -5673,7 +6899,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
         <ScrollView style={{flex:1}} contentContainerStyle={{padding:20,paddingBottom:20}} keyboardShouldPersistTaps="handled">
           {discoverMsgs.map((m,i)=>(
             <View key={i} style={{marginBottom:14,alignSelf:m.role==='user'?'flex-end':'flex-start',maxWidth:'82%'}}>
-              <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(255,255,255,0.08)'}}>
+              <View style={{backgroundColor:m.role==='user'?theme.primary:theme.card,borderRadius:16,padding:14,borderWidth:m.role==='ai'?1:0,borderColor:'rgba(128,128,128,0.15)'}}>
                 <Text style={{color:m.role==='user'?'white':theme.text,fontSize:15,lineHeight:22}}>{m.text}</Text>
               </View>
             </View>
@@ -5684,7 +6910,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           {discoverSuggestions.length>0&&<View style={{marginTop:8}}>
             <Text style={{color:theme.accent,fontSize:12,fontWeight:'700',letterSpacing:1,marginBottom:12}}>SUGGESTED TOPICS</Text>
             {discoverSuggestions.map((s,i)=>(
-              <TouchableOpacity key={i} onPress={()=>pickDiscoverTopic(s.title)} style={{backgroundColor:theme.card,borderRadius:14,padding:16,marginBottom:10,borderWidth:1,borderColor:'rgba(255,255,255,0.08)',borderLeftWidth:3,borderLeftColor:theme.primary}}>
+              <TouchableOpacity key={i} onPress={()=>pickDiscoverTopic(s.title)} style={{backgroundColor:theme.card,borderRadius:14,padding:16,marginBottom:10,borderWidth:1,borderColor:'rgba(128,128,128,0.15)',borderLeftWidth:3,borderLeftColor:theme.primary}}>
                 <Text style={{color:theme.text,fontSize:16,fontWeight:'600'}}>{s.title}</Text>
                 <Text style={{color:'#94A3B8',fontSize:13,marginTop:4,lineHeight:20}}>{s.description}</Text>
                 <Text style={{color:theme.primary,fontSize:12,fontWeight:'600',marginTop:6}}>Tap to start learning →</Text>
@@ -5695,7 +6921,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
         {!discoverLoading&&<View style={{paddingHorizontal:20,paddingBottom:30,paddingTop:10}}>
           <View style={{flexDirection:'row',gap:10}}>
             <TextInput style={{flex:1,backgroundColor:theme.card,borderRadius:14,paddingHorizontal:16,paddingVertical:12,color:theme.text,fontSize:15}} placeholder="Tell me your interests..." placeholderTextColor="#64748B" value={discoverInput} onChangeText={setDiscoverInput} onSubmitEditing={sendDiscover}/>
-            <TouchableOpacity onPress={sendDiscover} disabled={!discoverInput.trim()} style={{width:48,height:48,borderRadius:24,backgroundColor:discoverInput.trim()?theme.primary:'#374151',alignItems:'center',justifyContent:'center'}}>
+            <TouchableOpacity onPress={sendDiscover} disabled={!discoverInput.trim()} accessibilityLabel="Send message" style={{width:48,height:48,borderRadius:24,backgroundColor:discoverInput.trim()?theme.primary:'rgba(128,128,128,0.25)',alignItems:'center',justifyContent:'center'}}>
               <I.Send s={20} c="white"/>
             </TouchableOpacity>
           </View>
@@ -5723,7 +6949,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
       <View style={[st.card,{backgroundColor:theme.card}]}>
         <TextInput style={{fontSize:16,color:theme.text,minHeight:50,marginBottom:12}} placeholder="Type any topic: guitar, biology, cooking..." placeholderTextColor="#64748B" value={topicInput} onChangeText={setTopicInput} onSubmitEditing={startClarify}/>
         <Btn title={creating?"Creating...":"Start Learning"} onPress={startClarify} theme={theme} disabled={creating||!topicInput.trim()} loading={creating}/>
-        <TouchableOpacity style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,paddingVertical:14,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.08)',marginTop:4}} onPress={upload}>
+        <TouchableOpacity style={{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,paddingVertical:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.15)',marginTop:4}} onPress={upload}>
           <I.Upload s={20} c={theme.primary}/><Text style={{color:theme.primary,fontSize:14,fontWeight:'500'}}>Or upload notes (PDF / TXT)</Text>
         </TouchableOpacity>
       </View>
@@ -5742,6 +6968,20 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
         <I.Right s={20} c={theme.primary}/>
       </TouchableOpacity>
 
+      {/* Study Guide Mode */}
+      {topics.length>0&&(
+        <TouchableOpacity onPress={()=>{setSgSelectedTopicIds([]);setSgSelectedSectionIds([]);transitionToScreen('study-guide-select','forward');}} style={[st.card,{backgroundColor:'rgba(16,185,129,0.08)',borderColor:'#10B981',borderWidth:1,flexDirection:'row',alignItems:'center',gap:14}]}>
+          <View style={{width:44,height:44,borderRadius:22,backgroundColor:'#10B981',alignItems:'center',justifyContent:'center'}}>
+            <Text style={{fontSize:22}}>📋</Text>
+          </View>
+          <View style={{flex:1}}>
+            <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Study Guide</Text>
+            <Text style={{color:'#94A3B8',fontSize:13,marginTop:2}}>{savedStudyGuides.length>0?`${savedStudyGuides.length} saved guide${savedStudyGuides.length!==1?'s':''} · Tap to resume or create new`:'Create a concise review of your topics'}</Text>
+          </View>
+          <I.Right s={20} c='#10B981'/>
+        </TouchableOpacity>
+      )}
+
       {/* Active Goal */}
       {goal&&!goal.topicId&&<View style={[st.card,{backgroundColor:'rgba(16,185,129,0.08)',borderColor:'#10B981',borderWidth:1}]}>
         <Text style={{color:'#10B981',fontSize:12,fontWeight:'700',letterSpacing:1}}>SESSION GOAL</Text>
@@ -5756,7 +6996,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
           {/* Sort pills (Step 4) */}
           <View style={{flexDirection:'row',gap:6}}>
             {(['recent','progress','alpha'] as const).map(mode=>(
-              <TouchableOpacity key={mode} onPress={()=>setSortMode(mode)} style={{paddingHorizontal:10,paddingVertical:4,borderRadius:8,backgroundColor:sortMode===mode?theme.primary:'rgba(255,255,255,0.08)'}}>
+              <TouchableOpacity key={mode} onPress={()=>setSortMode(mode)} style={{paddingHorizontal:10,paddingVertical:4,borderRadius:8,backgroundColor:sortMode===mode?theme.primary:'rgba(128,128,128,0.15)'}}>
                 <Text style={{color:sortMode===mode?'white':'#94A3B8',fontSize:11,fontWeight:'600'}}>{mode==='recent'?'Recent':mode==='progress'?'Progress':'A-Z'}</Text>
               </TouchableOpacity>
             ))}
@@ -5765,7 +7005,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 
         {/* Search (Step 10) */}
         {topics.length>=4&&<View style={{marginTop:10,marginBottom:6}}>
-          <View style={{flexDirection:'row',alignItems:'center',backgroundColor:theme.card,borderRadius:12,paddingHorizontal:14,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+          <View style={{flexDirection:'row',alignItems:'center',backgroundColor:theme.card,borderRadius:12,paddingHorizontal:14,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <Text style={{color:'#64748B',fontSize:16,marginRight:8}}>🔍</Text>
             <TextInput style={{flex:1,paddingVertical:10,color:theme.text,fontSize:14}} placeholder="Search topics..." placeholderTextColor="#64748B" value={searchQuery} onChangeText={setSearchQuery}/>
             {searchQuery.length>0&&<TouchableOpacity onPress={()=>setSearchQuery('')}><I.X s={16} c="#64748B"/></TouchableOpacity>}
@@ -5788,7 +7028,7 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
                   <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>
                     {t.sections?.length||0} sections • {t.concepts.length} concepts • {t.progress}%
                   </Text>
-                  <View style={{height:4,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2,marginTop:6}}>
+                  <View style={{height:4,backgroundColor:'rgba(128,128,128,0.18)',borderRadius:2,marginTop:6}}>
                     <LinearGradient colors={[theme.primary,theme.secondary]} start={{x:0,y:0}} end={{x:1,y:0}} style={{height:'100%',borderRadius:2,width:`${Math.max(t.progress,2)}%`}}/>
                   </View>
                   {t.lastStudied&&<Text style={{color:'#4B5563',fontSize:11,marginTop:4}}>Last studied: {new Date(t.lastStudied).toLocaleDateString()}</Text>}
@@ -5816,12 +7056,13 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
 // ========== QUIZ SCREEN ==========
 const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,profile,theme}:{topics:Topic[];presets:QuizPreset[];onSavePreset:(p:QuizPreset)=>void;onUpdateTopic:(t:Topic)=>void;onUpdateProfile:(u:Partial<UserProfile>)=>void;profile:UserProfile;theme:ThemeColors}) => {
   // Step-based navigation
-  type QuizStep = 'topic_select'|'mode_select'|'section_select'|'settings'|'active'|'results';
-  type QuizMode = 'quiz'|'test';
+  type QuizStep = 'topic_select'|'section_select'|'settings'|'active'|'results';
+  type QuizMode = 'quiz'|'test'|'multi_test';
 
   const [quizStep,setQuizStep] = useState<QuizStep>('topic_select');
   const [quizMode,setQuizMode] = useState<QuizMode>('quiz');
   const [selTopic,setSelTopic] = useState<Topic|null>(null);
+  const [selectedTopicIds,setSelectedTopicIds] = useState<string[]>([]);
   const [selectedSectionIds,setSelectedSectionIds] = useState<string[]>([]);
   const [preset,setPreset] = useState<QuizPreset>(presets[0]||defaultPreset);
   const [questions,setQuestions] = useState<Question[]>([]);
@@ -5858,7 +7099,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
 
   const resetQuiz = () => {
     setQuizStep('topic_select'); setQuizMode('quiz'); setSelTopic(null);
-    setSelectedSectionIds([]); setPreset(presets[0]||defaultPreset);
+    setSelectedTopicIds([]); setSelectedSectionIds([]); setPreset(presets[0]||defaultPreset);
     setQuestions([]); setIdx(0); setAnswer(''); setSelOpt(null);
     setShowRes(false); setCorrect(false); setFeedback('');
     setLoading(false); setShowExplanation(null);
@@ -5887,24 +7128,45 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
   };
 
   const start = async () => {
-    if(!selTopic) return;
     try {
       setLoading(true);
-      const hasSections = (selTopic.sections||[]).length>0;
-      const conceptSubset = quizMode==='quiz'
-        ? (hasSections ? getConceptSubset() : (selTopic.concepts||[]))
-        : undefined;
-      if(quizMode==='quiz' && (!conceptSubset || conceptSubset.length===0)) {
-        Alert.alert('No Concepts Available','Selected sections do not have concepts yet. Add or regenerate topic sections before starting a quiz.');
-        return;
-      }
-      const dc = getDifficultyCounts();
-      const qs = await AI.generateQuestions(selTopic, preset.questionTypes, preset.questionCount, conceptSubset, dc);
-      if(!qs||qs.length===0) { Alert.alert('Error','Failed to generate questions. Please try again.'); setLoading(false); return; }
-      // Build initial bySection map
       const bySection:Record<string,{correct:number;total:number;sectionTitle:string}> = {};
-      (selTopic.sections||[]).forEach(s => { bySection[s.id] = {correct:0,total:0,sectionTitle:s.title}; });
-      setQuestions(qs); setIdx(0); setStats({correct:0,total:0,mastered:0,bySection});
+      let allQuestions:Question[] = [];
+
+      if(quizMode==='multi_test') {
+        // Multi-topic test: generate questions across all selected topics
+        const selectedTopics = topics.filter(t=>selectedTopicIds.includes(t.id));
+        if(!selectedTopics.length){ Alert.alert('No Topics','Select at least one topic.'); setLoading(false); return; }
+        const perTopic = Math.max(3, Math.ceil(preset.questionCount / selectedTopics.length));
+        const dc = getDifficultyCounts();
+        const perTopicDc = {easy:Math.max(1,Math.round(dc.easy/selectedTopics.length)),medium:Math.max(1,Math.round(dc.medium/selectedTopics.length)),hard:Math.max(0,Math.round(dc.hard/selectedTopics.length))};
+        for(const t of selectedTopics) {
+          const qs = await AI.generateQuestions(t, preset.questionTypes, perTopic, undefined, perTopicDc);
+          allQuestions.push(...qs);
+          (t.sections||[]).forEach(s => { bySection[s.id] = {correct:0,total:0,sectionTitle:`${t.title}: ${s.title}`}; });
+        }
+        // Shuffle and trim to requested count
+        for(let i=allQuestions.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[allQuestions[i],allQuestions[j]]=[allQuestions[j],allQuestions[i]];}
+        allQuestions = allQuestions.slice(0, preset.questionCount);
+        if(!selTopic) setSelTopic(selectedTopics[0]); // for results display
+      } else {
+        // Single topic quiz/test
+        if(!selTopic) return;
+        const hasSections = (selTopic.sections||[]).length>0;
+        const conceptSubset = quizMode==='quiz'
+          ? (hasSections ? getConceptSubset() : (selTopic.concepts||[]))
+          : undefined;
+        if(quizMode==='quiz' && (!conceptSubset || conceptSubset.length===0)) {
+          Alert.alert('No Concepts Available','Selected sections do not have concepts yet. Add or regenerate topic sections before starting a quiz.');
+          setLoading(false); return;
+        }
+        const dc = getDifficultyCounts();
+        allQuestions = await AI.generateQuestions(selTopic, preset.questionTypes, preset.questionCount, conceptSubset, dc);
+        (selTopic.sections||[]).forEach(s => { bySection[s.id] = {correct:0,total:0,sectionTitle:s.title}; });
+      }
+
+      if(!allQuestions||allQuestions.length===0) { Alert.alert('Error','Failed to generate questions. Please try again.'); setLoading(false); return; }
+      setQuestions(allQuestions); setIdx(0); setStats({correct:0,total:0,mastered:0,bySection});
       setShowRes(false); setAnswer(''); setSelOpt(null); setShowExplanation(null);
       setQuizStep('active');
     } catch(e) {
@@ -5958,7 +7220,28 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
       const om = selTopic.medal, nm = getMedal(np);
       const ut:Topic = {...selTopic,concepts:ucs,sections:updatedSections,progress:np,medal:nm,lastStudied:new Date().toISOString(),totalQuestions:(selTopic.totalQuestions||0)+1,correctAnswers:(selTopic.correctAnswers||0)+(ok?1:0)};
       setSelTopic(ut); onUpdateTopic(ut);
-      if(nm!==om&&nm!=='none') onUpdateProfile({totalPoints:(profile.totalPoints||0)+getMedalPts(nm),level:Math.floor(((profile.totalPoints||0)+getMedalPts(nm))/500)+1});
+      // Track persistent concept mastery + quiz XP
+      const profileUpdates:Partial<UserProfile> = {};
+      if(newMastered) {
+        profileUpdates.totalConceptsLearned = (profile.totalConceptsLearned||0)+1;
+      }
+      // Award XP for quiz correct answers (small amount per question)
+      if(ok) {
+        const quizXP = q.difficulty==='easy'?3:q.difficulty==='hard'?8:5;
+        const newPtsFromQuiz = (profile.totalPoints||0)+(profileUpdates.totalPoints?profileUpdates.totalPoints-profile.totalPoints:0)+quizXP;
+        profileUpdates.totalPoints = newPtsFromQuiz;
+        profileUpdates.level = getLevelFromPoints(newPtsFromQuiz);
+      }
+      if(nm!==om&&nm!=='none') {
+        const basePts = profileUpdates.totalPoints||profile.totalPoints||0;
+        const newPts = basePts+getMedalPts(nm);
+        profileUpdates.totalPoints = newPts;
+        profileUpdates.level = getLevelFromPoints(newPts);
+        if(nm==='trait'&&selTopic&&!(profile.traitTopicIds||[]).includes(selTopic.id)) {
+          profileUpdates.traitTopicIds = [...(profile.traitTopicIds||[]),selTopic.id];
+        }
+      }
+      if(Object.keys(profileUpdates).length>0) onUpdateProfile(profileUpdates);
 
       // Track per-section stats
       let sectionId = '';
@@ -5991,110 +7274,120 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
   };
 
   // ── SCREEN: TOPIC SELECT ──
-  if(quizStep==='topic_select') return (
+  if(quizStep==='topic_select') {
+    const isTestMode = quizMode==='test'||quizMode==='multi_test';
+    const allTopicIds = (topics||[]).map(t=>t.id);
+    const allTopicsSelected = allTopicIds.length>0 && selectedTopicIds.length===allTopicIds.length;
+    const totalTestConcepts = (topics||[]).filter(t=>selectedTopicIds.includes(t.id)).reduce((sum,t)=>sum+(t.concepts||[]).length,0);
+    return (
     <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
-      <Text style={[st.title,{color:theme.text}]}>Quiz Mode</Text>
-      <Text style={st.sub}>Choose a topic to get started</Text>
-      {(topics||[]).length>0?(topics||[]).map(t=>{
-        const sectionCount = (t.sections||[]).length;
-        const conceptCount = (t.concepts||[]).length;
-        return (
-          <TouchableOpacity key={t.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10}]} onPress={()=>{setSelTopic(t);setQuizStep('mode_select');}}>
-            <View style={{flexDirection:'row',alignItems:'center'}}>
-              <View style={{width:44,height:44,borderRadius:12,backgroundColor:'rgba(99,102,241,0.15)',alignItems:'center',justifyContent:'center'}}>
-                <I.Quiz s={22} c={theme.primary}/>
+      <Text style={[st.title,{color:theme.text}]}>Assessment</Text>
+      <Text style={st.sub}>{isTestMode?'Select topics for your test':'Choose a topic to quiz on'}</Text>
+
+      {/* Quiz / Test Segmented Toggle */}
+      <View style={{flexDirection:'row',backgroundColor:'rgba(128,128,128,0.12)',borderRadius:12,padding:3,marginBottom:18}}>
+        <TouchableOpacity style={{flex:1,paddingVertical:10,borderRadius:10,backgroundColor:!isTestMode?theme.primary:'transparent',alignItems:'center'}} onPress={()=>{
+          setQuizMode('quiz');
+          setSelectedTopicIds([]);
+          setSelTopic(null);
+        }}>
+          <Text style={{color:!isTestMode?'white':'#94A3B8',fontSize:15,fontWeight:'600'}}>Quiz</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={{flex:1,paddingVertical:10,borderRadius:10,backgroundColor:isTestMode?'#F59E0B':'transparent',alignItems:'center'}} onPress={()=>{
+          setQuizMode('multi_test');
+          setSelectedTopicIds([]);
+          setSelTopic(null);
+          setPreset(prev=>({...prev,questionTypes:{multipleChoice:true,fillInBlank:true,shortResponse:true,scenario:true},questionCount:30}));
+        }}>
+          <Text style={{color:isTestMode?'white':'#94A3B8',fontSize:15,fontWeight:'600'}}>Test</Text>
+        </TouchableOpacity>
+      </View>
+
+      {(topics||[]).length>0 ? (
+        isTestMode ? (
+          /* ── TEST MODE: Multi-topic checkboxes ── */
+          <>
+            <TouchableOpacity style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',paddingVertical:14,paddingHorizontal:16,backgroundColor:theme.card,borderRadius:14,marginBottom:14}} onPress={()=>{
+              if(allTopicsSelected) setSelectedTopicIds([]);
+              else setSelectedTopicIds(allTopicIds);
+            }}>
+              <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>Select All</Text>
+              <View style={{width:24,height:24,borderRadius:6,borderWidth:2,borderColor:allTopicsSelected?'#F59E0B':'#475569',backgroundColor:allTopicsSelected?'#F59E0B':'transparent',alignItems:'center',justifyContent:'center'}}>
+                {allTopicsSelected&&<I.Check s={16} c='white'/>}
               </View>
-              <View style={{flex:1,marginLeft:12}}>
-                <Text style={{color:theme.text,fontSize:16,fontWeight:'600'}}>{safeStr(t.title)}</Text>
-                <Text style={{color:'#64748B',fontSize:13,marginTop:2}}>{sectionCount} section{sectionCount!==1?'s':''} · {conceptCount} concept{conceptCount!==1?'s':''}</Text>
-              </View>
-              <View style={{alignItems:'flex-end'}}>
-                <MedalBadge medal={t.medal} size={28}/>
-                <Text style={{color:'#64748B',fontSize:11,marginTop:4}}>{t.progress||0}%</Text>
-              </View>
+            </TouchableOpacity>
+
+            {(topics||[]).map(t=>{
+              const isSelected = selectedTopicIds.includes(t.id);
+              const conceptCount = (t.concepts||[]).length;
+              return (
+                <TouchableOpacity key={t.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10,borderWidth:2,borderColor:isSelected?'#F59E0B':'transparent'}]} onPress={()=>{
+                  setSelectedTopicIds(prev=>prev.includes(t.id)?prev.filter(x=>x!==t.id):[...prev,t.id]);
+                }}>
+                  <View style={{flexDirection:'row',alignItems:'center'}}>
+                    <View style={{width:32,height:32,borderRadius:8,backgroundColor:isSelected?'#F59E0B':'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                      {isSelected?<I.Check s={18} c='white'/>:<I.Quiz s={18} c='#64748B'/>}
+                    </View>
+                    <View style={{flex:1}}>
+                      <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>{safeStr(t.title)}</Text>
+                      <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>{conceptCount} concept{conceptCount!==1?'s':''} · {t.progress||0}% progress</Text>
+                    </View>
+                    <MedalBadge medal={t.medal} size={22}/>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+
+            <View style={{marginTop:8}}>
+              <Btn
+                title={selectedTopicIds.length===0?'Select at least one topic':`Continue · ${selectedTopicIds.length} topic${selectedTopicIds.length!==1?'s':''} · ${totalTestConcepts} concepts`}
+                onPress={()=>setQuizStep('settings')}
+                theme={theme}
+                disabled={selectedTopicIds.length===0}
+              />
             </View>
-          </TouchableOpacity>
-        );
-      }):<View style={{alignItems:'center',paddingVertical:60}}>
-        <Text style={{fontSize:56}}>📝</Text>
-        <Text style={{color:theme.text,fontSize:20,fontWeight:'600',marginTop:16}}>No topics yet</Text>
-        <Text style={{color:'#64748B',fontSize:14,marginTop:8,textAlign:'center',paddingHorizontal:40}}>Head over to the Learn tab to create a topic, then come back here to quiz yourself.</Text>
-      </View>}
+          </>
+        ) : (
+          /* ── QUIZ MODE: Single topic selection ── */
+          (topics||[]).map(t=>{
+            const sectionCount = (t.sections||[]).length;
+            const conceptCount = (t.concepts||[]).length;
+            return (
+              <TouchableOpacity key={t.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10}]} onPress={()=>{setSelTopic(t);setQuizMode('quiz');setSelectedSectionIds([]);setQuizStep('section_select');}}>
+                <View style={{flexDirection:'row',alignItems:'center'}}>
+                  <View style={{width:44,height:44,borderRadius:12,backgroundColor:'rgba(99,102,241,0.15)',alignItems:'center',justifyContent:'center'}}>
+                    <I.Quiz s={22} c={theme.primary}/>
+                  </View>
+                  <View style={{flex:1,marginLeft:12}}>
+                    <Text style={{color:theme.text,fontSize:16,fontWeight:'600'}}>{safeStr(t.title)}</Text>
+                    <Text style={{color:'#64748B',fontSize:13,marginTop:2}}>{sectionCount} section{sectionCount!==1?'s':''} · {conceptCount} concept{conceptCount!==1?'s':''}</Text>
+                  </View>
+                  <View style={{alignItems:'flex-end'}}>
+                    <MedalBadge medal={t.medal} size={28}/>
+                    <Text style={{color:'#64748B',fontSize:11,marginTop:4}}>{t.progress||0}%</Text>
+                  </View>
+                </View>
+              </TouchableOpacity>
+            );
+          })
+        )
+      ) : (
+        <View style={{alignItems:'center',paddingVertical:60}}>
+          <Text style={{fontSize:56}}>📝</Text>
+          <Text style={{color:theme.text,fontSize:20,fontWeight:'600',marginTop:16}}>No topics yet</Text>
+          <Text style={{color:'#64748B',fontSize:14,marginTop:8,textAlign:'center',paddingHorizontal:40}}>Head over to the Learn tab to create a topic, then come back here to quiz yourself.</Text>
+        </View>
+      )}
     </ScrollView>
-  );
-
-  // ── SCREEN: MODE SELECT ──
-  if(quizStep==='mode_select'&&selTopic) return (
-    <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
-      <Back onPress={()=>{setSelTopic(null);setQuizStep('topic_select');}} theme={theme}/>
-      <Text style={[st.title,{color:theme.text}]}>{safeStr(selTopic.title)}</Text>
-      <Text style={st.sub}>Choose your study mode</Text>
-
-      {/* Quiz Mode Card */}
-      <TouchableOpacity style={[st.card,{backgroundColor:theme.card,marginBottom:14}]} onPress={()=>{setQuizMode('quiz');setSelectedSectionIds([]);setQuizStep('section_select');}}>
-        <View style={{flexDirection:'row',alignItems:'center',marginBottom:12}}>
-          <View style={{width:48,height:48,borderRadius:14,backgroundColor:'rgba(99,102,241,0.15)',alignItems:'center',justifyContent:'center'}}>
-            <Text style={{fontSize:24}}>🎯</Text>
-          </View>
-          <View style={{flex:1,marginLeft:14}}>
-            <Text style={{color:theme.text,fontSize:18,fontWeight:'700'}}>Quiz</Text>
-            <Text style={{color:'#94A3B8',fontSize:13,marginTop:2}}>Focus on specific sections</Text>
-          </View>
-          <I.Right s={22} c='#64748B'/>
-        </View>
-        <Text style={{color:'#64748B',fontSize:13,lineHeight:19}}>Choose which sections to quiz on. Perfect for targeted practice and reviewing weak areas.</Text>
-      </TouchableOpacity>
-
-      {/* Test Mode Card */}
-      <TouchableOpacity style={[st.card,{backgroundColor:theme.card,marginBottom:14}]} onPress={()=>{
-        setQuizMode('test');
-        setSelectedSectionIds((selTopic.sections||[]).map(s=>s.id));
-        setPreset(prev=>({...prev,questionTypes:{multipleChoice:true,fillInBlank:true,shortResponse:true,scenario:true},questionCount:30}));
-        setQuizStep('settings');
-      }}>
-        <View style={{flexDirection:'row',alignItems:'center',marginBottom:12}}>
-          <View style={{width:48,height:48,borderRadius:14,backgroundColor:'rgba(245,158,11,0.15)',alignItems:'center',justifyContent:'center'}}>
-            <Text style={{fontSize:24}}>📋</Text>
-          </View>
-          <View style={{flex:1,marginLeft:14}}>
-            <Text style={{color:theme.text,fontSize:18,fontWeight:'700'}}>Test</Text>
-            <Text style={{color:'#94A3B8',fontSize:13,marginTop:2}}>Full comprehensive exam</Text>
-          </View>
-          <I.Right s={22} c='#64748B'/>
-        </View>
-        <Text style={{color:'#64748B',fontSize:13,lineHeight:19}}>A full exam covering all sections. Great for gauging overall mastery and working toward medals.</Text>
-      </TouchableOpacity>
-
-      {/* Topic Progress Summary */}
-      <View style={[st.card,{backgroundColor:theme.card}]}>
-        <Text style={{color:'#64748B',fontSize:12,fontWeight:'600',letterSpacing:0.5,marginBottom:10}}>TOPIC PROGRESS</Text>
-        <ProgressBar progress={selTopic.progress||0}/>
-        <View style={{flexDirection:'row',justifyContent:'space-between',marginTop:10}}>
-          <Text style={{color:'#64748B',fontSize:12}}>{(selTopic.concepts||[]).filter(c=>c.mastered).length}/{(selTopic.concepts||[]).length} mastered</Text>
-          {selTopic.medal!=='none'&&<View style={{flexDirection:'row',alignItems:'center',gap:4}}><MedalBadge medal={selTopic.medal} size={18}/><Text style={{color:'#F59E0B',fontSize:12,fontWeight:'600'}}>{selTopic.medal}</Text></View>}
-        </View>
-      </View>
-
-      {/* Medal Requirements Info */}
-      <View style={{marginTop:4,padding:16,backgroundColor:'rgba(245,158,11,0.08)',borderRadius:14,borderWidth:1,borderColor:'rgba(245,158,11,0.2)'}}>
-        <Text style={{color:'#F59E0B',fontSize:12,fontWeight:'700',letterSpacing:0.5,marginBottom:6}}>PROMOTION REQUIREMENTS</Text>
-        <Text style={{color:'#94A3B8',fontSize:13,lineHeight:20}}>
-          {selTopic.medal==='gold'
-            ?'To earn the Trait: Score 80%+ on a 30-question Test exam.'
-            :selTopic.medal==='trait'
-            ?'You have achieved full mastery!'
-            :'To earn your next medal: Score 8/10 (80%) on a Quiz. To earn the Trait: Score 80%+ on a 30-question Test.'}
-        </Text>
-      </View>
-    </ScrollView>
-  );
+    );
+  }
 
   // ── SCREEN: SECTION SELECT ──
   if(quizStep==='section_select'&&selTopic) {
-    const sections = selTopic.sections||[];
+    const sections = selTopic!.sections||[];
     const hasSections = sections.length>0;
     const allSelected = sections.length>0 && selectedSectionIds.length===sections.length;
-    const fallbackConceptCount = (selTopic.concepts||[]).length;
+    const fallbackConceptCount = (selTopic!.concepts||[]).length;
     const canContinue = hasSections ? selectedSectionIds.length>0 : fallbackConceptCount>0;
     const toggleAll = () => {
       if(allSelected) setSelectedSectionIds([]);
@@ -6105,7 +7398,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
     };
     return (
       <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
-        <Back onPress={()=>setQuizStep('mode_select')} theme={theme}/>
+        <Back onPress={()=>{setSelTopic(null);setQuizStep('topic_select');}} theme={theme}/>
         <Text style={[st.title,{color:theme.text}]}>Select Sections</Text>
         <Text style={st.sub}>Choose which sections to focus on</Text>
 
@@ -6137,7 +7430,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
           return (
             <TouchableOpacity key={s.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10,borderWidth:2,borderColor:isSelected?theme.primary:'transparent'}]} onPress={()=>toggleSection(s.id)}>
               <View style={{flexDirection:'row',alignItems:'center'}}>
-                <View style={{width:32,height:32,borderRadius:8,backgroundColor:isSelected?theme.primary:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                <View style={{width:32,height:32,borderRadius:8,backgroundColor:isSelected?theme.primary:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',marginRight:12}}>
                   {isSelected?<I.Check s={18} c='white'/>:<Text style={{color:'#64748B',fontSize:14,fontWeight:'600'}}>{i+1}</Text>}
                 </View>
                 <View style={{flex:1}}>
@@ -6147,7 +7440,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
                 {s.medal!=='none'&&<MedalBadge medal={s.medal} size={22}/>}
               </View>
               {/* Mini progress bar */}
-              <View style={{height:3,backgroundColor:'rgba(255,255,255,0.06)',borderRadius:2,marginTop:10}}>
+              <View style={{height:3,backgroundColor:'rgba(128,128,128,0.12)',borderRadius:2,marginTop:10}}>
                 <View style={{height:'100%',borderRadius:2,backgroundColor:sectionProgress>=75?'#10B981':sectionProgress>=50?'#F59E0B':sectionProgress>=25?'#6366F1':'#475569',width:`${sectionProgress}%`}}/>
               </View>
             </TouchableOpacity>
@@ -6168,22 +7461,31 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
   }
 
   // ── SCREEN: SETTINGS ──
-  if(quizStep==='settings'&&selTopic) {
-    const hasSections = (selTopic.sections||[]).length>0;
-    const conceptCount = quizMode==='test' ? (selTopic.concepts||[]).length : (hasSections ? selectedConceptCount() : (selTopic.concepts||[]).length);
-    const sectionCount = quizMode==='test' ? (selTopic.sections||[]).length : (hasSections ? selectedSectionIds.length : 0);
-    const countOptions = quizMode==='test' ? [10,15,20,25,30] : [5,10,15,20,30];
+  if(quizStep==='settings'&&(selTopic||quizMode==='multi_test')) {
+    const isMultiTest = quizMode==='multi_test';
+    const isTest = quizMode==='test'||isMultiTest;
+    const hasSections = selTopic ? (selTopic.sections||[]).length>0 : false;
+    const conceptCount = isMultiTest
+      ? (topics||[]).filter(t=>selectedTopicIds.includes(t.id)).reduce((sum,t)=>sum+(t.concepts||[]).length,0)
+      : isTest ? (selTopic?.concepts||[]).length : (hasSections ? selectedConceptCount() : (selTopic?.concepts||[]).length);
+    const sectionCount = isMultiTest
+      ? (topics||[]).filter(t=>selectedTopicIds.includes(t.id)).reduce((sum,t)=>sum+(t.sections||[]).length,0)
+      : isTest ? (selTopic?.sections||[]).length : (hasSections ? selectedSectionIds.length : 0);
+    const countOptions = isTest ? [30,40,50,60] : [5,10,15,20,30];
+    const settingsTitle = isMultiTest
+      ? `${selectedTopicIds.length} Topic${selectedTopicIds.length!==1?'s':''} Selected`
+      : safeStr(selTopic?.title||'');
     return (
       <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
-        <Back onPress={()=>setQuizStep(quizMode==='test'?'mode_select':'section_select')} theme={theme}/>
-        <Text style={[st.title,{color:theme.text}]}>{quizMode==='test'?'Exam Settings':'Quiz Settings'}</Text>
-        <Text style={st.sub}>{safeStr(selTopic.title)}</Text>
+        <Back onPress={()=>setQuizStep(isMultiTest?'topic_select':isTest?'topic_select':'section_select')} theme={theme}/>
+        <Text style={[st.title,{color:theme.text}]}>{isTest?'Exam Settings':'Quiz Settings'}</Text>
+        <Text style={st.sub}>{settingsTitle}</Text>
 
         {/* Info banner */}
         <View style={{backgroundColor:'rgba(99,102,241,0.1)',borderRadius:12,padding:14,marginBottom:18,flexDirection:'row',alignItems:'center'}}>
-          <Text style={{fontSize:16,marginRight:10}}>{quizMode==='test'?'📋':'🎯'}</Text>
+          <Text style={{fontSize:16,marginRight:10}}>{isTest?'📋':'🎯'}</Text>
           <Text style={{color:'#94A3B8',fontSize:13,flex:1}}>
-            {quizMode==='test'?'Full exam':'Focused quiz'} · {sectionCount} section{sectionCount!==1?'s':''} · {conceptCount} concept{conceptCount!==1?'s':''}
+            {isTest?'Full exam':'Focused quiz'} · {sectionCount} section{sectionCount!==1?'s':''} · {conceptCount} concept{conceptCount!==1?'s':''}
           </Text>
         </View>
 
@@ -6192,7 +7494,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
           <Text style={st.section}>SAVED PRESETS</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom:16}}>
             {(presets||[]).map(p=>(
-              <TouchableOpacity key={p.id} style={{paddingVertical:8,paddingHorizontal:16,borderRadius:20,backgroundColor:preset.id===p.id?theme.primary:'rgba(255,255,255,0.06)',marginRight:10}} onPress={()=>setPreset(p)}>
+              <TouchableOpacity key={p.id} style={{paddingVertical:8,paddingHorizontal:16,borderRadius:20,backgroundColor:preset.id===p.id?theme.primary:'rgba(128,128,128,0.12)',marginRight:10}} onPress={()=>setPreset(p)}>
                 <Text style={{color:preset.id===p.id?'white':'#94A3B8',fontSize:13,fontWeight:'500'}}>{safeStr(p.name)}</Text>
               </TouchableOpacity>
             ))}
@@ -6208,9 +7510,9 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
                   <Text style={{fontSize:16,marginRight:10}}>{t.icon}</Text>
                   <Text style={{color:theme.text,fontSize:15}}>{t.l}</Text>
                 </View>
-                <Switch value={preset.questionTypes[t.k as keyof typeof preset.questionTypes]} onValueChange={v=>setPreset(prev=>({...prev,id:'custom',name:'Custom',questionTypes:{...prev.questionTypes,[t.k]:v}}))} trackColor={{false:'#374151',true:theme.primary}} thumbColor='white'/>
+                <Switch value={preset.questionTypes[t.k as keyof typeof preset.questionTypes]} onValueChange={v=>setPreset(prev=>({...prev,id:'custom',name:'Custom',questionTypes:{...prev.questionTypes,[t.k]:v}}))} trackColor={{false:'rgba(128,128,128,0.3)',true:theme.primary}} thumbColor='white'/>
               </View>
-              {i<arr.length-1&&<View style={{height:1,backgroundColor:'rgba(255,255,255,0.05)'}}/>}
+              {i<arr.length-1&&<View style={{height:1,backgroundColor:'rgba(128,128,128,0.1)'}}/>}
             </View>
           ))}
         </View>
@@ -6218,7 +7520,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
         <Text style={st.section}>NUMBER OF QUESTIONS</Text>
         <View style={{flexDirection:'row',justifyContent:'space-between',marginBottom:16}}>
           {countOptions.map(n=>(
-            <TouchableOpacity key={n} style={{flex:1,marginHorizontal:3,height:50,borderRadius:12,backgroundColor:preset.questionCount===n?theme.primary:'rgba(255,255,255,0.05)',alignItems:'center',justifyContent:'center'}} onPress={()=>setPreset(prev=>({...prev,questionCount:n}))}>
+            <TouchableOpacity key={n} style={{flex:1,marginHorizontal:3,height:50,borderRadius:12,backgroundColor:preset.questionCount===n?theme.primary:'rgba(128,128,128,0.1)',alignItems:'center',justifyContent:'center'}} onPress={()=>setPreset(prev=>({...prev,questionCount:n}))}>
               <Text style={{color:preset.questionCount===n?'white':'#94A3B8',fontSize:16,fontWeight:'600'}}>{n}</Text>
             </TouchableOpacity>
           ))}
@@ -6238,7 +7540,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
             ].map(p=>{
               const active = difficultyMix.easy===p.e&&difficultyMix.medium===p.m&&difficultyMix.hard===p.h;
               return (
-                <TouchableOpacity key={p.label} style={{flex:1,paddingVertical:8,borderRadius:8,backgroundColor:active?theme.primary:'rgba(255,255,255,0.06)',alignItems:'center'}} onPress={()=>setDifficultyMix({easy:p.e,medium:p.m,hard:p.h})}>
+                <TouchableOpacity key={p.label} style={{flex:1,paddingVertical:8,borderRadius:8,backgroundColor:active?theme.primary:'rgba(128,128,128,0.12)',alignItems:'center'}} onPress={()=>setDifficultyMix({easy:p.e,medium:p.m,hard:p.h})}>
                   <Text style={{color:active?'white':'#94A3B8',fontSize:11,fontWeight:'600'}}>{p.label}</Text>
                 </TouchableOpacity>
               );
@@ -6261,7 +7563,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
                   {dc.hard>0&&<View style={{flex:Math.max(difficultyMix.hard,1),backgroundColor:'#EF4444',alignItems:'center',justifyContent:'center'}}>
                     <Text style={{color:'white',fontSize:12,fontWeight:'700'}}>{dc.hard}</Text>
                   </View>}
-                  {dc.easy===0&&dc.medium===0&&dc.hard===0&&<View style={{flex:1,backgroundColor:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center'}}>
+                  {dc.easy===0&&dc.medium===0&&dc.hard===0&&<View style={{flex:1,backgroundColor:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center'}}>
                     <Text style={{color:'#64748B',fontSize:12}}>Adjust sliders</Text>
                   </View>}
                 </View>
@@ -6333,7 +7635,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
                           },
                         } as any : {})}
                       >
-                        <View style={{height:8,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:4}}>
+                        <View style={{height:8,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:4}}>
                           <View style={{height:'100%',borderRadius:4,backgroundColor:color,width:`${val}%`}}/>
                         </View>
                         {/* Thumb */}
@@ -6349,9 +7651,11 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
 
         {/* Save as Preset Link */}
         <TouchableOpacity style={{alignSelf:'center',marginBottom:20}} onPress={()=>{
-          const newPreset:QuizPreset = {...preset,id:'preset_'+Date.now(),name:quizMode==='test'?'Exam Preset':'Quiz Preset'};
+          const typesOn = Object.entries(preset.questionTypes).filter(([_,v])=>v).map(([k])=>k==='multipleChoice'?'MC':k==='fillInBlank'?'FIB':k==='shortResponse'?'SR':'Scenario');
+          const autoName = `${typesOn.join('+')} ×${preset.questionCount}`;
+          const newPreset:QuizPreset = {...preset,id:'preset_'+Date.now(),name:autoName};
           onSavePreset(newPreset);
-          Alert.alert('Saved','Preset saved successfully.');
+          Alert.alert('Saved',`Preset "${autoName}" saved.`);
         }}>
           <Text style={{color:theme.primary,fontSize:14,fontWeight:'500'}}>💾 Save as Preset</Text>
         </TouchableOpacity>
@@ -6361,7 +7665,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
           <Text style={{color:'#EF4444',fontSize:13,textAlign:'center'}}>Please enable at least one question type</Text>
         </View>}
 
-        <Btn title={loading?'Generating Questions...':(quizMode==='test'?'Start Exam':'Start Quiz')} onPress={start} theme={theme} loading={loading} disabled={loading||!Object.values(preset.questionTypes).some(v=>v)}/>
+        <Btn title={loading?'Generating Questions...':(isTest?'Start Exam':'Start Quiz')} onPress={start} theme={theme} loading={loading} disabled={loading||!Object.values(preset.questionTypes).some(v=>v)}/>
       </ScrollView>
     );
   }
@@ -6395,7 +7699,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
           </View>
 
           {/* Progress bar */}
-          <View style={{height:4,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:2,marginBottom:24}}>
+          <View style={{height:4,backgroundColor:'rgba(128,128,128,0.18)',borderRadius:2,marginBottom:24}}>
             <View style={{height:'100%',borderRadius:2,backgroundColor:theme.primary,width:`${(((questions||[]).length>0?(idx+1)/(questions||[]).length:0))*100}%`}}/>
           </View>
 
@@ -6414,10 +7718,10 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
             {/* Multiple Choice / Scenario Options */}
             {(q.type==='multiple_choice'||q.type==='scenario')&&(q.options||[]).map((o,i)=>(
               <TouchableOpacity key={i} style={{flexDirection:'row',alignItems:'center',padding:16,borderRadius:14,borderWidth:2,marginBottom:10,
-                borderColor:showRes&&compareAnswerText(o,q.correctAnswer)?'#10B981':showRes&&selOpt===i&&!compareAnswerText(o,q.correctAnswer)?'#EF4444':selOpt===i?'#818CF8':'rgba(255,255,255,0.08)',
-                backgroundColor:showRes&&compareAnswerText(o,q.correctAnswer)?'rgba(16,185,129,0.15)':showRes&&selOpt===i&&!compareAnswerText(o,q.correctAnswer)?'rgba(239,68,68,0.15)':selOpt===i?'rgba(99,102,241,0.1)':'rgba(255,255,255,0.03)'
+                borderColor:showRes&&compareAnswerText(o,q.correctAnswer)?'#10B981':showRes&&selOpt===i&&!compareAnswerText(o,q.correctAnswer)?'#EF4444':selOpt===i?'#818CF8':'rgba(128,128,128,0.15)',
+                backgroundColor:showRes&&compareAnswerText(o,q.correctAnswer)?'rgba(16,185,129,0.15)':showRes&&selOpt===i&&!compareAnswerText(o,q.correctAnswer)?'rgba(239,68,68,0.15)':selOpt===i?'rgba(99,102,241,0.1)':'rgba(128,128,128,0.07)'
               }} onPress={()=>!showRes&&setSelOpt(i)} disabled={showRes}>
-                <View style={{width:28,height:28,borderRadius:8,backgroundColor:selOpt===i?theme.primary:'rgba(255,255,255,0.08)',alignItems:'center',justifyContent:'center',marginRight:14}}>
+                <View style={{width:28,height:28,borderRadius:8,backgroundColor:selOpt===i?theme.primary:'rgba(128,128,128,0.15)',alignItems:'center',justifyContent:'center',marginRight:14}}>
                   <Text style={{color:selOpt===i?'white':'#E2E8F0',fontSize:14,fontWeight:'600'}}>{String.fromCharCode(65+i)}</Text>
                 </View>
                 <Text style={{flex:1,color:theme.text,fontSize:15,lineHeight:22}}>{safeStr(o)}</Text>
@@ -6428,7 +7732,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
 
             {/* Fill in Blank / Short Response */}
             {(q.type==='fill_in_blank'||q.type==='short_response')&&<TextInput
-              style={{borderWidth:1,borderColor:showRes?(correct?'#10B981':'#EF4444'):'rgba(255,255,255,0.1)',borderRadius:14,padding:16,fontSize:16,color:theme.text,backgroundColor:'rgba(255,255,255,0.03)',minHeight:q.type==='short_response'?120:50}}
+              style={{borderWidth:1,borderColor:showRes?(correct?'#10B981':'#EF4444'):'rgba(128,128,128,0.18)',borderRadius:14,padding:16,fontSize:16,color:theme.text,backgroundColor:'rgba(128,128,128,0.07)',minHeight:q.type==='short_response'?120:50}}
               placeholder={q.type==='fill_in_blank'?'Type your answer...':'Write your response...'}
               placeholderTextColor='#64748B' value={answer} onChangeText={setAnswer}
               multiline={q.type==='short_response'} editable={!showRes}
@@ -6556,7 +7860,7 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
                   <Text style={{color:theme.text,fontSize:14,fontWeight:'500',flex:1}} numberOfLines={1}>{safeStr(s.sectionTitle)}</Text>
                   <Text style={{color:barColor,fontSize:13,fontWeight:'700',marginLeft:8}}>{s.correct}/{s.total} ({sAcc}%)</Text>
                 </View>
-                <View style={{height:6,backgroundColor:'rgba(255,255,255,0.06)',borderRadius:3}}>
+                <View style={{height:6,backgroundColor:'rgba(128,128,128,0.12)',borderRadius:3}}>
                   <View style={{height:'100%',borderRadius:3,backgroundColor:barColor,width:`${sAcc}%`}}/>
                 </View>
               </View>
@@ -6594,14 +7898,14 @@ const QuizScreen = ({topics,presets,onSavePreset,onUpdateTopic,onUpdateProfile,p
 const BB_GRID = 8;
 const WORDLE_MAX_GUESSES = 6;
 const BP_COLS = 8;
-const BP_COLORS = ['#EF4444','#3B82F6','#10B981','#F59E0B','#A855F7','#F97316'];
-type HighScores = {bubble:number;blocks:number;wordle:number};
+const BP_COLORS = ['#E11D48','#2563EB','#059669','#D97706','#7C3AED','#0891B2'];
+type HighScores = {bubble:number;blocks:number;wordle:number;slider:number};
 
 const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topics:Topic[];onUpdateTopic:(t:Topic)=>void;onUpdateProfile:(u:Partial<UserProfile>)=>void;profile:UserProfile;theme:ThemeColors}) => {
   // ── Navigation ──
-  const [step,setStep] = useState<'topic_select'|'game_select'|'bubble'|'blocks'|'wordle'|'results'>('topic_select');
+  const [step,setStep] = useState<'topic_select'|'game_select'|'bubble'|'blocks'|'wordle'|'slider'|'results'>('topic_select');
   const [selTopic,setSelTopic] = useState<Topic|null>(null);
-  const [lastGame,setLastGame] = useState<'bubble'|'blocks'|'wordle'>('bubble');
+  const [lastGame,setLastGame] = useState<'bubble'|'blocks'|'wordle'|'slider'>('bubble');
   const { width: gamesWindowWidth, height: gamesWindowHeight } = useWindowDimensions();
   const GAME_PLAYFIELD_WIDTH = Math.min(400, Math.max(220, Math.floor(gamesWindowWidth - (Platform.OS==='web' ? 52 : 36))));
   const BB_CELL = Math.max(16, Math.floor((GAME_PLAYFIELD_WIDTH - BB_GRID) / BB_GRID));
@@ -6616,7 +7920,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   const [gameScore,setGameScore] = useState(0);
   const [xpEarned,setXpEarned] = useState(0);
   const [isNewHigh,setIsNewHigh] = useState(false);
-  const [highScores,setHighScores] = useState<HighScores>({bubble:0,blocks:0,wordle:0});
+  const [highScores,setHighScores] = useState<HighScores>({bubble:0,blocks:0,wordle:0,slider:0});
 
   // ── AI interruption overlay ──
   const [showQ,setShowQ] = useState(false);
@@ -6673,16 +7977,166 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   // ── Block Blast touch tracking ref ──
   const bbTouchActive = useRef(false);
 
+  // ── Tile Slider (2048-style) state ──
+  const SL_SIZE = 4;
+  const [slGrid,setSlGrid] = useState<number[][]>(Array(SL_SIZE).fill(null).map(()=>Array(SL_SIZE).fill(0)));
+  const [slScore,setSlScore] = useState(0);
+  const [slGameOver,setSlGameOver] = useState(false);
+  const [slWon,setSlWon] = useState(false);
+  const slMoveCountRef = useRef(0);
+  const slTouchStart = useRef<{x:number;y:number}|null>(null);
+  const slMoving = useRef(false);
+
+  const slAddRandom = (grid:number[][]):number[][] => {
+    const g = grid.map(r=>[...r]);
+    const empty:{r:number;c:number}[] = [];
+    for(let r=0;r<SL_SIZE;r++) for(let c=0;c<SL_SIZE;c++) if(!g[r][c]) empty.push({r,c});
+    if(!empty.length) return g;
+    const spot = empty[Math.floor(Math.random()*empty.length)];
+    g[spot.r][spot.c] = Math.random()<0.9?2:4;
+    return g;
+  };
+
+  const slInit = ():number[][] => {
+    let g = Array(SL_SIZE).fill(null).map(()=>Array(SL_SIZE).fill(0));
+    g = slAddRandom(g);
+    g = slAddRandom(g);
+    return g;
+  };
+
+  const slCanMove = (grid:number[][]):boolean => {
+    for(let r=0;r<SL_SIZE;r++) for(let c=0;c<SL_SIZE;c++){
+      if(!grid[r][c]) return true;
+      if(c<SL_SIZE-1 && grid[r][c]===grid[r][c+1]) return true;
+      if(r<SL_SIZE-1 && grid[r][c]===grid[r+1][c]) return true;
+    }
+    return false;
+  };
+
+  const slSlide = (row:number[]):{result:number[];score:number} => {
+    const filtered = row.filter(v=>v);
+    let score = 0;
+    for(let i=0;i<filtered.length-1;i++){
+      if(filtered[i]===filtered[i+1]){
+        filtered[i]*=2;
+        score+=filtered[i];
+        filtered.splice(i+1,1);
+      }
+    }
+    while(filtered.length<SL_SIZE) filtered.push(0);
+    return {result:filtered,score};
+  };
+
+  const slMove = (dir:'left'|'right'|'up'|'down') => {
+    if(slGameOver||paused||showQ) return;
+    let g = slGrid.map(r=>[...r]);
+    let moved = false;
+    let pts = 0;
+
+    if(dir==='left'){
+      for(let r=0;r<SL_SIZE;r++){
+        const {result,score}=slSlide(g[r]);
+        if(result.some((v,i)=>v!==g[r][i])) moved=true;
+        g[r]=result; pts+=score;
+      }
+    } else if(dir==='right'){
+      for(let r=0;r<SL_SIZE;r++){
+        const {result,score}=slSlide([...g[r]].reverse());
+        const rev = result.reverse();
+        if(rev.some((v,i)=>v!==g[r][i])) moved=true;
+        g[r]=rev; pts+=score;
+      }
+    } else if(dir==='up'){
+      for(let c=0;c<SL_SIZE;c++){
+        const col = g.map(r=>r[c]);
+        const {result,score}=slSlide(col);
+        if(result.some((v,i)=>v!==g[i][c])) moved=true;
+        result.forEach((v,i)=>{g[i][c]=v;}); pts+=score;
+      }
+    } else {
+      for(let c=0;c<SL_SIZE;c++){
+        const col = g.map(r=>r[c]).reverse();
+        const {result,score}=slSlide(col);
+        const rev = result.reverse();
+        if(rev.some((v,i)=>v!==g[i][c])) moved=true;
+        rev.forEach((v,i)=>{g[i][c]=v;}); pts+=score;
+      }
+    }
+
+    if(!moved) return;
+    g = slAddRandom(g);
+    const newScore = slScore + pts;
+    setSlGrid(g);
+    setSlScore(newScore);
+    setGameScore(newScore);
+
+    // Check for 2048 tile
+    if(g.some(r=>r.some(v=>v>=2048)) && !slWon) setSlWon(true);
+
+    // Check game over
+    if(!slCanMove(g)){
+      setSlGameOver(true);
+      saveHighScore('slider',newScore);
+      updateProgress(true);
+      setStep('results');
+      return;
+    }
+
+    // Trigger question every 5 moves
+    slMoveCountRef.current++;
+    if(slMoveCountRef.current % 25 === 0 && Date.now()-lastQTimeRef.current>3000){
+      triggerInterruption();
+    }
+  };
+
+  const resetSlider = useCallback(()=>{
+    const g = slInit();
+    setSlGrid(g);
+    setSlScore(0);
+    setSlGameOver(false);
+    setSlWon(false);
+    slMoveCountRef.current=0;
+    setQAnswered(0);setQCorrect(0);setGameScore(0);setXpEarned(0);
+    setShowQ(false);setPaused(false);lastQTimeRef.current=Date.now();
+  },[]);
+
+  // Keyboard arrow controls for Number Fusion (web)
+  useEffect(()=>{
+    if(Platform.OS!=='web'||step!=='slider') return;
+    const handleKeyDown = (e:KeyboardEvent) => {
+      const keyMap:{[k:string]:'left'|'right'|'up'|'down'} = {ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down'};
+      const dir = keyMap[e.key];
+      if(dir) { e.preventDefault(); slMove(dir); }
+    };
+    window.addEventListener('keydown',handleKeyDown);
+    return ()=>window.removeEventListener('keydown',handleKeyDown);
+  },[step,slGrid,slGameOver,paused,showQ]);
+
+  const SL_COLORS:Record<number,{bg:string;text:string}> = {
+    0:{bg:'rgba(128,128,128,0.1)',text:'transparent'},
+    2:{bg:'#DBEAFE',text:'#1E40AF'},
+    4:{bg:'#BFDBFE',text:'#1E40AF'},
+    8:{bg:'#60A5FA',text:'#FFFFFF'},
+    16:{bg:'#3B82F6',text:'#FFFFFF'},
+    32:{bg:'#2563EB',text:'#FFFFFF'},
+    64:{bg:'#1D4ED8',text:'#FFFFFF'},
+    128:{bg:'#34D399',text:'#FFFFFF'},
+    256:{bg:'#10B981',text:'#FFFFFF'},
+    512:{bg:'#059669',text:'#FFFFFF'},
+    1024:{bg:'#A855F7',text:'#FFFFFF'},
+    2048:{bg:'#7C3AED',text:'#FFFFFF'},
+  };
+
   // ── Load high scores ──
   useEffect(()=>{
     (async()=>{
-      const hs = await Store.load<HighScores>(SK.HIGHSCORES,{bubble:0,blocks:0,wordle:0});
+      const hs = await Store.load<HighScores>(SK.HIGHSCORES,{bubble:0,blocks:0,wordle:0,slider:0});
       setHighScores(hs);
     })();
   },[]);
 
-  const saveHighScore = useCallback(async(game:'bubble'|'blocks'|'wordle',score:number)=>{
-    const hs = await Store.load<HighScores>(SK.HIGHSCORES,{bubble:0,blocks:0,wordle:0});
+  const saveHighScore = useCallback(async(game:'bubble'|'blocks'|'wordle'|'slider',score:number)=>{
+    const hs = await Store.load<HighScores>(SK.HIGHSCORES,{bubble:0,blocks:0,wordle:0,slider:0});
     if(score>hs[game]){
       hs[game]=score;
       await Store.save(SK.HIGHSCORES,hs);
@@ -6716,10 +8170,26 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     }));
     const streak = updateStudyStreak(selTopic);
     const ut:Topic = {...selTopic,concepts:ucs,sections:updSections,progress:np,medal:nm,lastStudied:new Date().toISOString(),studyStreak:streak};
+    const gameUpdates:Partial<UserProfile> = {};
     if(correct){
       setXpEarned(x=>x+gain);
-      onUpdateProfile({totalPoints:(profile.totalPoints||0)+gain});
+      const newPts = (profile.totalPoints||0)+gain;
+      gameUpdates.totalPoints = newPts;
+      gameUpdates.level = getLevelFromPoints(newPts);
     }
+    // Track persistent concept mastery + trait in games
+    const newMastered = !concept.mastered&&uc.mastered;
+    if(newMastered) gameUpdates.totalConceptsLearned = (profile.totalConceptsLearned||0)+1;
+    const om = selTopic.medal;
+    if(nm!==om&&nm!=='none') {
+      const basePts = gameUpdates.totalPoints||profile.totalPoints||0;
+      gameUpdates.totalPoints = basePts+getMedalPts(nm);
+      gameUpdates.level = getLevelFromPoints(gameUpdates.totalPoints);
+      if(nm==='trait'&&!(profile.traitTopicIds||[]).includes(selTopic.id)) {
+        gameUpdates.traitTopicIds = [...(profile.traitTopicIds||[]),selTopic.id];
+      }
+    }
+    if(Object.keys(gameUpdates).length>0) onUpdateProfile(gameUpdates);
     setSelTopic(ut);
     onUpdateTopic(ut);
   },[selTopic,profile,onUpdateTopic,onUpdateProfile]);
@@ -6775,7 +8245,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           <Text style={{color:theme.primary,fontSize:11,fontWeight:'700',letterSpacing:1,marginBottom:8}}>ANSWER TO CONTINUE</Text>
           <Text style={{color:theme.text,fontSize:18,fontWeight:'600',marginBottom:20,lineHeight:26}}>{safeStr(gameQ.question)}</Text>
           {(gameQ.options||[]).map((o,i)=>(
-            <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(255,255,255,0.12)',marginBottom:8,backgroundColor:'rgba(255,255,255,0.03)'}} onPress={()=>{
+            <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
               const res = answerInterruption(o, step==='bubble'||step==='blocks');
               if(!res.correct&&step==='bubble') setBpGameOver(true);
               else if(!res.correct&&step==='blocks') setBbGameOver(true);
@@ -6789,7 +8259,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   },[showQ,gameQ,theme,answerInterruption,step]);
 
   // ══════════════════════════════════════
-  // ── BUBBLE POP ("Pop Scholar") ──
+  // ── CONCEPT CLASH (Bubble-style game) ──
   // ══════════════════════════════════════
   const bpMakeGrid = useCallback((level:number):number[][] => {
     const rows = Math.min(3 + level, 9);
@@ -7029,9 +8499,9 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   },[step,bpMeasurePlayArea]);
 
   // ══════════════════════════════════════
-  // ── BLOCK BLAST ("Brain Blocks") ──
+  // ── GRID MASTER (Block placement game) ──
   // ══════════════════════════════════════
-  const BB_COLORS = ['transparent','#6366F1','#EC4899','#10B981','#F59E0B','#3B82F6','#8B5CF6','#EF4444'];
+  const BB_COLORS = ['transparent','#4F46E5','#DB2777','#0D9488','#CA8A04','#0284C7','#9333EA','#DC2626'];
   const BB_SHAPES:number[][][] = [
     [[1]],[[1,1]],[[1],[1]],[[1,1],[1,0]],[[0,1],[1,1]],[[1,1,1]],
     [[1],[1],[1]],[[1,1],[1,1]],[[1,1,1],[0,1,0]],[[1,0],[1,1],[0,1]],
@@ -7177,8 +8647,9 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     const piece = bbPieces[pieceIdx];
     if(!piece) { setBbPreview(null); return; }
     const anchor = bbDragAnchorRef.current;
-    const gx = point.x - anchor.x - bbGridLayoutRef.current.x;
-    const gy = point.y - anchor.y - bbGridLayoutRef.current.y;
+    // +3 accounts for inner padding(2) + border(1) of the grid container
+    const gx = point.x - anchor.x - bbGridLayoutRef.current.x - 3;
+    const gy = point.y - anchor.y - bbGridLayoutRef.current.y - 3;
     const col = Math.round(gx / BB_CELL_PITCH);
     const row = Math.round(gy / BB_CELL_PITCH);
     if(row>=0&&row<BB_GRID&&col>=0&&col<BB_GRID) setBbPreview({row,col});
@@ -7229,7 +8700,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   },[step,bbMeasureGrid]);
 
   // ══════════════════════════════════════
-  // ── WORDLE ("Lexicon") ──
+  // ── WORD LAB (Word guessing game) ──
   // ══════════════════════════════════════
   const resetWordle = useCallback(()=>{
     setWordleTarget('');setWordleHint('');setWordleWords([]);
@@ -7261,7 +8732,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     return 'absent';
   },[wordleTarget]);
 
-  const wlColor = (s:'correct'|'present'|'absent'):string => s==='correct'?'#10B981':s==='present'?'#F59E0B':'#374151';
+  const wlColor = (s:'correct'|'present'|'absent'):string => s==='correct'?'#2563EB':s==='present'?'#D97706':'#475569';
 
   const submitWordleGuess = useCallback(()=>{
     if(wordleDone||!wordleTarget) return;
@@ -7300,6 +8771,19 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     setWordleGuesses([]);setWordleCurrent('');setWordleDone(false);setWordleWon(false);
     setWordleKeyColors({});setWordleQuizStep('playing');setWordleQuizQ(null);
   },[wordleRound,wordleWords,gameScore,saveHighScore]);
+
+  // Keyboard controls for Word Lab (web)
+  useEffect(()=>{
+    if(Platform.OS!=='web'||step!=='wordle'||wordleDone) return;
+    const handleKey = (e:KeyboardEvent) => {
+      const k = e.key.toUpperCase();
+      if(k==='ENTER') { e.preventDefault(); submitWordleGuess(); }
+      else if(k==='BACKSPACE'||k==='DELETE') { e.preventDefault(); setWordleCurrent(c=>c.slice(0,-1)); }
+      else if(/^[A-Z]$/.test(k)) { e.preventDefault(); setWordleCurrent(c=>c.length<(wordleTarget.length||5)?c+k:c); }
+    };
+    window.addEventListener('keydown',handleKey);
+    return ()=>window.removeEventListener('keydown',handleKey);
+  },[step,wordleDone,wordleTarget,submitWordleGuess]);
 
   useEffect(()=>{
     if(wordleQuizStep!=='quiz'||wordleQuizQ) return;
@@ -7385,15 +8869,17 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
       <Text style={[st.title,{color:theme.text}]}>Choose a Game</Text>
       <Text style={st.sub}>Learning: {selTopic?.title}</Text>
       {[
-        {id:'bubble' as const,name:'Pop Scholar',desc:'Shoot & match bubbles! AI quizzes you every few shots — wrong answer pops your game.',emoji:'🫧',gradient:['#6366F1','#8B5CF6'] as [string,string],hs:highScores.bubble},
-        {id:'blocks' as const,name:'Brain Blocks',desc:'Drag blocks onto the grid to clear rows & columns. AI interrupts to keep you sharp!',emoji:'🧩',gradient:['#EC4899','#F43F5E'] as [string,string],hs:highScores.blocks},
-        {id:'wordle' as const,name:'Lexicon',desc:'Guess topic-related words in 6 tries. Quick quiz after each round!',emoji:'🔤',gradient:['#10B981','#059669'] as [string,string],hs:highScores.wordle},
+        {id:'bubble' as const,name:'Concept Clash',desc:'Launch colored orbs to match and clear clusters. AI quizzes you mid-game — miss one and it\'s over!',emoji:'💥',gradient:['#6366F1','#8B5CF6'] as [string,string],hs:highScores.bubble},
+        {id:'blocks' as const,name:'Grid Master',desc:'Place shapes on the board to complete rows and columns. Stay sharp — AI questions keep you on your toes!',emoji:'⬛',gradient:['#EC4899','#F43F5E'] as [string,string],hs:highScores.blocks},
+        {id:'wordle' as const,name:'Word Lab',desc:'Decode topic-related words in 6 attempts using color-coded clues. Quick quiz after each solve!',emoji:'🧪',gradient:['#10B981','#059669'] as [string,string],hs:highScores.wordle},
+        {id:'slider' as const,name:'Number Fusion',desc:'Slide and fuse matching tiles to build higher numbers. AI challenges you every few moves!',emoji:'🔢',gradient:['#F59E0B','#D97706'] as [string,string],hs:highScores.slider},
       ].map(g=>(
         <TouchableOpacity key={g.id} style={{marginBottom:14,borderRadius:16,overflow:'hidden'}} onPress={()=>{
           resetAll(); setLastGame(g.id);
           if(g.id==='bubble') resetBubblePop();
           else if(g.id==='blocks') resetBlockBlast();
           else if(g.id==='wordle'){resetWordle();startWordle();}
+          else if(g.id==='slider') resetSlider();
           setStep(g.id);
         }}>
           <LinearGradient colors={g.gradient} start={{x:0,y:0}} end={{x:1,y:1}} style={{padding:20,flexDirection:'row',alignItems:'center',gap:16}}>
@@ -7415,7 +8901,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   );
 
   // ══════════════════════════════════════
-  // ── SCREEN: Pop Scholar (Bubble Pop) ──
+  // ── SCREEN: Concept Clash ──
   // ══════════════════════════════════════
   if(step==='bubble') {
     const boardWidth = BP_BUBBLE_D * BP_COLS;
@@ -7443,7 +8929,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     } : {};
     return (
       <View style={[st.screen,{backgroundColor:theme.background}]}>
-        <GameHeader title="Pop Scholar" sub={selTopic?.title} score={bpScore}/>
+        <GameHeader title="Concept Clash" sub={selTopic?.title} score={bpScore}/>
         {/* Shots left */}
         <View style={{flexDirection:'row',justifyContent:'center',gap:20,paddingBottom:4}}>
           <Text style={{color:'#94A3B8',fontSize:12}}>Shots: <Text style={{color:bpShots<=5?'#EF4444':theme.text,fontWeight:'700'}}>{bpShots}</Text></Text>
@@ -7462,7 +8948,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           {bpGrid.map((row,ri)=>(
             <View key={ri} style={{flexDirection:'row',position:'absolute',top:ri*BP_ROW_H+8,left:boardLeft+(ri%2===0?0:BP_BUBBLE_R)}}>
               {row.map((cell,ci)=>cell>0?(
-                <View key={ci} style={{width:BP_BUBBLE_D,height:BP_BUBBLE_D,borderRadius:BP_BUBBLE_R,backgroundColor:BP_COLORS[(cell-1)%6],alignItems:'center',justifyContent:'center',borderWidth:2,borderColor:'rgba(255,255,255,0.25)'}}>
+                <View key={ci} style={{width:BP_BUBBLE_D,height:BP_BUBBLE_D,borderRadius:BP_BUBBLE_R,backgroundColor:BP_COLORS[(cell-1)%6],alignItems:'center',justifyContent:'center',borderWidth:1.5,borderColor:'rgba(255,255,255,0.35)'}}>
                   <View style={{width:BP_BUBBLE_R*0.7,height:BP_BUBBLE_R*0.5,borderRadius:BP_BUBBLE_R,backgroundColor:'rgba(255,255,255,0.35)',position:'absolute',top:4,left:6}}/>
                 </View>
               ):(
@@ -7499,7 +8985,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
               <TouchableOpacity onPress={()=>resetBubblePop(bpLevel+1)} style={{backgroundColor:theme.primary,paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:'white',fontWeight:'700'}}>Next Level</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={()=>{saveHighScore('bubble',bpScore);setStep('results');}} style={{backgroundColor:'rgba(255,255,255,0.1)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
+              <TouchableOpacity onPress={()=>{saveHighScore('bubble',bpScore);setStep('results');}} style={{backgroundColor:'rgba(128,128,128,0.18)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:theme.text,fontWeight:'600'}}>Results</Text>
               </TouchableOpacity>
             </View>
@@ -7516,7 +9002,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
               <TouchableOpacity onPress={()=>resetBubblePop(bpLevel)} style={{backgroundColor:theme.primary,paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:'white',fontWeight:'700'}}>Retry</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={()=>{setStep('results');}} style={{backgroundColor:'rgba(255,255,255,0.1)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
+              <TouchableOpacity onPress={()=>{setStep('results');}} style={{backgroundColor:'rgba(128,128,128,0.18)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:theme.text,fontWeight:'600'}}>Results</Text>
               </TouchableOpacity>
             </View>
@@ -7529,7 +9015,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   }
 
   // ══════════════════════════════════════
-  // ── SCREEN: Brain Blocks (Block Blast) ──
+  // ── SCREEN: Grid Master ──
   // ══════════════════════════════════════
   if(step==='blocks') {
     const activeDragPiece = bbDragIdx>=0 ? bbPieces[bbDragIdx] : null;
@@ -7545,11 +9031,11 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
         onTouchEnd={bbHandleTouchEnd}
         onTouchCancel={bbHandleTouchEnd}
         {...blockWebHandlers}>
-        <GameHeader title="Brain Blocks" sub={selTopic?.title} score={bbScore}/>
+        <GameHeader title="Grid Master" sub={selTopic?.title} score={bbScore}/>
         {bbCombo>0&&<Text style={{color:'#EC4899',fontSize:13,fontWeight:'700',textAlign:'center'}}>🔥 Combo x{bbCombo}</Text>}
         {/* Grid */}
-        <View ref={bbGridRef} style={{alignItems:'center',paddingTop:8}} onLayout={bbMeasureGrid}>
-          <View style={{borderWidth:1,borderColor:'rgba(255,255,255,0.08)',borderRadius:12,overflow:'hidden',padding:2,backgroundColor:'rgba(0,0,0,0.3)'}}>
+        <View style={{alignItems:'center',paddingTop:8}}>
+          <View ref={bbGridRef} onLayout={bbMeasureGrid} style={{borderWidth:2,borderColor:_isLightTheme(theme.background)?'rgba(0,0,0,0.15)':'rgba(255,255,255,0.1)',borderRadius:12,overflow:'hidden',padding:2,backgroundColor:_isLightTheme(theme.background)?'rgba(0,0,0,0.06)':'rgba(0,0,0,0.3)'}}>
             {bbGrid.map((row,ri)=>(
               <View key={ri} style={{flexDirection:'row'}}>
                 {row.map((cell,ci)=>{
@@ -7561,13 +9047,14 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                     return false;
                   })();
                   const canPlace = isPrev&&bbDragIdx>=0&&bbPieces[bbDragIdx]&&bbPreview?canPlaceBB(bbGrid,bbPieces[bbDragIdx].shape,bbPreview.row,bbPreview.col):false;
+                  const _lt = _isLightTheme(theme.background);
                   return (
                     <View key={ci} style={{
-                      width:BB_CELL,height:BB_CELL,borderWidth:0.5,borderColor:'rgba(255,255,255,0.06)',
-                      backgroundColor:cell>0?(BB_COLORS[cell]||'#6366F1'):isPrev?(canPlace?'rgba(99,102,241,0.35)':'rgba(239,68,68,0.25)'):'rgba(255,255,255,0.02)',
+                      width:BB_CELL,height:BB_CELL,borderWidth:1,borderColor:_lt?'rgba(0,0,0,0.12)':'rgba(255,255,255,0.08)',
+                      backgroundColor:cell>0?(BB_COLORS[cell]||'#6366F1'):isPrev?(canPlace?'rgba(99,102,241,0.35)':'rgba(239,68,68,0.25)'):(_lt?'rgba(255,255,255,0.5)':'rgba(255,255,255,0.03)'),
                       borderRadius:3,margin:0.5,
                     }}>
-                      {cell>0&&<View style={{flex:1,borderRadius:3,borderWidth:1,borderColor:'rgba(255,255,255,0.15)'}}/>}
+                      {cell>0&&<View style={{flex:1,borderRadius:3,borderWidth:1,borderColor:'rgba(255,255,255,0.3)'}}/>}
                     </View>
                   );
                 })}
@@ -7591,8 +9078,8 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                 {...(Platform.OS==='web' ? {onMouseDown:(e:any)=>bbStartDrag(pi,e)} as any : {})}
                 style={{
                   padding:8,borderRadius:12,
-                  borderWidth:2,borderColor:pi===bbDragIdx&&bbTouchActive.current?theme.primary:'rgba(255,255,255,0.08)',
-                  backgroundColor:pi===bbDragIdx&&bbTouchActive.current?'rgba(99,102,241,0.15)':'rgba(255,255,255,0.03)',
+                  borderWidth:2,borderColor:pi===bbDragIdx&&bbTouchActive.current?theme.primary:'rgba(128,128,128,0.15)',
+                  backgroundColor:pi===bbDragIdx&&bbTouchActive.current?'rgba(99,102,241,0.15)':'rgba(128,128,128,0.07)',
                   opacity:bbDragPos&&pi===bbDragIdx?0.4:1,
                 }}>
                 {(piece.shape||[]).map((row,ri)=>(
@@ -7601,7 +9088,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                       <View key={ci} style={{
                         width:22,height:22,margin:1,borderRadius:3,
                         backgroundColor:cell===1?(BB_COLORS[piece.color]||'#6366F1'):'transparent',
-                        borderWidth:cell===1?1:0,borderColor:'rgba(255,255,255,0.2)',
+                        borderWidth:cell===1?1:0,borderColor:'rgba(128,128,128,0.3)',
                       }}/>
                     ))}
                   </View>
@@ -7637,7 +9124,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
               <TouchableOpacity onPress={resetBlockBlast} style={{backgroundColor:theme.primary,paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:'white',fontWeight:'700'}}>Play Again</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={()=>setStep('results')} style={{backgroundColor:'rgba(255,255,255,0.1)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
+              <TouchableOpacity onPress={()=>setStep('results')} style={{backgroundColor:'rgba(128,128,128,0.18)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
                 <Text style={{color:theme.text,fontWeight:'600'}}>Results</Text>
               </TouchableOpacity>
             </View>
@@ -7650,7 +9137,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   }
 
   // ══════════════════════════════════════
-  // ── SCREEN: Lexicon (Wordle) ──
+  // ── SCREEN: Word Lab ──
   // ══════════════════════════════════════
   if(step==='wordle') {
     const tLen = wordleTarget.length||5;
@@ -7677,7 +9164,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
               <Text style={{color:theme.primary,fontSize:11,fontWeight:'700',letterSpacing:1,marginBottom:10}}>ROUND {wordleRound+1} OF {wordleWords.length}</Text>
               <Text style={{color:theme.text,fontSize:18,fontWeight:'600',marginBottom:20,lineHeight:26}}>{safeStr(wordleQuizQ.question)}</Text>
               {(wordleQuizQ.options||[]).map((o,i)=>(
-                <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(255,255,255,0.12)',marginBottom:8,backgroundColor:'rgba(255,255,255,0.03)'}} onPress={()=>{
+                <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
                   const ok=o===wordleQuizQ.answer;
                   setQAnswered(a=>a+1);
                   if(ok){setQCorrect(c=>c+1);setGameScore(s=>s+30);updateProgress(true,wordleWords[wordleRound]?.conceptId);}
@@ -7698,7 +9185,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
 
     return (
       <View style={[st.screen,{backgroundColor:theme.background}]}>
-        <GameHeader title="Lexicon" sub={`Round ${wordleRound+1}/${wordleWords.length}`} score={`${gameScore}pts`}/>
+        <GameHeader title="Word Lab" sub={`Round ${wordleRound+1}/${wordleWords.length}`} score={`${gameScore}pts`}/>
         {/* Hint */}
         <View style={{paddingHorizontal:20,paddingVertical:6}}>
           <View style={{backgroundColor:'rgba(99,102,241,0.1)',padding:12,borderRadius:12}}>
@@ -7720,8 +9207,8 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                   return (
                     <View key={ci} style={{
                       width:cellW,height:cellW,borderRadius:8,borderWidth:2,
-                      borderColor:s?wlColor(s):(isCur&&ci===cur.length?theme.primary:'rgba(255,255,255,0.15)'),
-                      backgroundColor:s?wlColor(s)+'20':'rgba(255,255,255,0.03)',
+                      borderColor:s?wlColor(s):(isCur&&ci===cur.length?theme.primary:'rgba(128,128,128,0.25)'),
+                      backgroundColor:s?wlColor(s)+'20':'rgba(128,128,128,0.07)',
                       alignItems:'center',justifyContent:'center',
                     }}>
                       <Text style={{color:s?'white':theme.text,fontSize:20,fontWeight:'700'}}>{letter}</Text>
@@ -7755,7 +9242,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                       paddingVertical:14,paddingHorizontal:isSp?12:0,
                       width:isSp?undefined:Math.floor((SW-60)/10),
                       borderRadius:8,alignItems:'center',justifyContent:'center',
-                      backgroundColor:kc==='correct'?'#10B981':kc==='present'?'#F59E0B':kc==='absent'?'#1E293B':'rgba(255,255,255,0.08)',
+                      backgroundColor:kc==='correct'?'#2563EB':kc==='present'?'#D97706':kc==='absent'?'#1E293B':'rgba(128,128,128,0.15)',
                     }}>
                       <Text style={{color:'white',fontSize:isSp?12:16,fontWeight:'600'}}>{key}</Text>
                     </TouchableOpacity>
@@ -7770,12 +9257,122 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
   }
 
   // ══════════════════════════════════════
+  // ── SCREEN: Number Fusion (2048-style) ──
+  // ══════════════════════════════════════
+  if(step==='slider') {
+    const slCellGap = 6;
+    const slBoardPad = 8;
+    const slCellSize = Math.floor((GAME_PLAYFIELD_WIDTH - slBoardPad * 2 - slCellGap * (SL_SIZE + 1)) / SL_SIZE);
+    const slBoardSize = slCellSize * SL_SIZE + slCellGap * (SL_SIZE + 1) + slBoardPad * 2;
+    return (
+      <View style={[st.screen,{backgroundColor:theme.background}]}>
+        <GameHeader title="Number Fusion" sub={selTopic?.title} score={slScore}/>
+        <View style={{flex:1,alignItems:'center',justifyContent:'center',paddingHorizontal:16}}>
+          {/* Game Board */}
+          <View
+            style={{width:slBoardSize,height:slBoardSize,backgroundColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.1)':'rgba(99,102,241,0.08)',borderRadius:14,padding:slBoardPad,borderWidth:1,borderColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.25)':'rgba(99,102,241,0.15)'}}
+            onStartShouldSetResponder={()=>true}
+            onMoveShouldSetResponder={()=>true}
+            onResponderGrant={(e)=>{
+              slTouchStart.current={x:e.nativeEvent.pageX,y:e.nativeEvent.pageY};
+              slMoving.current=false;
+            }}
+            onResponderMove={(e)=>{
+              if(!slTouchStart.current||slMoving.current) return;
+              const dx=e.nativeEvent.pageX-slTouchStart.current.x;
+              const dy=e.nativeEvent.pageY-slTouchStart.current.y;
+              const threshold=30;
+              if(Math.abs(dx)<threshold&&Math.abs(dy)<threshold) return;
+              slMoving.current=true;
+              if(Math.abs(dx)>Math.abs(dy)){
+                slMove(dx>0?'right':'left');
+              } else {
+                slMove(dy>0?'down':'up');
+              }
+            }}
+            onResponderRelease={()=>{slTouchStart.current=null;slMoving.current=false;}}
+          >
+            {slGrid.map((row,r)=>(
+              <View key={r} style={{flexDirection:'row',marginTop:r===0?slCellGap:0}}>
+                {row.map((val,c)=>{
+                  const colors = SL_COLORS[val]||SL_COLORS[2048]||{bg:'#6D28D9',text:'#FFFFFF'};
+                  const _lt = _isLightTheme(theme.background);
+                  const emptyBg = _lt ? 'rgba(99,102,241,0.06)' : 'rgba(255,255,255,0.04)';
+                  const emptyBorder = _lt ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.08)';
+                  return (
+                    <View key={c} style={{width:slCellSize,height:slCellSize,marginLeft:slCellGap,marginBottom:slCellGap,borderRadius:10,backgroundColor:val>0?colors.bg:emptyBg,alignItems:'center',justifyContent:'center',borderWidth:1,borderColor:val>0?(_lt?'rgba(0,0,0,0.08)':'rgba(255,255,255,0.1)'):emptyBorder}}>
+                      {val>0&&<Text style={{color:colors.text,fontSize:val>=1024?18:val>=128?22:28,fontWeight:'800'}}>{val}</Text>}
+                    </View>
+                  );
+                })}
+              </View>
+            ))}
+          </View>
+
+          {/* Swipe hint */}
+          <Text style={{color:'#64748B',fontSize:12,marginTop:12}}>Swipe or use arrow keys to slide tiles • Combine matching numbers</Text>
+
+          {slWon&&!slGameOver&&(
+            <View style={{marginTop:16,padding:14,backgroundColor:'rgba(245,158,11,0.15)',borderRadius:12,alignItems:'center'}}>
+              <Text style={{color:'#F59E0B',fontSize:18,fontWeight:'700'}}>🎉 You reached 2048!</Text>
+              <Text style={{color:'#94A3B8',fontSize:13,marginTop:4}}>Keep going for a higher score!</Text>
+            </View>
+          )}
+
+          {slGameOver&&(
+            <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:'rgba(0,0,0,0.8)',justifyContent:'center',alignItems:'center',zIndex:90}}>
+              <Text style={{fontSize:48,marginBottom:12}}>🔢</Text>
+              <Text style={{color:'#EF4444',fontSize:28,fontWeight:'800'}}>No Moves Left!</Text>
+              <Text style={{color:'#94A3B8',fontSize:18,marginTop:4}}>Score: {slScore}</Text>
+              {isNewHigh&&<Text style={{color:'#F59E0B',fontSize:18,fontWeight:'700',marginTop:8}}>🏆 NEW HIGH SCORE!</Text>}
+              <View style={{flexDirection:'row',gap:12,marginTop:24}}>
+                <TouchableOpacity onPress={resetSlider} style={{backgroundColor:theme.primary,paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
+                  <Text style={{color:'white',fontWeight:'700'}}>Play Again</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={()=>setStep('results')} style={{backgroundColor:'rgba(128,128,128,0.18)',paddingVertical:12,paddingHorizontal:28,borderRadius:14}}>
+                  <Text style={{color:theme.text,fontWeight:'700'}}>Results</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+        </View>
+
+        {/* Question overlay */}
+        {showQ&&gameQ&&(
+          <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:'rgba(0,0,0,0.92)',justifyContent:'center',padding:24,zIndex:100}}>
+            {gameQ.teachText&&<Text style={{color:'#A78BFA',fontSize:12,fontWeight:'600',marginBottom:12,textAlign:'center'}}>{gameQ.teachText}</Text>}
+            <Text style={{color:'white',fontSize:18,fontWeight:'600',textAlign:'center',lineHeight:26,marginBottom:20}}>{gameQ.question}</Text>
+            {(gameQ.options||[]).map((o,i)=>(
+              <TouchableOpacity key={i} style={{backgroundColor:'rgba(128,128,128,0.15)',padding:14,borderRadius:12,marginBottom:10}} onPress={()=>{
+                const correct=safeStr(o).trim().toLowerCase()===safeStr(gameQ.answer).trim().toLowerCase();
+                setQAnswered(a=>a+1);
+                if(correct){
+                  setQCorrect(c=>c+1); setXpEarned(x=>x+5); updateProgress(true,gameQ.conceptId);
+                  setShowQ(false); setPaused(false);
+                } else {
+                  // Wrong answer ends the game
+                  setSlGameOver(true);
+                  saveHighScore('slider',slScore);
+                  setShowQ(false); setPaused(false);
+                  setStep('results');
+                }
+              }}>
+                <Text style={{color:'white',fontSize:15,textAlign:'center'}}>{o}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+      </View>
+    );
+  }
+
+  // ══════════════════════════════════════
   // ── SCREEN: Results ──
   // ══════════════════════════════════════
   if(step==='results') {
     const accuracy = qAnswered>0?Math.round((qCorrect/qAnswered)*100):0;
-    const gameName = lastGame==='bubble'?'Pop Scholar':lastGame==='blocks'?'Brain Blocks':'Lexicon';
-    const finalScore = lastGame==='bubble'?bpScore:lastGame==='blocks'?bbScore:gameScore;
+    const gameName = lastGame==='bubble'?'Concept Clash':lastGame==='blocks'?'Grid Master':lastGame==='slider'?'Number Fusion':'Word Lab';
+    const finalScore = lastGame==='bubble'?bpScore:lastGame==='blocks'?bbScore:lastGame==='slider'?slScore:gameScore;
     return (
       <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={[st.screenC,{alignItems:'center'}]}>
         {isNewHigh?(
@@ -7837,7 +9434,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           <View style={[st.card,{backgroundColor:theme.card,width:'100%'}]}>
             <Text style={{color:theme.text,fontSize:15,fontWeight:'600',marginBottom:12}}>Word Results</Text>
             {wordleRoundScores.map((rs,i)=>(
-              <View key={i} style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:8,borderBottomWidth:i<wordleRoundScores.length-1?1:0,borderColor:'rgba(255,255,255,0.06)'}}>
+              <View key={i} style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:8,borderBottomWidth:i<wordleRoundScores.length-1?1:0,borderColor:'rgba(128,128,128,0.12)'}}>
                 <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>{rs.word}</Text>
                 <View style={{flexDirection:'row',gap:8}}>
                   <Text style={{color:rs.won?'#10B981':'#EF4444',fontSize:12}}>{rs.won?`${rs.guesses}/6`:'Missed'}</Text>
@@ -9749,6 +11346,27 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
             <Text style={{color:'white',fontSize:18,fontWeight:'700'}}>Start Call</Text>
           </LinearGradient>
         </TouchableOpacity>
+
+        {/* Conversation Ideas */}
+        <View style={{marginTop:28,width:'100%',maxWidth:400}}>
+          <View style={{flexDirection:'row',alignItems:'center',marginBottom:10}}>
+            <Text style={{fontSize:16}}>💡</Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginLeft:6,letterSpacing:0.5}}>WHAT TO TALK ABOUT</Text>
+          </View>
+          {[
+            {icon:'🧠',text:'"Quiz me on every concept I need to know"',desc:'Auto will test you one by one and explain what you miss'},
+            {icon:'📖',text:'"Teach me each concept using a story"',desc:'Learn through analogies and narratives — like 48 Laws of Power'},
+            {icon:'🎯',text:'"Walk me through my weakest areas step by step"',desc:'Auto focuses on concepts you haven\'t mastered yet'},
+          ].map((idea,i)=>(
+            <View key={i} style={{flexDirection:'row',paddingVertical:10,paddingHorizontal:14,backgroundColor:'rgba(128,128,128,0.08)',borderRadius:12,marginBottom:8,borderWidth:1,borderColor:'rgba(128,128,128,0.12)'}}>
+              <Text style={{fontSize:18,marginRight:10,marginTop:2}}>{idea.icon}</Text>
+              <View style={{flex:1}}>
+                <Text style={{color:'#E2E8F0',fontSize:13,fontWeight:'600',lineHeight:18}}>{idea.text}</Text>
+                <Text style={{color:'#64748B',fontSize:11,marginTop:2,lineHeight:16}}>{idea.desc}</Text>
+              </View>
+            </View>
+          ))}
+        </View>
       </View>
     </View>
   );
@@ -9833,7 +11451,7 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
             onResponderGrant={(e)=>{const w=SW-88-32;const x=Math.max(0,Math.min(e.nativeEvent.locationX,w));setVolume(Math.max(0.05,Math.min(1,x/w)));}}
             onResponderMove={(e)=>{const w=SW-88-32;const x=Math.max(0,Math.min(e.nativeEvent.locationX,w));setVolume(Math.max(0.05,Math.min(1,x/w)));}}
           >
-            <View style={{height:3,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:2}}>
+            <View style={{height:3,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:2}}>
               <LinearGradient colors={['#06B6D4','#10B981']} start={{x:0,y:0}} end={{x:1,y:0}} style={{height:'100%',borderRadius:2,width:`${volume*100}%`}}/>
             </View>
             <View style={{position:'absolute',left:`${volume*100}%`,marginLeft:-7,top:7,width:14,height:14,borderRadius:7,backgroundColor:'#10B981',borderWidth:2,borderColor:'#0A0E17',shadowColor:'#10B981',shadowOffset:{width:0,height:0},shadowOpacity:0.6,shadowRadius:6}}/>
@@ -9903,7 +11521,7 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
 };
 
 // ========== FRIENDS SCREEN ==========
-const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) => {
+const FriendsScreen = ({profile,onUpdateProfile,theme}:{profile:UserProfile;onUpdateProfile:(u:Partial<UserProfile>)=>void;theme:ThemeColors}) => {
   const [friends,setFriends] = useState<Friend[]>([]);
   const [orgs,setOrgs] = useState<Organization[]>([]);
   const [challenges,setChallenges] = useState<FriendChallenge[]>([]);
@@ -9915,6 +11533,18 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
   const [newOrg,setNewOrg] = useState('');
   const [newOrgDesc,setNewOrgDesc] = useState('');
   const [showCreate,setShowCreate] = useState(false);
+  // Challenge creation modal state
+  const [showChallengeModal,setShowChallengeModal] = useState(false);
+  const [challengeTarget,setChallengeTarget] = useState<Friend|null>(null);
+  const [challengeType,setChallengeType] = useState<'sprint'|'consistency'|'deep'|'custom'>('sprint');
+  const [customXP,setCustomXP] = useState('200');
+  const [customDays,setCustomDays] = useState('5');
+  // Org detail modal
+  // Friend profile modal
+  const [viewingFriend,setViewingFriend] = useState<Friend|null>(null);
+  const [pendingRequests, setPendingRequests] = useState<{id:string;from_user_id:string;username:string;level:number;total_points:number}[]>([]);
+  const [notifications, setNotifications] = useState<{id:string;type:string;message:string;from_username?:string;read:boolean;created_at:string}[]>([]);
+  const [joinCodeInput, setJoinCodeInput] = useState('');
   const tabOptions = ['friends','orgs','challenges'] as const;
   type SocialTab = typeof tabOptions[number];
   const activeTab = (tabOptions as readonly string[]).includes(tab) ? (tab as SocialTab) : 'friends';
@@ -9926,54 +11556,33 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
     return Math.abs(h);
   },[]);
 
-  const seededStudyTopic = useCallback((seed:string):string=>{
-    const topics = [
-      'Strategic Management',
-      'Biology',
-      'Statistics',
-      'Data Analysis',
-      'Economics',
-      'Chemistry',
-      'World History',
-      'Programming',
-      'Psychology',
-      'Accounting',
-    ];
-    return topics[hashSeed(seed)%topics.length];
-  },[hashSeed]);
-
-  const seededPresence = useCallback((seed:string):FriendPresence=>{
-    const n = hashSeed(seed)%100;
-    if(n<30) return 'online';
-    if(n<62) return 'away';
-    return 'offline';
-  },[hashSeed]);
+  // No fake/seeded data — friends are real users added by username
 
   const normalizeFriend = useCallback((raw:any):Friend=>{
     const usernameRaw = safeStr(raw?.username||'').replace(/\s+/g,' ').trim();
-    const username = usernameRaw || `Learner${hashSeed(JSON.stringify(raw)).toString().slice(0,3)}`;
+    const username = usernameRaw || 'Unknown';
     const levelRaw = Number(raw?.level);
-    const level = Number.isFinite(levelRaw) ? Math.max(1, Math.min(50, Math.round(levelRaw))) : Math.max(1, (hashSeed(username)%9)+1);
+    const level = Number.isFinite(levelRaw) ? Math.max(1, Math.round(levelRaw)) : 1;
     const pointsRaw = Number(raw?.points);
-    const points = Number.isFinite(pointsRaw) ? Math.max(0, Math.round(pointsRaw)) : Math.max(120, (level*420) + (hashSeed(`${username}_xp`)%650));
+    const points = Number.isFinite(pointsRaw) ? Math.max(0, Math.round(pointsRaw)) : 0;
     const streakRaw = Number(raw?.streak);
-    const streak = Number.isFinite(streakRaw) ? Math.max(0, Math.round(streakRaw)) : Math.max(1, (hashSeed(`${username}_streak`)%21));
+    const streak = Number.isFinite(streakRaw) ? Math.max(0, Math.round(streakRaw)) : 0;
     const status:FriendPresence = raw?.status==='online' || raw?.status==='away' || raw?.status==='offline'
       ? raw.status
-      : seededPresence(username);
-    const lastActive = safeStr(raw?.lastActive||'').trim() || new Date(Date.now() - ((hashSeed(`${username}_active`)%72) * 3600000)).toISOString();
+      : 'offline';
+    const lastActive = safeStr(raw?.lastActive||'').trim() || new Date().toISOString();
     return {
       id: safeStr(raw?.id||'').trim() || `f_${Date.now()}_${hashSeed(username)%1000}`,
       username,
       level,
       points,
       streak,
-      studying: safeStr(raw?.studying||'').trim() || seededStudyTopic(username),
+      studying: safeStr(raw?.studying||'').trim() || '',
       showStudying: raw?.showStudying!==false,
       status,
       lastActive,
     };
-  },[hashSeed,seededPresence,seededStudyTopic]);
+  },[hashSeed]);
 
   const normalizeOrgMember = useCallback((raw:any):OrganizationMember=>{
     const username = safeStr(raw?.username||'').replace(/\s+/g,' ').trim();
@@ -9998,6 +11607,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
       createdAt: safeStr(raw?.createdAt||'').trim() || new Date().toISOString(),
       joinCode: safeStr(raw?.joinCode||'').replace(/[^A-Z0-9]/gi,'').toUpperCase(),
       members,
+      perks: Array.isArray(raw?.perks) ? raw.perks : DEFAULT_ORG_PERKS,
     };
   },[hashSeed,normalizeOrgMember]);
 
@@ -10054,44 +11664,46 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
   useEffect(()=>{
     let active = true;
     (async()=>{
-      const loadedFriends = await Store.load<any[]>(SK.FRIENDS,[]);
-      const normalizedFriends = (Array.isArray(loadedFriends) ? loadedFriends : [])
-        .map(normalizeFriend)
-        .filter((f,idx,arr)=>arr.findIndex(x=>x.username.toLowerCase()===f.username.toLowerCase())===idx);
-      const fallbackOrgs:Organization[] = [
-        {
-          id:'o1',
-          name:'Study Squad',
-          description:'Daily focused sessions and weekly accountability.',
-          createdBy:'Alex',
-          createdAt:new Date(Date.now()-86400000*30).toISOString(),
-          joinCode:'SQUAD742',
-          members:[{username:'Alex',level:5,points:2500,joinedAt:new Date(Date.now()-86400000*22).toISOString()},{username:'Jordan',level:3,points:1200,joinedAt:new Date(Date.now()-86400000*10).toISOString()}],
-        },
-        {
-          id:'o2',
-          name:'Science Club',
-          description:'Collaborative prep for science-heavy courses.',
-          createdBy:'Taylor',
-          createdAt:new Date(Date.now()-86400000*18).toISOString(),
-          joinCode:'SCIEN613',
-          members:[{username:'Taylor',level:8,points:4200,joinedAt:new Date(Date.now()-86400000*12).toISOString()},{username:'Morgan',level:6,points:3100,joinedAt:new Date(Date.now()-86400000*9).toISOString()}],
-        },
-      ];
-      const loadedOrgs = await Store.load<any[]>(SK.ORGS,fallbackOrgs);
-      const normalizedOrgs = (Array.isArray(loadedOrgs) ? loadedOrgs : fallbackOrgs)
-        .map(normalizeOrg)
-        .filter((o,idx,arr)=>o.name && arr.findIndex(x=>x.name.toLowerCase()===o.name.toLowerCase())===idx);
-
-      const loadedChallenges = await Store.load<any[]>(SK.FRIEND_CHALLENGES,[]);
-      const normalizedChallenges = (Array.isArray(loadedChallenges) ? loadedChallenges : [])
-        .map(normalizeChallenge)
-        .filter((c): c is FriendChallenge => !!c);
-
-      if(!active) return;
-      setFriends(normalizedFriends);
-      setOrgs(normalizedOrgs);
-      setChallenges(normalizedChallenges);
+      if(supabase && _supabaseUserId && _supabaseConfigured()) {
+        // Load real data from Supabase
+        const [cloudFriends, cloudOrgs, cloudChallenges] = await Promise.all([
+          SocialDB.getFriends(),
+          SocialDB.getOrganizations(),
+          SocialDB.getChallenges(),
+        ]);
+        if(!active) return;
+        setFriends(cloudFriends);
+        setOrgs(cloudOrgs);
+        setChallenges(cloudChallenges);
+        // Also load pending requests and notifications
+        const [pendingReqs, notifs] = await Promise.all([
+          SocialDB.getPendingRequests(),
+          SocialDB.getNotifications(),
+        ]);
+        if(!active) return;
+        setPendingRequests(pendingReqs);
+        setNotifications(notifs);
+        // Mark notifications as read after loading
+        SocialDB.markNotificationsRead().catch(()=>{});
+      } else {
+        // Fallback: load from local storage (offline/unconfigured mode)
+        const loadedFriends = await Store.load<any[]>(SK.FRIENDS,[]);
+        const normalizedFriends = (Array.isArray(loadedFriends) ? loadedFriends : [])
+          .map(normalizeFriend)
+          .filter((f,idx,arr)=>arr.findIndex(x=>x.username.toLowerCase()===f.username.toLowerCase())===idx);
+        const loadedOrgs = await Store.load<any[]>(SK.ORGS,[]);
+        const normalizedOrgs = (Array.isArray(loadedOrgs) ? loadedOrgs : [])
+          .map(normalizeOrg)
+          .filter((o,idx,arr)=>o.name && arr.findIndex(x=>x.name.toLowerCase()===o.name.toLowerCase())===idx);
+        const loadedChallenges = await Store.load<any[]>(SK.FRIEND_CHALLENGES,[]);
+        const normalizedChallenges = (Array.isArray(loadedChallenges) ? loadedChallenges : [])
+          .map(normalizeChallenge)
+          .filter((c): c is FriendChallenge => !!c);
+        if(!active) return;
+        setFriends(normalizedFriends);
+        setOrgs(normalizedOrgs);
+        setChallenges(normalizedChallenges);
+      }
     })();
     return ()=>{ active = false; };
   },[normalizeFriend,normalizeOrg,normalizeChallenge]);
@@ -10185,7 +11797,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
     });
   },[challenges]);
 
-  const addFriend = () => {
+  const addFriend = async () => {
     const cleanedInput = safeStr(search||'').trim();
     const username = cleanedInput.replace(/[^A-Za-z0-9_.-]/g,'');
     if(username.length<3) {
@@ -10197,82 +11809,123 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
       return;
     }
     if(friends.some(f=>f.username.toLowerCase()===username.toLowerCase())) {
-      Alert.alert('Already Added',`${username} is already in your friends list.`);
+      Alert.alert('Already Friends',`${username} is already in your friends list.`);
       return;
     }
-    const seed = `${username}_${Date.now()}`;
-    const level = Math.max(1, Math.min(50, Math.round((profile.level*0.65)+((hashSeed(seed)%8)-2))));
-    const points = Math.max(100, (level*420) + (hashSeed(`${seed}_xp`)%640));
-    const nf:Friend = {
-      id:`f_${Date.now()}`,
-      username,
-      level,
-      points,
-      streak:Math.max(1, (hashSeed(`${seed}_streak`)%21)),
-      studying:seededStudyTopic(seed),
-      showStudying:true,
-      status:seededPresence(seed),
-      lastActive:new Date(Date.now() - ((hashSeed(`${seed}_active`)%36) * 3600000)).toISOString(),
-    };
-    persistFriends([nf,...friends]);
-    setSearch('');
-    Alert.alert('Friend Added!',`${nf.username} is now in your network.`);
+    if(supabase && _supabaseUserId && _supabaseConfigured()) {
+      // Real: look up user in Supabase and send friend request
+      const user = await SocialDB.findUser(username);
+      if(!user) {
+        Alert.alert('User Not Found',`No user named "${username}" was found. Make sure they have an account on Auto Learn.`);
+        return;
+      }
+      const result = await SocialDB.sendFriendRequest(user.user_id);
+      if(result.success) {
+        setSearch('');
+        Alert.alert('Friend Request Sent',`A friend request has been sent to ${username}. They'll appear in your list once they accept.`);
+      } else {
+        Alert.alert('Could Not Send Request', result.error || 'Please try again.');
+      }
+    } else {
+      // Offline fallback: add locally
+      const nf:Friend = {
+        id:`f_${Date.now()}`,
+        username,
+        level:1, points:0, streak:0, studying:'',
+        showStudying:true, status:'offline',
+        lastActive:new Date().toISOString(),
+      };
+      persistFriends([nf,...friends]);
+      setSearch('');
+      Alert.alert('Friend Added',`${username} has been added to your friends list.`);
+    }
   };
 
-  const createOrg = () => {
+  const createOrg = async () => {
     const orgName = safeStr(newOrg||'').replace(/\s+/g,' ').trim();
     const orgDescription = safeStr(newOrgDesc||'').replace(/\s+/g,' ').trim();
     if(orgName.length<3) {
       Alert.alert('Organization Name Too Short','Use at least 3 characters.');
       return;
     }
-    if(orgs.some(o=>o.name.toLowerCase()===orgName.toLowerCase())) {
-      Alert.alert('Name Already Used','Choose a different organization name.');
-      return;
+    const joinCode = `${orgName.replace(/[^A-Za-z0-9]/g,'').toUpperCase().slice(0,4).padEnd(4,'X')}${Math.floor(Math.random()*900+100)}`;
+    if(supabase && _supabaseUserId && _supabaseConfigured()) {
+      const result = await SocialDB.createOrganization(orgName, orgDescription || 'Focused study group for consistent progress.', joinCode);
+      if(result.success) {
+        // Refresh orgs from cloud
+        const cloudOrgs = await SocialDB.getOrganizations();
+        setOrgs(cloudOrgs);
+        setNewOrg('');
+        setNewOrgDesc('');
+        setShowCreate(false);
+        Alert.alert('Organization Created',`${orgName} is ready. Invite friends with code ${joinCode}.`);
+      } else {
+        Alert.alert('Creation Failed', result.error || 'Please try again.');
+      }
+    } else {
+      // Offline fallback
+      const no:Organization = {
+        id:`o_${Date.now()}`,
+        name:orgName,
+        description:orgDescription || 'Focused study group for consistent progress.',
+        createdBy:profile.username,
+        createdAt:new Date().toISOString(),
+        joinCode,
+        members:[{username:profile.username,level:profile.level,points:profile.totalPoints,joinedAt:new Date().toISOString()}],
+        perks:DEFAULT_ORG_PERKS,
+      };
+      persistOrgs([no,...orgs]);
+      setNewOrg('');
+      setNewOrgDesc('');
+      setShowCreate(false);
+      Alert.alert('Organization Created',`${no.name} is ready. Invite friends with code ${no.joinCode}.`);
     }
-    const joinCode = `${orgName.replace(/[^A-Za-z0-9]/g,'').toUpperCase().slice(0,4).padEnd(4,'X')}${(hashSeed(`${orgName}_${Date.now()}`)%900)+100}`;
-    const no:Organization = {
-      id:`o_${Date.now()}`,
-      name:orgName,
-      description:orgDescription || 'Focused study group for consistent progress.',
-      createdBy:profile.username,
-      createdAt:new Date().toISOString(),
-      joinCode,
-      members:[{username:profile.username,level:profile.level,points:profile.totalPoints,joinedAt:new Date().toISOString()}],
-    };
-    persistOrgs([no,...orgs]);
-    setNewOrg('');
-    setNewOrgDesc('');
-    setShowCreate(false);
-    Alert.alert('Organization Created',`${no.name} is ready. Invite friends with code ${no.joinCode}.`);
   };
 
-  const joinOrg = (org:Organization) => {
+  const joinOrg = async (org:Organization) => {
     const already = org.members.some(m=>m.username.toLowerCase()===profile.username.toLowerCase());
     if(already){
       Alert.alert('Already a Member',`You are already in ${org.name}.`);
       return;
     }
-    const updated = orgs.map(o=>{
-      if(o.id!==org.id) return o;
-      return {
-        ...o,
-        members:[...o.members,{username:profile.username,level:profile.level,points:profile.totalPoints,joinedAt:new Date().toISOString()}],
-      };
-    });
-    persistOrgs(updated);
-    Alert.alert('Joined!',`You joined ${org.name}.`);
+    if(supabase && _supabaseUserId && _supabaseConfigured()) {
+      // Join via Supabase using org's join code
+      const result = await SocialDB.joinOrganizationByCode(org.joinCode || '');
+      if(result.success) {
+        const cloudOrgs = await SocialDB.getOrganizations();
+        setOrgs(cloudOrgs);
+        Alert.alert('Joined!',`You joined ${org.name}.`);
+      } else {
+        Alert.alert('Join Failed', result.error || 'Please try again.');
+      }
+    } else {
+      const updated = orgs.map(o=>{
+        if(o.id!==org.id) return o;
+        return {
+          ...o,
+          members:[...o.members,{username:profile.username,level:profile.level,points:profile.totalPoints,joinedAt:new Date().toISOString()}],
+        };
+      });
+      persistOrgs(updated);
+      Alert.alert('Joined!',`You joined ${org.name}.`);
+    }
   };
 
   const leaveOrg = (org:Organization) => {
-    confirmAction('Leave Organization',`Leave ${org.name}?`,()=>{
-      const updated = orgs.flatMap(o=>{
-        if(o.id!==org.id) return [o];
-        const members = o.members.filter(m=>m.username.toLowerCase()!==profile.username.toLowerCase());
-        if(!members.length) return [];
-        return [{...o,members}];
-      });
-      persistOrgs(updated);
+    confirmAction('Leave Organization',`Leave ${org.name}?`,async()=>{
+      if(supabase && _supabaseUserId && _supabaseConfigured()) {
+        await SocialDB.leaveOrganization(org.id);
+        const cloudOrgs = await SocialDB.getOrganizations();
+        setOrgs(cloudOrgs);
+      } else {
+        const updated = orgs.flatMap(o=>{
+          if(o.id!==org.id) return [o];
+          const members = o.members.filter(m=>m.username.toLowerCase()!==profile.username.toLowerCase());
+          if(!members.length) return [];
+          return [{...o,members}];
+        });
+        persistOrgs(updated);
+      }
     });
   };
 
@@ -10285,40 +11938,74 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
     });
   };
 
-  const toggleStudyVisibility = (friend:Friend) => {
-    persistFriends(friends.map(f=>f.id===friend.id?{...f,showStudying:!f.showStudying}:f));
+  const nudgeFriend = async (friend:Friend) => {
+    if(supabase && _supabaseUserId && _supabaseConfigured()) {
+      const sent = await SocialDB.sendNudge(friend.id, friend.username);
+      if(sent) {
+        Alert.alert('Nudge Sent',`A study reminder has been sent to ${friend.username}. They'll see it next time they open Auto Learn.`);
+      } else {
+        Alert.alert('Nudge Failed','Could not send the nudge. Please try again.');
+      }
+    } else {
+      Alert.alert('Not Connected','Social features require an account connected to the cloud.');
+    }
   };
 
-  const nudgeFriend = (friend:Friend) => {
-    Alert.alert('Nudge Sent',`Sent a quick study reminder to ${friend.username}.`);
-  };
-
-  const createChallenge = (friend:Friend) => {
+  const openChallengeModal = (friend:Friend) => {
     if(challenges.some(c=>c.friendId===friend.id && c.status==='active')) {
       Alert.alert('Active Challenge Exists',`You already have an active challenge with ${friend.username}.`);
       return;
     }
-    const templates = [
-      {title:'XP Sprint',target:180,days:4},
-      {title:'Consistency Run',target:250,days:7},
-      {title:'Deep Work Challenge',target:320,days:9},
-    ];
-    const pick = templates[hashSeed(`${friend.username}_${profile.totalPoints}_${Date.now()}`)%templates.length];
-    const deadline = new Date(Date.now() + pick.days*86400000).toISOString();
-    const challenge:FriendChallenge = {
-      id:`ch_${Date.now()}`,
-      friendId:friend.id,
-      friendUsername:friend.username,
-      title:pick.title,
-      description:`Earn ${pick.target} XP before ${new Date(deadline).toLocaleDateString()}.`,
-      targetXP:pick.target,
-      startPoints:profile.totalPoints,
-      createdAt:new Date().toISOString(),
-      deadlineISO:deadline,
-      status:'active',
+    setChallengeTarget(friend);
+    setChallengeType('sprint');
+    setCustomXP('200');
+    setCustomDays('5');
+    setShowChallengeModal(true);
+  };
+
+  const confirmCreateChallenge = async () => {
+    if(!challengeTarget) return;
+    const templates:{[k:string]:{title:string;target:number;days:number}} = {
+      sprint:{title:'XP Sprint',target:180,days:4},
+      consistency:{title:'Consistency Run',target:250,days:7},
+      deep:{title:'Deep Work Challenge',target:400,days:10},
+      custom:{title:'Custom Challenge',target:Math.max(50,parseInt(customXP)||200),days:Math.max(1,parseInt(customDays)||5)},
     };
-    persistChallenges([challenge,...challenges]);
-    Alert.alert('Challenge Started',`${pick.title} started with ${friend.username}.`);
+    const pick = templates[challengeType];
+    const deadline = new Date(Date.now() + pick.days*86400000).toISOString();
+    if(supabase && _supabaseUserId && _supabaseConfigured()) {
+      const result = await SocialDB.createChallenge(
+        challengeTarget.id, challengeTarget.username,
+        pick.title, `Earn ${pick.target} XP in ${pick.days} day${pick.days!==1?'s':''}.`,
+        pick.target, deadline, profile.totalPoints
+      );
+      if(result.success) {
+        const cloudChallenges = await SocialDB.getChallenges();
+        setChallenges(cloudChallenges);
+        setShowChallengeModal(false);
+        setChallengeTarget(null);
+        Alert.alert('Challenge Started!',`${pick.title} with ${challengeTarget.username} — earn ${pick.target} XP in ${pick.days} days!`);
+      } else {
+        Alert.alert('Challenge Failed', result.error || 'Please try again.');
+      }
+    } else {
+      const challenge:FriendChallenge = {
+        id:`ch_${Date.now()}`,
+        friendId:challengeTarget.id,
+        friendUsername:challengeTarget.username,
+        title:pick.title,
+        description:`Earn ${pick.target} XP in ${pick.days} day${pick.days!==1?'s':''}.`,
+        targetXP:pick.target,
+        startPoints:profile.totalPoints,
+        createdAt:new Date().toISOString(),
+        deadlineISO:deadline,
+        status:'active',
+      };
+      persistChallenges([challenge,...challenges]);
+      setShowChallengeModal(false);
+      setChallengeTarget(null);
+      Alert.alert('Challenge Started!',`${pick.title} with ${challengeTarget.username} — earn ${pick.target} XP in ${pick.days} days!`);
+    }
   };
 
   const completeChallenge = (challenge:FriendChallenge) => {
@@ -10351,10 +12038,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
     return '#64748B';
   },[]);
 
-  const quickAddSuggestions = useMemo(()=>{
-    const base = ['StudyAce','QuizMate','FocusBuddy','LearnCrew','DeepWorkPal'];
-    return base.filter(name=>!friends.some(f=>f.username.toLowerCase()===name.toLowerCase())).slice(0,3);
-  },[friends]);
+  // No fake suggestions — users add real friends by username
 
   return (
     <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
@@ -10386,7 +12070,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
 
       <View style={{flexDirection:'row',gap:10,marginBottom:20}}>
         {tabOptions.map(t=>(
-          <TouchableOpacity key={t} onPress={()=>setTab(t as any)} style={{flex:1,paddingVertical:12,borderRadius:12,backgroundColor:activeTab===t?theme.primary:'rgba(255,255,255,0.05)',alignItems:'center'}}>
+          <TouchableOpacity key={t} onPress={()=>setTab(t as any)} style={{flex:1,paddingVertical:12,borderRadius:12,backgroundColor:activeTab===t?theme.primary:'rgba(128,128,128,0.1)',alignItems:'center'}}>
             <Text style={{color:activeTab===t?'white':'#94A3B8',fontWeight:'600'}}>{t==='friends'?'Friends':t==='orgs'?'Organizations':'Challenges'}</Text>
           </TouchableOpacity>
         ))}
@@ -10397,7 +12081,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
           <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'700',letterSpacing:0.8,marginBottom:10}}>ADD FRIEND</Text>
           <View style={{flexDirection:'row',gap:10}}>
             <TextInput
-              style={{flex:1,backgroundColor:'rgba(255,255,255,0.04)',borderRadius:12,paddingHorizontal:14,paddingVertical:12,color:theme.text,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}
+              style={{flex:1,backgroundColor:'rgba(128,128,128,0.08)',borderRadius:12,paddingHorizontal:14,paddingVertical:12,color:theme.text,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}
               placeholder="Enter username..."
               placeholderTextColor="#64748B"
               value={search}
@@ -10408,21 +12092,12 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
               <Text style={{color:'white',fontWeight:'700'}}>Add</Text>
             </TouchableOpacity>
           </View>
-          {quickAddSuggestions.length>0&&(
-            <View style={{flexDirection:'row',flexWrap:'wrap',gap:8,marginTop:10}}>
-              {quickAddSuggestions.map(name=>(
-                <TouchableOpacity key={name} onPress={()=>setSearch(name)} style={{paddingVertical:6,paddingHorizontal:10,borderRadius:999,backgroundColor:'rgba(99,102,241,0.15)',borderWidth:1,borderColor:'rgba(99,102,241,0.35)'}}>
-                  <Text style={{color:'#A5B4FC',fontSize:12,fontWeight:'600'}}>+ {name}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
         </View>
 
         <View style={[st.card,{backgroundColor:theme.card,marginBottom:14}]}>
           <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'700',letterSpacing:0.8,marginBottom:10}}>FILTER & SORT</Text>
           <TextInput
-            style={{backgroundColor:'rgba(255,255,255,0.04)',borderRadius:12,paddingHorizontal:14,paddingVertical:11,color:theme.text,borderWidth:1,borderColor:'rgba(255,255,255,0.08)',marginBottom:10}}
+            style={{backgroundColor:'rgba(128,128,128,0.08)',borderRadius:12,paddingHorizontal:14,paddingVertical:11,color:theme.text,borderWidth:1,borderColor:'rgba(128,128,128,0.15)',marginBottom:10}}
             placeholder="Filter by name, topic, or status..."
             placeholderTextColor="#64748B"
             value={friendFilter}
@@ -10430,17 +12105,54 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
           />
           <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
             {(['activity','xp','level','name'] as const).map(mode=>(
-              <TouchableOpacity key={mode} onPress={()=>setSortMode(mode)} style={{paddingVertical:7,paddingHorizontal:11,borderRadius:999,backgroundColor:sortMode===mode?'rgba(99,102,241,0.18)':'rgba(255,255,255,0.04)',borderWidth:1,borderColor:sortMode===mode?theme.primary:'rgba(255,255,255,0.08)'}}>
+              <TouchableOpacity key={mode} onPress={()=>setSortMode(mode)} style={{paddingVertical:7,paddingHorizontal:11,borderRadius:999,backgroundColor:sortMode===mode?'rgba(99,102,241,0.18)':'rgba(128,128,128,0.08)',borderWidth:1,borderColor:sortMode===mode?theme.primary:'rgba(128,128,128,0.15)'}}>
                 <Text style={{color:sortMode===mode?theme.primary:'#94A3B8',fontSize:12,fontWeight:'700'}}>{mode==='xp'?'XP':mode==='level'?'Level':mode==='name'?'A-Z':'Activity'}</Text>
               </TouchableOpacity>
             ))}
           </View>
         </View>
 
-        {filteredFriends.length===0&&<Text style={{color:'#64748B',textAlign:'center',marginTop:30}}>No matching friends yet. Add a username to start your network.</Text>}
+        {/* Pending Friend Requests */}
+        {pendingRequests.length > 0 && (
+          <View style={{marginBottom:16}}>
+            <Text style={{color:theme.primary,fontSize:13,fontWeight:'700',marginBottom:8}}>PENDING REQUESTS ({pendingRequests.length})</Text>
+            {pendingRequests.map(req=>(
+              <View key={req.id} style={[st.card,{backgroundColor:theme.card,flexDirection:'row',alignItems:'center',padding:14,marginBottom:8}]}>
+                <View style={{width:40,height:40,borderRadius:20,backgroundColor:theme.primary+'20',alignItems:'center',justifyContent:'center',marginRight:12}}>
+                  <Text style={{color:theme.primary,fontWeight:'700',fontSize:16}}>{(req.username||'?')[0].toUpperCase()}</Text>
+                </View>
+                <View style={{flex:1}}>
+                  <Text style={{color:theme.text,fontWeight:'600',fontSize:15}}>{req.username}</Text>
+                  <Text style={{color:'#64748B',fontSize:12}}>Level {req.level} • {req.total_points} XP</Text>
+                </View>
+                <TouchableOpacity onPress={async()=>{
+                  await SocialDB.respondToRequest(req.id, true);
+                  setPendingRequests(prev=>prev.filter(r=>r.id!==req.id));
+                  const cloudFriends = await SocialDB.getFriends();
+                  setFriends(cloudFriends);
+                  Alert.alert('Accepted!',`${req.username} is now your friend.`);
+                }} style={{backgroundColor:theme.primary,paddingHorizontal:14,paddingVertical:8,borderRadius:8,marginRight:6}}>
+                  <Text style={{color:'white',fontSize:12,fontWeight:'700'}}>Accept</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={async()=>{
+                  await SocialDB.respondToRequest(req.id, false);
+                  setPendingRequests(prev=>prev.filter(r=>r.id!==req.id));
+                }} style={{backgroundColor:'rgba(239,68,68,0.15)',paddingHorizontal:14,paddingVertical:8,borderRadius:8}}>
+                  <Text style={{color:'#EF4444',fontSize:12,fontWeight:'700'}}>Decline</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {filteredFriends.length===0&&<View style={{alignItems:'center',paddingVertical:40}}>
+          <Text style={{fontSize:48,marginBottom:12}}>👥</Text>
+          <Text style={{color:theme.text,fontSize:18,fontWeight:'700',marginBottom:6}}>No Friends Yet</Text>
+          <Text style={{color:'#64748B',textAlign:'center',lineHeight:20,maxWidth:280}}>Add friends by their username above. Once connected, you can challenge each other, see study progress, and stay accountable.</Text>
+        </View>}
         {filteredFriends.map(f=>(
           <View key={f.id} style={[st.card,{backgroundColor:theme.card,marginBottom:10,padding:14}]}>
-            <View style={{flexDirection:'row',alignItems:'center',gap:12,marginBottom:8}}>
+            <TouchableOpacity onPress={()=>setViewingFriend(f)} style={{flexDirection:'row',alignItems:'center',gap:12,marginBottom:8}}>
               <View style={{width:46,height:46,borderRadius:23,backgroundColor:theme.primary,alignItems:'center',justifyContent:'center',position:'relative'}}>
                 <Text style={{color:'white',fontSize:18,fontWeight:'700'}}>{f.username[0].toUpperCase()}</Text>
                 <View style={{position:'absolute',right:-1,bottom:-1,width:12,height:12,borderRadius:6,backgroundColor:presenceColor(f.status),borderWidth:2,borderColor:theme.card}}/>
@@ -10452,22 +12164,22 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
               <View style={{backgroundColor:'rgba(245,158,11,0.15)',paddingHorizontal:10,paddingVertical:5,borderRadius:999}}>
                 <Text style={{color:'#F59E0B',fontSize:12,fontWeight:'700'}}>⚡ {f.points}</Text>
               </View>
-            </View>
+            </TouchableOpacity>
             <View style={{flexDirection:'row',gap:8,flexWrap:'wrap',marginBottom:8}}>
               <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(16,185,129,0.12)'}}><Text style={{color:'#10B981',fontSize:11,fontWeight:'700'}}>Lv {f.level}</Text></View>
-              <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(99,102,241,0.12)'}}><Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700'}}>🔥 {f.streak} day streak</Text></View>
+              {f.streak>0&&<View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(99,102,241,0.12)'}}><Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700'}}>🔥 {f.streak} day streak</Text></View>}
               <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(6,182,212,0.12)'}}><Text style={{color:'#22D3EE',fontSize:11,fontWeight:'700'}}>{f.status==='online'?'Available now':'Not in session'}</Text></View>
             </View>
-            {f.showStudying&&<Text style={{color:'#94A3B8',fontSize:13,marginBottom:10}}>Studying: {f.studying}</Text>}
+            {f.showStudying&&f.studying?<Text style={{color:'#94A3B8',fontSize:13,marginBottom:10}}>Studying: {f.studying}</Text>:null}
             <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
-              <TouchableOpacity onPress={()=>createChallenge(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(99,102,241,0.16)',borderWidth:1,borderColor:'rgba(99,102,241,0.35)'}}>
+              <TouchableOpacity onPress={()=>setViewingFriend(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(139,92,246,0.14)',borderWidth:1,borderColor:'rgba(139,92,246,0.35)'}}>
+                <Text style={{color:'#A78BFA',fontSize:12,fontWeight:'700'}}>Profile</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={()=>openChallengeModal(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(99,102,241,0.16)',borderWidth:1,borderColor:'rgba(99,102,241,0.35)'}}>
                 <Text style={{color:'#A5B4FC',fontSize:12,fontWeight:'700'}}>Challenge</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={()=>nudgeFriend(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(16,185,129,0.14)',borderWidth:1,borderColor:'rgba(16,185,129,0.35)'}}>
                 <Text style={{color:'#34D399',fontSize:12,fontWeight:'700'}}>Nudge</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={()=>toggleStudyVisibility(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(148,163,184,0.12)',borderWidth:1,borderColor:'rgba(148,163,184,0.3)'}}>
-                <Text style={{color:'#CBD5E1',fontSize:12,fontWeight:'700'}}>{f.showStudying?'Hide Topic':'Show Topic'}</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={()=>removeFriend(f)} style={{paddingVertical:8,paddingHorizontal:12,borderRadius:10,backgroundColor:'rgba(239,68,68,0.14)',borderWidth:1,borderColor:'rgba(239,68,68,0.32)'}}>
                 <Text style={{color:'#F87171',fontSize:12,fontWeight:'700'}}>Remove</Text>
@@ -10485,12 +12197,19 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
             Progress is measured from your XP at challenge start. Complete active goals before their deadline.
           </Text>
           {friends.length>0&&(
-            <TouchableOpacity onPress={()=>createChallenge(filteredFriends[0]||friends[0])} style={{marginTop:12,paddingVertical:10,borderRadius:10,alignItems:'center',backgroundColor:'rgba(99,102,241,0.16)',borderWidth:1,borderColor:'rgba(99,102,241,0.35)'}}>
-              <Text style={{color:'#A5B4FC',fontWeight:'700'}}>Start Quick Challenge</Text>
+            <TouchableOpacity onPress={()=>{
+              const f = filteredFriends[0]||friends[0];
+              if(f) openChallengeModal(f);
+            }} style={{marginTop:12,paddingVertical:10,borderRadius:10,alignItems:'center',backgroundColor:'rgba(99,102,241,0.16)',borderWidth:1,borderColor:'rgba(99,102,241,0.35)'}}>
+              <Text style={{color:'#A5B4FC',fontWeight:'700'}}>+ Create Challenge</Text>
             </TouchableOpacity>
           )}
         </View>
-        {orderedChallenges.length===0&&<Text style={{color:'#64748B',textAlign:'center',marginTop:24}}>No challenges yet. Start one from a friend card.</Text>}
+        {orderedChallenges.length===0&&<View style={{alignItems:'center',paddingVertical:32}}>
+          <Text style={{fontSize:40,marginBottom:10}}>🏆</Text>
+          <Text style={{color:theme.text,fontSize:16,fontWeight:'700',marginBottom:4}}>No Active Challenges</Text>
+          <Text style={{color:'#64748B',textAlign:'center',lineHeight:20,maxWidth:260}}>Start a challenge from any friend's profile to compete on XP goals with deadlines.</Text>
+        </View>}
         {orderedChallenges.map(ch=>{
           const progress = challengeProgress(ch);
           const color = ch.status==='completed' ? '#10B981' : ch.status==='expired' ? '#EF4444' : '#6366F1';
@@ -10508,7 +12227,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
                 </View>
               </View>
               <Text style={{color:'#CBD5E1',fontSize:13,lineHeight:20,marginBottom:8}}>{ch.description}</Text>
-              <View style={{height:6,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:4,overflow:'hidden',marginBottom:6}}>
+              <View style={{height:6,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:4,overflow:'hidden',marginBottom:6}}>
                 <View style={{height:'100%',width:`${progress}%`,backgroundColor:color,borderRadius:4}}/>
               </View>
               <View style={{flexDirection:'row',justifyContent:'space-between',marginBottom:10}}>
@@ -10534,8 +12253,41 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
         <TouchableOpacity onPress={()=>setShowCreate(true)} style={{backgroundColor:theme.primary,paddingVertical:14,borderRadius:12,alignItems:'center',marginBottom:12}}>
           <Text style={{color:'white',fontWeight:'700'}}>Create Organization</Text>
         </TouchableOpacity>
+        {/* Join by code */}
+        <View style={{flexDirection:'row',gap:8,marginBottom:16}}>
+          <TextInput
+            style={{flex:1,borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:12,padding:12,color:theme.text,fontSize:14,backgroundColor:'rgba(128,128,128,0.07)'}}
+            placeholder="Enter join code..."
+            placeholderTextColor="#64748B"
+            value={joinCodeInput}
+            onChangeText={setJoinCodeInput}
+            autoCapitalize="characters"
+          />
+          <TouchableOpacity
+            disabled={!joinCodeInput.trim()}
+            onPress={async()=>{
+              if(!joinCodeInput.trim()) return;
+              if(supabase && _supabaseUserId && _supabaseConfigured()) {
+                const result = await SocialDB.joinOrganizationByCode(joinCodeInput.trim());
+                if(result.success) {
+                  const cloudOrgs = await SocialDB.getOrganizations();
+                  setOrgs(cloudOrgs);
+                  setJoinCodeInput('');
+                  Alert.alert('Joined!',`You joined ${result.orgName || 'the organization'}.`);
+                } else {
+                  Alert.alert('Join Failed', result.error || 'Invalid code.');
+                }
+              } else {
+                Alert.alert('Not Connected','Join by code requires a cloud account.');
+              }
+            }}
+            style={{backgroundColor:joinCodeInput.trim()?theme.primary:'rgba(128,128,128,0.25)',paddingHorizontal:18,borderRadius:12,alignItems:'center',justifyContent:'center'}}
+          >
+            <Text style={{color:'white',fontSize:14,fontWeight:'700'}}>Join</Text>
+          </TouchableOpacity>
+        </View>
         <TextInput
-          style={{backgroundColor:theme.card,borderRadius:12,paddingHorizontal:14,paddingVertical:11,color:theme.text,borderWidth:1,borderColor:'rgba(255,255,255,0.08)',marginBottom:14}}
+          style={{backgroundColor:theme.card,borderRadius:12,paddingHorizontal:14,paddingVertical:11,color:theme.text,borderWidth:1,borderColor:'rgba(128,128,128,0.15)',marginBottom:14}}
           placeholder="Search organizations..."
           placeholderTextColor="#64748B"
           value={orgFilter}
@@ -10571,7 +12323,7 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
             </View>
             <Text style={{color:'#64748B',fontSize:12,marginBottom:8}}>LEADERBOARD</Text>
             {membersSorted.map((m,i)=>(
-              <View key={`${o.id}_${m.username}_${i}`} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,borderBottomWidth:i<membersSorted.length-1?1:0,borderBottomColor:'rgba(255,255,255,0.05)'}}>
+              <View key={`${o.id}_${m.username}_${i}`} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,borderBottomWidth:i<membersSorted.length-1?1:0,borderBottomColor:'rgba(128,128,128,0.1)'}}>
                 <Text style={{color:i===0?'#FFD700':i===1?'#C0C0C0':i===2?'#CD7F32':'#94A3B8',fontSize:16,fontWeight:'700',width:30}}>#{i+1}</Text>
                 <Text style={{color:m.username.toLowerCase()===profile.username.toLowerCase()?'#A5B4FC':theme.text,flex:1,fontSize:15,fontWeight:m.username.toLowerCase()===profile.username.toLowerCase()?'700':'500'}}>{m.username}</Text>
                 <Text style={{color:'#64748B',fontSize:13}}>Lv.{m.level}</Text>
@@ -10580,27 +12332,175 @@ const FriendsScreen = ({profile,theme}:{profile:UserProfile;theme:ThemeColors}) 
             ))}
           </View>
         )})}
-        {filteredOrgs.length===0&&<Text style={{color:'#64748B',textAlign:'center',marginTop:24}}>No organizations match your filter.</Text>}
+        {filteredOrgs.length===0&&<View style={{alignItems:'center',paddingVertical:32}}>
+          <Text style={{fontSize:40,marginBottom:10}}>🏫</Text>
+          <Text style={{color:theme.text,fontSize:16,fontWeight:'700',marginBottom:4}}>{orgFilter?'No Matching Organizations':'No Organizations Yet'}</Text>
+          <Text style={{color:'#64748B',textAlign:'center',lineHeight:20,maxWidth:280}}>{orgFilter?'Try a different search term.':'Create an organization to study with a group. Share a join code so others can join.'}</Text>
+        </View>}
         <Modal visible={showCreate} transparent animationType="fade">
           <View style={st.overlay}>
             <View style={[st.card,{backgroundColor:theme.card,maxWidth:340,width:'100%'}]}>
               <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:16,textAlign:'center'}}>Create Organization</Text>
-              <TextInput style={{borderWidth:1,borderColor:'rgba(255,255,255,0.1)',borderRadius:12,padding:14,fontSize:16,color:theme.text,marginBottom:12}} placeholder="Organization name..." placeholderTextColor="#64748B" value={newOrg} onChangeText={setNewOrg}/>
-              <TextInput style={{borderWidth:1,borderColor:'rgba(255,255,255,0.1)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:16,minHeight:84,textAlignVertical:'top'}} multiline placeholder="Short description (optional)..." placeholderTextColor="#64748B" value={newOrgDesc} onChangeText={setNewOrgDesc}/>
+              <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:12,padding:14,fontSize:16,color:theme.text,marginBottom:12}} placeholder="Organization name..." placeholderTextColor="#64748B" value={newOrg} onChangeText={setNewOrg}/>
+              <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:16,minHeight:84,textAlignVertical:'top'}} multiline placeholder="Short description (optional)..." placeholderTextColor="#64748B" value={newOrgDesc} onChangeText={setNewOrgDesc}/>
               <View style={{flexDirection:'row',gap:12}}>
-                <TouchableOpacity onPress={()=>{setShowCreate(false);setNewOrg('');setNewOrgDesc('');}} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
+                <TouchableOpacity onPress={()=>{setShowCreate(false);setNewOrg('');setNewOrgDesc('');}} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
                 <TouchableOpacity onPress={createOrg} style={{flex:1}}><LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}><Text style={{color:'white',fontWeight:'600'}}>Create</Text></LinearGradient></TouchableOpacity>
               </View>
             </View>
           </View>
         </Modal>
+
+        {/* Org perks display for each org */}
+        {filteredOrgs.length>0&&(
+          <View style={[st.card,{backgroundColor:theme.card,marginTop:14}]}>
+            <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'700',letterSpacing:0.8,marginBottom:10}}>ORGANIZATION PERKS</Text>
+            <Text style={{color:'#64748B',fontSize:13,lineHeight:20,marginBottom:12}}>Perks unlock as your organization grows. More members = more benefits for everyone.</Text>
+            {DEFAULT_ORG_PERKS.map(perk=>{
+              const bestOrg = filteredOrgs.filter(o=>o.members.some(m=>m.username.toLowerCase()===profile.username.toLowerCase())).sort((a,b)=>b.members.length-a.members.length)[0];
+              const unlocked = bestOrg ? bestOrg.members.length>=perk.unlockThreshold : false;
+              return (
+                <View key={perk.id} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,opacity:unlocked?1:0.5}}>
+                  <Text style={{fontSize:20,marginRight:12}}>{perk.icon}</Text>
+                  <View style={{flex:1}}>
+                    <Text style={{color:unlocked?theme.text:'#64748B',fontSize:14,fontWeight:'600'}}>{perk.name}</Text>
+                    <Text style={{color:'#64748B',fontSize:12}}>{perk.description}</Text>
+                  </View>
+                  <View style={{paddingHorizontal:8,paddingVertical:3,borderRadius:999,backgroundColor:unlocked?'rgba(16,185,129,0.15)':'rgba(128,128,128,0.1)'}}>
+                    <Text style={{color:unlocked?'#10B981':'#64748B',fontSize:10,fontWeight:'700'}}>{unlocked?'Active':`${perk.unlockThreshold}+ members`}</Text>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        )}
       </>}
+
+      {/* Challenge Creation Modal */}
+      <Modal visible={showChallengeModal} transparent animationType="fade">
+        <View style={st.overlay}>
+          <View style={[st.card,{backgroundColor:theme.card,maxWidth:380,width:'100%'}]}>
+            <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>Create Challenge</Text>
+            <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>
+              {challengeTarget?`Challenge with ${challengeTarget.username}`:'Select challenge type'}
+            </Text>
+
+            <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'700',letterSpacing:0.8,marginBottom:10}}>CHALLENGE TYPE</Text>
+            {([
+              {id:'sprint' as const,title:'XP Sprint',desc:'180 XP in 4 days — quick burst of learning',icon:'⚡'},
+              {id:'consistency' as const,title:'Consistency Run',desc:'250 XP in 7 days — steady daily progress',icon:'🔥'},
+              {id:'deep' as const,title:'Deep Work',desc:'400 XP in 10 days — master difficult material',icon:'🧠'},
+              {id:'custom' as const,title:'Custom',desc:'Set your own XP target and deadline',icon:'✏️'},
+            ]).map(t=>(
+              <TouchableOpacity key={t.id} onPress={()=>setChallengeType(t.id)}
+                style={{flexDirection:'row',alignItems:'center',padding:12,borderRadius:12,marginBottom:8,
+                  backgroundColor:challengeType===t.id?'rgba(99,102,241,0.15)':'rgba(128,128,128,0.07)',
+                  borderWidth:1,borderColor:challengeType===t.id?theme.primary:'rgba(128,128,128,0.12)'}}>
+                <Text style={{fontSize:20,marginRight:12}}>{t.icon}</Text>
+                <View style={{flex:1}}>
+                  <Text style={{color:challengeType===t.id?theme.text:'#94A3B8',fontSize:14,fontWeight:'700'}}>{t.title}</Text>
+                  <Text style={{color:'#64748B',fontSize:12}}>{t.desc}</Text>
+                </View>
+              </TouchableOpacity>
+            ))}
+
+            {challengeType==='custom'&&(
+              <View style={{flexDirection:'row',gap:10,marginBottom:12}}>
+                <View style={{flex:1}}>
+                  <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'600',marginBottom:6}}>XP Target</Text>
+                  <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:10,padding:12,color:theme.text,fontSize:16,textAlign:'center'}} value={customXP} onChangeText={setCustomXP} keyboardType="numeric" placeholder="200"/>
+                </View>
+                <View style={{flex:1}}>
+                  <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'600',marginBottom:6}}>Days</Text>
+                  <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:10,padding:12,color:theme.text,fontSize:16,textAlign:'center'}} value={customDays} onChangeText={setCustomDays} keyboardType="numeric" placeholder="5"/>
+                </View>
+              </View>
+            )}
+
+            <View style={{flexDirection:'row',gap:12,marginTop:8}}>
+              <TouchableOpacity onPress={()=>{setShowChallengeModal(false);setChallengeTarget(null);}} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.25)',alignItems:'center'}}>
+                <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={confirmCreateChallenge} style={{flex:1}}>
+                <LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+                  <Text style={{color:'white',fontWeight:'700'}}>Start Challenge</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Friend Profile View Modal */}
+      <Modal visible={!!viewingFriend} transparent animationType="fade">
+        <View style={st.overlay}>
+          <View style={[st.card,{backgroundColor:theme.card,maxWidth:380,width:'100%'}]}>
+            {viewingFriend&&<>
+              <View style={{alignItems:'center',marginBottom:20}}>
+                <View style={{width:80,height:80,borderRadius:40,backgroundColor:theme.primary,alignItems:'center',justifyContent:'center',marginBottom:12,borderWidth:3,borderColor:theme.secondary}}>
+                  <Text style={{fontSize:32,color:'white',fontWeight:'700'}}>{viewingFriend.username[0].toUpperCase()}</Text>
+                </View>
+                <Text style={{color:theme.text,fontSize:22,fontWeight:'800'}}>{viewingFriend.username}</Text>
+                <View style={{flexDirection:'row',alignItems:'center',gap:6,marginTop:6}}>
+                  <View style={{width:8,height:8,borderRadius:4,backgroundColor:presenceColor(viewingFriend.status)}}/>
+                  <Text style={{color:'#64748B',fontSize:13,textTransform:'capitalize'}}>{viewingFriend.status} • {formatRelativeActivity(viewingFriend.lastActive)}</Text>
+                </View>
+              </View>
+
+              <View style={{flexDirection:'row',gap:12,marginBottom:16}}>
+                {[
+                  {e:'⭐',v:`Lv ${viewingFriend.level}`,l:'Level'},
+                  {e:'⚡',v:`${viewingFriend.points}`,l:'Total XP'},
+                  {e:'🔥',v:`${viewingFriend.streak}`,l:'Day Streak'},
+                ].map((s,i)=>(
+                  <View key={i} style={{flex:1,backgroundColor:'rgba(128,128,128,0.08)',borderRadius:12,padding:12,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.12)'}}>
+                    <Text style={{fontSize:18,marginBottom:4}}>{s.e}</Text>
+                    <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>{s.v}</Text>
+                    <Text style={{color:'#64748B',fontSize:11}}>{s.l}</Text>
+                  </View>
+                ))}
+              </View>
+
+              {viewingFriend.studying?<View style={{backgroundColor:'rgba(99,102,241,0.08)',borderRadius:12,padding:14,marginBottom:16,borderWidth:1,borderColor:'rgba(99,102,241,0.2)'}}>
+                <Text style={{color:'#94A3B8',fontSize:11,fontWeight:'700',letterSpacing:0.5,marginBottom:4}}>CURRENTLY STUDYING</Text>
+                <Text style={{color:theme.text,fontSize:15,fontWeight:'600'}}>{viewingFriend.studying}</Text>
+              </View>:null}
+
+              {(() => {
+                const lvlInfo = getLevelProgress(viewingFriend.points);
+                return (
+                  <View style={{marginBottom:16}}>
+                    <View style={{flexDirection:'row',justifyContent:'space-between',marginBottom:6}}>
+                      <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600'}}>Level {lvlInfo.level} Progress</Text>
+                      <Text style={{color:'#64748B',fontSize:12}}>{lvlInfo.pct}%</Text>
+                    </View>
+                    <View style={{height:6,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:3,overflow:'hidden'}}>
+                      <LinearGradient colors={[theme.primary,theme.secondary]} start={{x:0,y:0}} end={{x:1,y:0}} style={{height:'100%',width:`${lvlInfo.pct}%`}}/>
+                    </View>
+                  </View>
+                );
+              })()}
+
+              <View style={{flexDirection:'row',gap:12}}>
+                <TouchableOpacity onPress={()=>setViewingFriend(null)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.25)',alignItems:'center'}}>
+                  <Text style={{color:'#94A3B8',fontWeight:'600'}}>Close</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={()=>{setViewingFriend(null);openChallengeModal(viewingFriend);}} style={{flex:1}}>
+                  <LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+                    <Text style={{color:'white',fontWeight:'700'}}>Challenge</Text>
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </>}
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 };
 
 // ========== PROFILE SCREEN ==========
-const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:UserProfile;topics:Topic[];onUpdate:(u:Partial<UserProfile>)=>void;onShowTutorial:()=>void;theme:ThemeColors}) => {
+const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{profile:UserProfile;topics:Topic[];onUpdate:(u:Partial<UserProfile>)=>void;onShowTutorial:()=>void;onLogout?:()=>void;theme:ThemeColors}) => {
   const [editName,setEditName] = useState(false);
   const [name,setName] = useState(profile.username);
   const [editPw,setEditPw] = useState(false);
@@ -10613,22 +12513,68 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   const [showApiKeys,setShowApiKeys] = useState(false);
   const [cerebrasKey,setCerebrasKey] = useState('');
   const [geminiKey,setGeminiKey] = useState('');
+  const [customKey,setCustomKey] = useState('');
+  const [customUrl,setCustomUrl] = useState('');
+  const [customModel,setCustomModel] = useState('');
+  const [customName,setCustomName] = useState('');
+  const [showCustomProvider,setShowCustomProvider] = useState(false);
   // Voice state
   const [showVoicePicker,setShowVoicePicker] = useState(false);
   const [selectedVoice,setSelectedVoice] = useState(_podcastVoiceName);
   const [voicePreviewing,setVoicePreviewing] = useState(false);
   const selectedVoiceMeta = PODCAST_VOICE_OPTIONS.find(v=>v.name===selectedVoice) || PODCAST_VOICE_OPTIONS[0];
-  // Kokoro audiobook voice state
+  // Audiobook voice state
   const [selectedAudiobookVoice,setSelectedAudiobookVoice] = useState(_audiobookVoiceName);
-  const [kokoroVoicePreviewing,setKokoroVoicePreviewing] = useState(false);
-  const selectedAudiobookMeta = KOKORO_VOICE_OPTIONS.find(v=>v.name===selectedAudiobookVoice) || KOKORO_VOICE_OPTIONS[0];
+  const [voicePreviewingAudiobook,setVoicePreviewingAudiobook] = useState(false);
+  const selectedAudiobookMeta = AUDIOBOOK_VOICE_OPTIONS.find(v=>v.name===selectedAudiobookVoice) || AUDIOBOOK_VOICE_OPTIONS[0];
+
+  // Saved custom themes
+  const [savedThemes,setSavedThemes] = useState<SavedTheme[]>([]);
+  const [saveThemeName,setSaveThemeName] = useState('');
+  const [showSaveTheme,setShowSaveTheme] = useState(false);
+  // Referral system state
+  const [referralData,setReferralData] = useState<ReferralData|null>(null);
+  const [referralInput,setReferralInput] = useState('');
+  const [showReferralTree,setShowReferralTree] = useState(false);
+
+  // Sync persistent stats when profile screen opens
+  useEffect(()=>{
+    const currentMastered = topics.reduce((s,t)=>s+t.concepts.filter(c=>c.mastered).length,0);
+    const currentTraitIds = topics.filter(t=>t.medal==='trait').map(t=>t.id);
+    const needsUpdate = currentMastered>(profile.totalConceptsLearned||0) || currentTraitIds.some(id=>!(profile.traitTopicIds||[]).includes(id));
+    if(needsUpdate) {
+      onUpdate({
+        totalConceptsLearned: Math.max(profile.totalConceptsLearned||0, currentMastered),
+        traitTopicIds: [...new Set([...(profile.traitTopicIds||[]),...currentTraitIds])],
+      });
+    }
+  },[topics]);
 
   useEffect(()=>{
     (async()=>{
       try { const g = await SecretStore.getItem(SK.CEREBRAS_KEY); setCerebrasKey(_cleanStored(g)); } catch(_){ setCerebrasKey(''); }
       try { const m = await SecretStore.getItem(SK.GEMINI_KEY); setGeminiKey(_cleanStored(m)); } catch(_){ setGeminiKey(''); }
+      try {
+        const cp = await Store.load<{key:string;url:string;model:string;name:string}>(SK.CUSTOM_PROVIDER,{key:'',url:'',model:'',name:''});
+        setCustomKey(cp.key||''); setCustomUrl(cp.url||''); setCustomModel(cp.model||''); setCustomName(cp.name||'');
+        if(cp.key) setShowCustomProvider(true);
+      } catch(_){}
       try { const v = await SecretStore.getItem(SK.PODCAST_VOICE); setSelectedVoice(_normalizePodcastVoice(v||_podcastVoiceName)); } catch(_){ setSelectedVoice(_podcastVoiceName); }
-      try { const av = await SecretStore.getItem(SK.AUDIOBOOK_VOICE); setSelectedAudiobookVoice(_normalizeKokoroVoice(av||_audiobookVoiceName)); } catch(_){ setSelectedAudiobookVoice(_audiobookVoiceName); }
+      try { const av = await SecretStore.getItem(SK.AUDIOBOOK_VOICE); setSelectedAudiobookVoice(_normalizeAudiobookVoice(av||_audiobookVoiceName)); } catch(_){ setSelectedAudiobookVoice(_audiobookVoiceName); }
+      // Load saved themes
+      try { const st = await Store.load<SavedTheme[]>(SK.SAVED_THEMES,[]); if(Array.isArray(st)) setSavedThemes(st); } catch(_){}
+      // Load referral data
+      try {
+        const rd = await Store.load<ReferralData|null>(SK.REFERRALS, null);
+        if(rd) { setReferralData(rd); }
+        else {
+          // Initialize referral data for new user
+          const code = profile.username.substring(0,4).toUpperCase() + Math.random().toString(36).substring(2,6).toUpperCase();
+          const newRd:ReferralData = { myCode:code, myUsername:profile.username, invitedBy:null, tree:[], totalInvites:0 };
+          setReferralData(newRd);
+          Store.save(SK.REFERRALS, newRd);
+        }
+      } catch(_){}
     })();
   },[]);
   useEffect(()=>{
@@ -10669,38 +12615,28 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
     await ApiKeys.savePodcastVoice(nextVoice);
   },[]);
 
-  const previewKokoroVoice = useCallback(async (voiceName:string)=>{
-    if(kokoroVoicePreviewing) return;
-    setKokoroVoicePreviewing(true);
+  const previewAudiobookVoice = useCallback(async (voiceName:string)=>{
+    if(voicePreviewingAudiobook) return;
+    setVoicePreviewingAudiobook(true);
     try {
-      await TTSEngine.stop();
-      _unlockWebAudio(); // Unlock AudioContext during this user gesture (button tap)
-      const sample = `Hello! I'm your audiobook narrator. Let me read your lessons aloud.`;
-      if(Platform.OS==='web') {
-        const wavBuffer = await _kokoroGenerate(sample, voiceName);
-        await TTSEngine.playWavBuffer(wavBuffer, {
-          onDone: ()=>setKokoroVoicePreviewing(false),
-          onError: (e:any)=>{
-            setKokoroVoicePreviewing(false);
-            Alert.alert('Voice Preview Error', String(e?.message||'Could not generate preview audio.').slice(0,160));
-          },
-        });
-      } else {
-        // Native: use expo-speech for preview
-        ExpoSpeech.speak(sample, {
-          rate: 1,
-          onDone: ()=>setKokoroVoicePreviewing(false),
-          onError: ()=>setKokoroVoicePreviewing(false),
-        });
-      }
+      try { ExpoSpeech.stop(); } catch(_){}
+      const sample = `Hello! I'm your audiobook narrator. Let me read your lessons aloud with a natural, clear voice.`;
+      ExpoSpeech.speak(sample, {
+        voice: voiceName || AUDIOBOOK_DEFAULT_VOICE,
+        rate: 1,
+        pitch: 1.0,
+        onDone: ()=>setVoicePreviewingAudiobook(false),
+        onStopped: ()=>setVoicePreviewingAudiobook(false),
+        onError: ()=>setVoicePreviewingAudiobook(false),
+      });
     } catch(e:any) {
-      setKokoroVoicePreviewing(false);
-      Alert.alert('Voice Preview Error', String(e?.message||'Could not generate preview audio.').slice(0,160));
+      setVoicePreviewingAudiobook(false);
+      Alert.alert('Voice Preview Error', String(e?.message||'Could not preview voice.').slice(0,160));
     }
-  },[kokoroVoicePreviewing]);
+  },[]);
 
   const applyAudiobookVoice = useCallback(async (voiceName:string)=>{
-    const next = _normalizeKokoroVoice(voiceName);
+    const next = _normalizeAudiobookVoice(voiceName);
     setSelectedAudiobookVoice(next);
     await ApiKeys.saveAudiobookVoice(next);
   },[]);
@@ -10709,17 +12645,28 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   const totalMedals = Object.values(medals).reduce((s,v)=>s+v,0);
   const totalConcepts = topics.reduce((s,t)=>s+t.concepts.length,0);
   const masteredConcepts = topics.reduce((s,t)=>s+t.concepts.filter(c=>c.mastered).length,0);
-  const levelStepPoints = 500;
-  const pointsInLevel = ((profile.totalPoints%levelStepPoints)+levelStepPoints)%levelStepPoints;
-  const pointsToNextLevel = pointsInLevel===0 ? levelStepPoints : (levelStepPoints-pointsInLevel);
-  const levelProgressPct = Math.max(0, Math.min(100, Math.round((pointsInLevel/levelStepPoints)*100)));
+  // Progressive leveling
+  const lvlInfo = getLevelProgress(profile.totalPoints||0);
+  const pointsInLevel = lvlInfo.pointsInLevel;
+  const pointsToNextLevel = lvlInfo.pointsForNext - lvlInfo.pointsInLevel;
+  const levelProgressPct = lvlInfo.pct;
   const topicsInProgress = topics.filter(t=>t.progress>0 && t.progress<100).length;
   const masteredTopics = topics.filter(t=>t.progress>=100).length;
   const conceptMasteryPct = totalConcepts>0 ? Math.round((masteredConcepts/totalConcepts)*100) : 0;
+  // Persistent stats
+  const traitCount = Math.max(medals.trait, (profile.traitTopicIds||[]).length);
+  const totalConceptsLearned = Math.max(profile.totalConceptsLearned||0, masteredConcepts);
+  const treeCount = (referralData?.tree||[]).length;
+  // Topics closest to next medal
+  const topicMedalProgress = topics.filter(t=>t.progress>0&&t.progress<100).map(t=>{
+    const nextMedal = t.medal==='none'?'bronze':t.medal==='bronze'?'silver':t.medal==='silver'?'gold':t.medal==='gold'?'trait':'done';
+    const nextThreshold = nextMedal==='bronze'?25:nextMedal==='silver'?50:nextMedal==='gold'?75:nextMedal==='trait'?100:100;
+    return {title:t.title,progress:t.progress,nextMedal,nextThreshold,remaining:Math.max(0,nextThreshold-t.progress)};
+  }).filter(t=>t.nextMedal!=='done').sort((a,b)=>a.remaining-b.remaining).slice(0,5);
   const hasPassword = !!safeStr(profile.password||'').trim();
   const accountHealthScore = Math.max(0, Math.min(100,
     (hasPassword?30:0) +
-    (ApiKeys.hasCerebrasKey()?35:0) +
+    (ApiKeys.hasAnyTextKey()?35:0) +
     (ApiKeys.hasGeminiKey()?20:0) +
     (profile.tutorialCompleted?15:0)
   ));
@@ -10776,18 +12723,50 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
   return (
     <ScrollView style={[st.screen,{backgroundColor:theme.background}]} contentContainerStyle={st.screenC}>
       <View style={{alignItems:'center',marginBottom:18}}>
-        <View style={{width:100,height:100,borderRadius:50,backgroundColor:theme.primary,alignItems:'center',justifyContent:'center',marginBottom:16}}>
-          <Text style={{fontSize:40,color:'white',fontWeight:'600'}}>{profile.username[0].toUpperCase()}</Text>
-        </View>
+        <TouchableOpacity onPress={async()=>{
+          try {
+            const result = await DocumentPicker.getDocumentAsync({type:['image/png','image/jpeg','image/jpg','image/webp'],copyToCacheDirectory:true});
+            if(!result.canceled && result.assets && result.assets[0]) {
+              const asset = result.assets[0];
+              if(asset.size && asset.size > 2*1024*1024) { Alert.alert('File Too Large','Profile picture must be under 2MB.'); return; }
+              try {
+                const base64 = await LegacyFileSystem.readAsStringAsync(asset.uri, {encoding:LegacyFileSystem.EncodingType.Base64});
+                const mimeType = asset.mimeType || 'image/jpeg';
+                const dataUri = `data:${mimeType};base64,${base64}`;
+                onUpdate({profilePicture:dataUri});
+              } catch(e) {
+                Alert.alert('Error','Could not load the image. Try a different file.');
+              }
+            }
+          } catch(e) { Alert.alert('Error','Could not open file picker.'); }
+        }} style={{position:'relative',marginBottom:16}}>
+          {profile.profilePicture ? (
+            <View style={{width:100,height:100,borderRadius:50,overflow:'hidden',borderWidth:3,borderColor:theme.primary}}>
+              {Platform.OS==='web'?<img src={profile.profilePicture} style={{width:100,height:100,objectFit:'cover'} as any}/>:<View style={{width:100,height:100,borderRadius:50,backgroundColor:theme.primary,alignItems:'center',justifyContent:'center'}}><Text style={{fontSize:40,color:'white',fontWeight:'600'}}>{profile.username[0].toUpperCase()}</Text></View>}
+            </View>
+          ) : (
+            <View style={{width:100,height:100,borderRadius:50,backgroundColor:theme.primary,alignItems:'center',justifyContent:'center'}}>
+              <Text style={{fontSize:40,color:'white',fontWeight:'600'}}>{profile.username[0].toUpperCase()}</Text>
+            </View>
+          )}
+          <View style={{position:'absolute',bottom:0,right:0,width:32,height:32,borderRadius:16,backgroundColor:theme.secondary,alignItems:'center',justifyContent:'center',borderWidth:2,borderColor:theme.card}}>
+            <Text style={{color:'white',fontSize:14,fontWeight:'700'}}>+</Text>
+          </View>
+        </TouchableOpacity>
         {editName?(
           <View style={{flexDirection:'row',alignItems:'center',gap:12}}>
             <TextInput style={{fontSize:22,fontWeight:'700',color:theme.text,borderBottomWidth:2,borderBottomColor:theme.primary,paddingBottom:4,minWidth:170,textAlign:'center'}} value={name} onChangeText={setName} autoFocus maxLength={24}/>
             <TouchableOpacity onPress={()=>{
-              const cleaned = safeStr(name||'').replace(/\s+/g,' ').trim();
-              if(cleaned.length<2) {
-                Alert.alert('Invalid Name','Use at least 2 characters.');
+              const cleaned = safeStr(name||'').replace(/[^A-Za-z0-9_. -]/g,'').replace(/\s+/g,' ').trim();
+              if(cleaned.length<3) {
+                Alert.alert('Invalid Username','Use at least 3 characters.');
                 return;
               }
+              if(cleaned.length>20) {
+                Alert.alert('Username Too Long','Maximum 20 characters.');
+                return;
+              }
+              // Username saved locally and synced to cloud via handleUpdateProfile
               onUpdate({username:cleaned});
               setEditName(false);
             }}><I.Check s={24}/></TouchableOpacity>
@@ -10799,6 +12778,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             <I.Edit s={18} c="#64748B"/>
           </TouchableOpacity>
         )}
+        {profile.email&&<Text style={{color:'#64748B',fontSize:13,marginTop:4}}>{profile.email}</Text>}
         <View style={{flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'rgba(245,158,11,0.15)',paddingVertical:6,paddingHorizontal:14,borderRadius:16,marginTop:12}}>
           <I.Star s={16}/><Text style={{color:'#F59E0B',fontWeight:'600'}}>Level {profile.level}</Text>
         </View>
@@ -10806,8 +12786,8 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
       </View>
 
       <View style={{flexDirection:'row',gap:12,marginBottom:8}}>
-        {[{e:'📚',v:topics.length,l:'Topics'},{e:'🧠',v:`${masteredConcepts}/${totalConcepts}`,l:'Concepts'},{e:'🏅',v:totalMedals,l:'Medals'}].map((s,i)=>(
-          <View key={i} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(255,255,255,0.08)'}}>
+        {[{e:'🏆',v:traitCount,l:'Traits'},{e:'🧠',v:totalConceptsLearned,l:'Concepts Learned'},{e:'🌳',v:treeCount,l:'Tree'}].map((s,i)=>(
+          <View key={i} style={{flex:1,backgroundColor:theme.card,borderRadius:14,padding:16,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.15)'}}>
             <Text style={{fontSize:24,marginBottom:8}}>{s.e}</Text>
             <Text style={{color:theme.text,fontSize:22,fontWeight:'700'}}>{s.v}</Text>
             <Text style={{color:'#64748B',fontSize:12}}>{s.l}</Text>
@@ -10817,17 +12797,43 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
 
       <View style={[st.card,{backgroundColor:theme.card,marginBottom:12}]}>
         <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-          <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Level Progress</Text>
-          <Text style={{color:'#64748B',fontSize:12}}>Next level in {pointsToNextLevel} pts</Text>
+          <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Level {profile.level} Progress</Text>
+          <Text style={{color:'#64748B',fontSize:12}}>{pointsToNextLevel} pts to next</Text>
         </View>
-        <View style={{height:8,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:5,overflow:'hidden',marginBottom:8}}>
+        <View style={{height:8,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:5,overflow:'hidden',marginBottom:8}}>
           <LinearGradient colors={[theme.primary,theme.secondary]} start={{x:0,y:0}} end={{x:1,y:0}} style={{height:'100%',width:`${levelProgressPct}%`}}/>
         </View>
         <View style={{flexDirection:'row',justifyContent:'space-between'}}>
-          <Text style={{color:'#94A3B8',fontSize:12}}>{pointsInLevel}/{levelStepPoints} pts this level</Text>
+          <Text style={{color:'#94A3B8',fontSize:12}}>{pointsInLevel}/{lvlInfo.pointsForNext} pts this level</Text>
           <Text style={{color:'#94A3B8',fontSize:12}}>{levelProgressPct}%</Text>
         </View>
+        <Text style={{color:'#64748B',fontSize:11,marginTop:6}}>
+          {profile.level<10?'Early levels: 100 pts each — great progress!':profile.level<100?'Intermediate: 250 pts per level':'Advanced: leveling takes dedication!'}
+        </Text>
       </View>
+
+      {/* Trait Progress — topics closest to next medal */}
+      {topicMedalProgress.length>0&&<>
+        <Text style={st.section}>TRAIT PROGRESS</Text>
+        <View style={[st.card,{backgroundColor:theme.card}]}>
+          <Text style={{color:'#94A3B8',fontSize:13,lineHeight:20,marginBottom:12}}>Topics closest to their next medal upgrade.</Text>
+          {topicMedalProgress.map((t,i)=>{
+            const medalColors:{[k:string]:string} = {bronze:'#CD7F32',silver:'#C0C0C0',gold:'#FFD700',trait:'#8B5CF6'};
+            const medalEmoji:{[k:string]:string} = {bronze:'🥉',silver:'🥈',gold:'🥇',trait:'🏆'};
+            return (
+              <View key={i} style={{marginBottom:i<topicMedalProgress.length-1?12:0}}>
+                <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
+                  <Text style={{color:theme.text,fontSize:14,fontWeight:'600',flex:1}} numberOfLines={1}>{t.title}</Text>
+                  <Text style={{color:medalColors[t.nextMedal]||'#64748B',fontSize:12,fontWeight:'700'}}>{medalEmoji[t.nextMedal]||''} {t.remaining}% to {t.nextMedal}</Text>
+                </View>
+                <View style={{height:6,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:3,overflow:'hidden'}}>
+                  <View style={{height:'100%',width:`${Math.min(100,(t.progress/t.nextThreshold)*100)}%`,backgroundColor:medalColors[t.nextMedal]||theme.primary,borderRadius:3}}/>
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      </>}
 
       <View style={[st.card,{backgroundColor:theme.card,marginBottom:12}]}>
         <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
@@ -10838,11 +12844,11 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         </View>
         <Text style={{color:theme.text,fontSize:24,fontWeight:'800',marginBottom:4}}>{accountHealthScore}/100</Text>
         <Text style={{color:'#94A3B8',fontSize:13,lineHeight:20,marginBottom:10}}>
-          {ApiKeys.hasCerebrasKey() ? 'Cerebras key configured.' : 'Add a Cerebras key for full Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
+          {ApiKeys.hasAnyTextKey() ? (ApiKeys.hasCustomProvider() ? `${_customProviderName||'Custom'} provider configured.` : 'Cerebras key configured.') : 'Add an AI provider key for Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
         </Text>
         <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(hasPassword?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:hasPassword?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{hasPassword?'Password set':'Password missing'}</Text></View>
-          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasCerebrasKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasCerebrasKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasCerebrasKey()?'Cerebras ready':'Cerebras missing'}</Text></View>
+          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasAnyTextKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasAnyTextKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasAnyTextKey()?(ApiKeys.hasCustomProvider()?`${_customProviderName||'Custom'} ready`:'Cerebras ready'):'AI key missing'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasGeminiKey()?'rgba(16,185,129,0.14)':'rgba(245,158,11,0.14)')}}><Text style={{color:ApiKeys.hasGeminiKey()?'#34D399':'#F59E0B',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasGeminiKey()?'Gemini ready':'Gemini optional'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(99,102,241,0.14)'}}><Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700'}}>Mastery {conceptMasteryPct}%</Text></View>
         </View>
@@ -10875,15 +12881,15 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
                   width:170,
                   borderRadius:12,
                   padding:10,
-                  backgroundColor:active?'rgba(99,102,241,0.16)':'rgba(255,255,255,0.04)',
+                  backgroundColor:active?'rgba(99,102,241,0.16)':'rgba(128,128,128,0.08)',
                   borderWidth:1,
-                  borderColor:active?theme.primary:'rgba(255,255,255,0.08)',
+                  borderColor:active?theme.primary:'rgba(128,128,128,0.15)',
                 }}
               >
                 <LinearGradient colors={[preset.colors.primary,preset.colors.secondary]} start={{x:0,y:0}} end={{x:1,y:0}} style={{height:44,borderRadius:10,marginBottom:8}}/>
                 <View style={{flexDirection:'row',gap:6,marginBottom:8}}>
                   {[preset.colors.accent,preset.colors.background,preset.colors.card,preset.colors.text].map((c,i)=>(
-                    <View key={`${preset.id}_${i}`} style={{width:16,height:16,borderRadius:4,backgroundColor:c,borderWidth:1,borderColor:'rgba(255,255,255,0.25)'}}/>
+                    <View key={`${preset.id}_${i}`} style={{width:16,height:16,borderRadius:4,backgroundColor:c,borderWidth:1,borderColor:'rgba(128,128,128,0.35)'}}/>
                   ))}
                 </View>
                 <Text style={{color:theme.text,fontSize:13,fontWeight:'700'}}>{preset.name}</Text>
@@ -10894,21 +12900,51 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           })}
         </ScrollView>
         <View style={{flexDirection:'row',gap:10,marginTop:12}}>
-          <TouchableOpacity onPress={()=>onUpdate({themeColors:defaultTheme})} style={{flex:1,paddingVertical:11,borderRadius:10,borderWidth:1,borderColor:'rgba(255,255,255,0.16)',alignItems:'center'}}>
+          <TouchableOpacity onPress={()=>onUpdate({themeColors:defaultTheme})} style={{flex:1,paddingVertical:11,borderRadius:10,borderWidth:1,borderColor:'rgba(128,128,128,0.25)',alignItems:'center'}}>
             <Text style={{color:'#94A3B8',fontWeight:'700',fontSize:12}}>Reset Theme</Text>
           </TouchableOpacity>
-          <View style={{flex:1,paddingVertical:11,borderRadius:10,backgroundColor:'rgba(16,185,129,0.12)',alignItems:'center',borderWidth:1,borderColor:'rgba(16,185,129,0.35)'}}>
-            <Text style={{color:'#34D399',fontWeight:'700',fontSize:12}}>{activeThemePresetId?'Preset active':'Custom theme'}</Text>
-          </View>
+          <TouchableOpacity onPress={()=>{setSaveThemeName('');setShowSaveTheme(true);}} style={{flex:1,paddingVertical:11,borderRadius:10,backgroundColor:'rgba(16,185,129,0.12)',alignItems:'center',borderWidth:1,borderColor:'rgba(16,185,129,0.35)'}}>
+            <Text style={{color:'#34D399',fontWeight:'700',fontSize:12}}>Save Current Theme</Text>
+          </TouchableOpacity>
         </View>
       </View>
+
+      {savedThemes.length>0&&<>
+        <Text style={st.section}>YOUR SAVED THEMES</Text>
+        <View style={[st.card,{backgroundColor:theme.card}]}>
+          {savedThemes.map((st2,i)=>{
+            const isActive = isThemeEqual(theme,st2.colors);
+            return (
+              <View key={st2.id} style={{flexDirection:'row',alignItems:'center',paddingVertical:10,borderBottomWidth:i<savedThemes.length-1?1:0,borderBottomColor:'rgba(128,128,128,0.1)',gap:12}}>
+                <View style={{flexDirection:'row',gap:4}}>
+                  {[st2.colors.primary,st2.colors.secondary,st2.colors.accent].map((c,j)=>(
+                    <View key={j} style={{width:20,height:20,borderRadius:5,backgroundColor:c,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}/>
+                  ))}
+                </View>
+                <Text style={{color:theme.text,flex:1,fontSize:14,fontWeight:'600'}} numberOfLines={1}>{st2.name}</Text>
+                {isActive&&<View style={{paddingHorizontal:8,paddingVertical:3,borderRadius:999,backgroundColor:'rgba(16,185,129,0.15)'}}><Text style={{color:'#34D399',fontSize:10,fontWeight:'700'}}>ACTIVE</Text></View>}
+                <TouchableOpacity onPress={()=>onUpdate({themeColors:st2.colors})} style={{paddingHorizontal:10,paddingVertical:6,borderRadius:8,backgroundColor:'rgba(99,102,241,0.14)'}}>
+                  <Text style={{color:'#A5B4FC',fontSize:12,fontWeight:'700'}}>Apply</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={()=>{
+                  const next = savedThemes.filter(t=>t.id!==st2.id);
+                  setSavedThemes(next);
+                  Store.save(SK.SAVED_THEMES,next);
+                }} style={{paddingHorizontal:8,paddingVertical:6,borderRadius:8,backgroundColor:'rgba(239,68,68,0.12)'}}>
+                  <Text style={{color:'#F87171',fontSize:12,fontWeight:'700'}}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+        </View>
+      </>}
 
       <Text style={st.section}>CUSTOM COLORS</Text>
       <View style={[st.card,{backgroundColor:theme.card}]}>
         {(['primary','secondary','accent','background','card'] as const).map(k=>(
-          <TouchableOpacity key={k} style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:14,borderBottomWidth:1,borderBottomColor:'rgba(255,255,255,0.05)'}} onPress={()=>{setEditColor(k);setTempColor(theme[k]);setShowColorPicker(true);}}>
+          <TouchableOpacity key={k} style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:14,borderBottomWidth:1,borderBottomColor:'rgba(128,128,128,0.1)'}} onPress={()=>{setEditColor(k);setTempColor(theme[k]);setShowColorPicker(true);}}>
             <Text style={{color:theme.text,fontSize:15}}>{k.charAt(0).toUpperCase()+k.slice(1)}</Text>
-            <View style={{width:32,height:32,borderRadius:8,backgroundColor:theme[k],borderWidth:2,borderColor:'rgba(255,255,255,0.2)'}}/>
+            <View style={{width:32,height:32,borderRadius:8,backgroundColor:theme[k],borderWidth:2,borderColor:'rgba(128,128,128,0.3)'}}/>
           </TouchableOpacity>
         ))}
       </View>
@@ -10927,14 +12963,182 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         </Text>
       </View>
 
-      <Text style={st.section}>PRIVACY</Text>
+
+      {/* Referral / Legacy Tree */}
+      <Text style={st.section}>LEGACY TREE</Text>
       <View style={[st.card,{backgroundColor:theme.card}]}>
-        {[{k:'showMedals',l:'Show medals to others'},{k:'showCurrentStudy',l:'Show what I\'m studying'}].map(s=>(
-          <View key={s.k} style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:14}}>
-            <Text style={{color:theme.text,fontSize:15}}>{s.l}</Text>
-            <Switch value={profile.privacySettings[s.k as keyof typeof profile.privacySettings]} onValueChange={v=>onUpdate({privacySettings:{...profile.privacySettings,[s.k]:v}})} trackColor={{false:'#374151',true:theme.primary}}/>
+        <View style={{flexDirection:'row',alignItems:'center',marginBottom:14}}>
+          <Text style={{fontSize:24,marginRight:12}}>🌳</Text>
+          <View style={{flex:1}}>
+            <Text style={{color:theme.text,fontSize:16,fontWeight:'700'}}>Your Legacy</Text>
+            <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>
+              {referralData?.totalInvites||0} learner{(referralData?.totalInvites||0)!==1?'s':''} joined through you
+            </Text>
           </View>
-        ))}
+        </View>
+
+        {/* Invite code */}
+        <View style={{backgroundColor:'rgba(139,92,246,0.08)',borderRadius:12,padding:14,marginBottom:12,borderWidth:1,borderColor:'rgba(139,92,246,0.2)'}}>
+          <Text style={{color:'#A78BFA',fontSize:11,fontWeight:'600',letterSpacing:0.5,marginBottom:6}}>YOUR INVITE CODE</Text>
+          <View style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between'}}>
+            <Text style={{color:theme.text,fontSize:22,fontWeight:'800',letterSpacing:3}}>{referralData?.myCode||'...'}</Text>
+            <TouchableOpacity onPress={()=>{
+              if(typeof navigator!=='undefined'&&navigator.clipboard&&referralData?.myCode){
+                navigator.clipboard.writeText(referralData.myCode);
+                Alert.alert('Copied!','Your invite code has been copied.');
+              }
+            }} style={{backgroundColor:theme.primary,paddingHorizontal:14,paddingVertical:8,borderRadius:8}}>
+              <Text style={{color:'white',fontSize:12,fontWeight:'700'}}>Copy</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={{color:'#64748B',fontSize:11,marginTop:6}}>Share this code with friends to grow your Legacy Tree</Text>
+        </View>
+
+        {/* Add to tree */}
+        <View style={{marginBottom:12}}>
+          <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:8}}>Add a learner to your tree (enter username)</Text>
+          <View style={{flexDirection:'row',gap:8}}>
+            <TextInput
+              style={{flex:1,borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:10,padding:12,color:theme.text,fontSize:14,backgroundColor:'rgba(128,128,128,0.07)'}}
+              placeholder="Enter username..."
+              placeholderTextColor="#64748B"
+              value={referralInput}
+              onChangeText={setReferralInput}
+            />
+            <TouchableOpacity
+              disabled={!referralInput.trim()}
+              onPress={async()=>{
+                if(!referralData||!referralInput.trim()) return;
+                const username = referralInput.trim();
+                if(referralData.tree.some(n=>n.username.toLowerCase()===username.toLowerCase())) {
+                  Alert.alert('Already in Tree',`${username} is already part of your tree.`);
+                  return;
+                }
+                if(supabase && _supabaseUserId && _supabaseConfigured()) {
+                  const result = await SocialDB.addReferral(username);
+                  if(result.success) {
+                    const newNode:ReferralNode = {username,invitedBy:profile.username,invitees:[],joinedAt:new Date().toISOString(),depth:1};
+                    const updated = {...referralData,tree:[...referralData.tree,newNode],totalInvites:referralData.totalInvites+1};
+                    setReferralData(updated);
+                    Store.save(SK.REFERRALS, updated);
+                    setReferralInput('');
+                    Alert.alert('Added!',`${username} has been added to your Legacy Tree.`);
+                  } else {
+                    Alert.alert('Could Not Add', result.error || 'User not found. Make sure they have an Auto Learn account.');
+                  }
+                } else {
+                  const newNode:ReferralNode = {username,invitedBy:profile.username,invitees:[],joinedAt:new Date().toISOString(),depth:1};
+                  const updated = {...referralData,tree:[...referralData.tree,newNode],totalInvites:referralData.totalInvites+1};
+                  setReferralData(updated);
+                  Store.save(SK.REFERRALS, updated);
+                  setReferralInput('');
+                  Alert.alert('Added!',`${username} has been added to your Legacy Tree.`);
+                }
+              }}
+              style={{backgroundColor:referralInput.trim()?theme.primary:'rgba(128,128,128,0.25)',paddingHorizontal:16,borderRadius:10,alignItems:'center',justifyContent:'center'}}
+            >
+              <Text style={{color:'white',fontSize:13,fontWeight:'700'}}>Add</Text>
+            </TouchableOpacity>
+            </View>
+        </View>
+
+        {/* Invited by link */}
+        {!referralData?.invitedBy ? (
+          <View style={{marginBottom:12}}>
+            <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:8}}>Were you invited by someone?</Text>
+            <View style={{flexDirection:'row',gap:8}}>
+              <TextInput
+                style={{flex:1,borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:10,padding:10,color:theme.text,fontSize:13,backgroundColor:'rgba(128,128,128,0.07)'}}
+                placeholder="Their username or code"
+                placeholderTextColor="#64748B"
+                value={referralInput.includes('@')?'':referralInput}
+                onChangeText={v=>setReferralInput(v)}
+              />
+              <TouchableOpacity
+                onPress={()=>{
+                  if(!referralData) return;
+                  const val = referralInput.trim();
+                  if(!val) return;
+                  const updated = {...referralData, invitedBy:val};
+                  setReferralData(updated);
+                  Store.save(SK.REFERRALS, updated);
+                  Alert.alert('Linked!',`You've been linked to ${val}'s tree.`);
+                }}
+                style={{backgroundColor:theme.primary,paddingHorizontal:14,borderRadius:10,alignItems:'center',justifyContent:'center'}}
+              >
+                <Text style={{color:'white',fontSize:12,fontWeight:'700'}}>Link</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ) : (
+          <View style={{flexDirection:'row',alignItems:'center',padding:12,backgroundColor:'rgba(16,185,129,0.08)',borderRadius:10,marginBottom:12,borderWidth:1,borderColor:'rgba(16,185,129,0.2)'}}>
+            <Text style={{fontSize:16,marginRight:8}}>🔗</Text>
+            <Text style={{color:'#10B981',fontSize:13}}>Invited by <Text style={{fontWeight:'700'}}>{referralData.invitedBy}</Text></Text>
+          </View>
+        )}
+
+        {/* Legacy tree visualization */}
+        {referralData && referralData.tree.length>0 && (
+          <>
+          <TouchableOpacity onPress={()=>setShowReferralTree(!showReferralTree)} style={{flexDirection:'row',alignItems:'center',justifyContent:'space-between',paddingTop:8,paddingBottom:8}}>
+            <Text style={{color:theme.primary,fontSize:14,fontWeight:'600'}}>Your Tree · {referralData.tree.length} member{referralData.tree.length!==1?'s':''}</Text>
+            <Text style={{color:'#64748B',fontSize:16}}>{showReferralTree?'▼':'▶'}</Text>
+          </TouchableOpacity>
+          {showReferralTree && (
+            <View style={{borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.12)',paddingTop:8}}>
+              {/* Root node: You */}
+              <View style={{flexDirection:'row',alignItems:'center',paddingVertical:6}}>
+                <Text style={{fontSize:16,marginRight:8}}>👑</Text>
+                <View style={{flex:1}}>
+                  <Text style={{color:theme.text,fontSize:14,fontWeight:'700'}}>{profile.username} (You)</Text>
+                  <Text style={{color:'#64748B',fontSize:11}}>Root · {referralData.tree.filter(n=>n.depth===1).length} direct invite{referralData.tree.filter(n=>n.depth===1).length!==1?'s':''}</Text>
+                </View>
+              </View>
+              {/* Tree nodes grouped by depth */}
+              {referralData.tree.sort((a,b)=>a.depth-b.depth||a.username.localeCompare(b.username)).map((node,i)=>{
+                const childCount = referralData.tree.filter(n=>n.invitedBy===node.username).length;
+                return (
+                  <TouchableOpacity key={i} style={{flexDirection:'row',alignItems:'center',paddingVertical:8,paddingLeft:node.depth*24}}
+                    onPress={()=>{
+                      if(childCount>0) {
+                        Alert.alert(`${node.username}'s Invites`,referralData.tree.filter(n=>n.invitedBy===node.username).map(n=>`• ${n.username}`).join('\n')||'No sub-invites yet.');
+                      }
+                    }}>
+                    <View style={{width:24,alignItems:'center'}}>
+                      <Text style={{fontSize:14}}>{node.depth===1?'🌱':node.depth===2?'🍃':'🌿'}</Text>
+                    </View>
+                    <View style={{flex:1,marginLeft:6}}>
+                      <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
+                        <Text style={{color:theme.text,fontSize:13,fontWeight:'600'}}>{node.username}</Text>
+                        {childCount>0&&<View style={{backgroundColor:'rgba(99,102,241,0.15)',paddingHorizontal:6,paddingVertical:2,borderRadius:999}}><Text style={{color:'#A5B4FC',fontSize:10,fontWeight:'700'}}>{childCount} invite{childCount!==1?'s':''}</Text></View>}
+                      </View>
+                      <Text style={{color:'#64748B',fontSize:10}}>
+                        Invited by {node.invitedBy||'unknown'} · Joined {new Date(node.joinedAt).toLocaleDateString()}
+                      </Text>
+                    </View>
+                    {childCount>0&&<I.Right s={14} c="#64748B"/>}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+          </>
+        )}
+
+        {referralData && referralData.tree.length===0 && (
+          <View style={{padding:12,backgroundColor:'rgba(128,128,128,0.07)',borderRadius:10}}>
+            <Text style={{color:'#64748B',fontSize:12,lineHeight:18,textAlign:'center'}}>
+              Your tree is empty. Add learners who joined using your code to grow your Legacy Tree.
+            </Text>
+          </View>
+        )}
+
+        {/* Tree info */}
+        <View style={{marginTop:12,padding:12,backgroundColor:'rgba(128,128,128,0.07)',borderRadius:10}}>
+          <Text style={{color:'#64748B',fontSize:11,lineHeight:18}}>
+            🌱 Direct invites → 🍃 Their invites → 🌿 Third generation. Your tree grows with each generation. Tap a member to see their invites.
+          </Text>
+        </View>
       </View>
 
       <Text style={st.section}>API KEYS</Text>
@@ -10943,8 +13147,8 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           <Text style={{fontSize:20}}>🔑</Text>
           <View style={{flex:1}}>
             <Text style={{color:theme.text,fontSize:15}}>Manage API Keys</Text>
-            <Text style={{color:ApiKeys.hasCerebrasKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasCerebrasKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
-              Cerebras: {ApiKeys.hasCerebrasKey()?'✓ Set':'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}
+            <Text style={{color:ApiKeys.hasAnyTextKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasAnyTextKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
+              AI: {ApiKeys.hasAnyTextKey()?`✓ ${ApiKeys.hasCustomProvider()?(_customProviderName||'Custom'):'Cerebras'}`:'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}{ApiKeys.hasCustomProvider()&&ApiKeys.hasCerebrasKey()?'  ·  Cerebras: ✓':''}
             </Text>
           </View>
           <I.Right s={20} c="#64748B"/>
@@ -10962,7 +13166,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           <I.Right s={20} c="#64748B"/>
         </TouchableOpacity>
         <TouchableOpacity
-          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',opacity:voicePreviewing?0.7:1}}
+          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)',opacity:voicePreviewing?0.7:1}}
           disabled={voicePreviewing}
           onPress={()=>previewVoice(selectedVoice)}
         >
@@ -10980,12 +13184,12 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             <Text style={{color:'#64748B',fontSize:12,marginTop:2}}>{selectedAudiobookMeta?.label} · {selectedAudiobookMeta?.gender} · {selectedAudiobookMeta?.style}</Text>
           </View>
         </TouchableOpacity>
-        <View style={{borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',paddingTop:10,paddingBottom:6}}>
+        <View style={{borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)',paddingTop:10,paddingBottom:6}}>
           <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
-            {KOKORO_VOICE_OPTIONS.map(v=>{
+            {AUDIOBOOK_VOICE_OPTIONS.map(v=>{
               const isActive = selectedAudiobookVoice===v.name;
               return (
-                <TouchableOpacity key={v.name} onPress={()=>applyAudiobookVoice(v.name)} style={{backgroundColor:isActive?'rgba(139,92,246,0.2)':'rgba(255,255,255,0.05)',borderRadius:10,paddingVertical:8,paddingHorizontal:12,borderWidth:1,borderColor:isActive?'#8B5CF6':'rgba(255,255,255,0.08)',flexDirection:'row',alignItems:'center',gap:6}}>
+                <TouchableOpacity key={v.name} onPress={()=>applyAudiobookVoice(v.name)} style={{backgroundColor:isActive?'rgba(139,92,246,0.2)':'rgba(128,128,128,0.1)',borderRadius:10,paddingVertical:8,paddingHorizontal:12,borderWidth:1,borderColor:isActive?'#8B5CF6':'rgba(128,128,128,0.15)',flexDirection:'row',alignItems:'center',gap:6}}>
                   <View>
                     <Text style={{color:isActive?'#8B5CF6':theme.text,fontSize:13,fontWeight:'600'}}>{v.label.split(' - ')[0]}</Text>
                     <Text style={{color:isActive?'#A78BFA':'#64748B',fontSize:10}}>{v.style}</Text>
@@ -10996,13 +13200,13 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           </View>
         </View>
         <TouchableOpacity
-          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.05)',marginTop:6,opacity:kokoroVoicePreviewing?0.7:1}}
-          disabled={kokoroVoicePreviewing}
-          onPress={()=>previewKokoroVoice(selectedAudiobookVoice)}
+          style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)',marginTop:6,opacity:voicePreviewingAudiobook?0.7:1}}
+          disabled={voicePreviewingAudiobook}
+          onPress={()=>previewAudiobookVoice(selectedAudiobookVoice)}
         >
-          <I.Play s={20} c="#10B981"/><Text style={{color:theme.text,flex:1,fontSize:15}}>{kokoroVoicePreviewing?'Loading Voice Model...':'Preview Narrator Voice'}</Text>
+          <I.Play s={20} c="#10B981"/><Text style={{color:theme.text,flex:1,fontSize:15}}>{voicePreviewingAudiobook?'Playing...':'Preview Narrator Voice'}</Text>
         </TouchableOpacity>
-        <Text style={{color:'#64748B',fontSize:12,paddingVertical:8,lineHeight:18}}>Used for lesson read-aloud in Learn tab. Powered by Kokoro AI — runs locally, no API calls needed. First play downloads the voice model (~160MB, cached).</Text>
+        <Text style={{color:'#64748B',fontSize:12,paddingVertical:8,lineHeight:18}}>Used for lesson read-aloud in Learn tab. Uses your device's built-in text-to-speech — no downloads or API keys needed. Works on web, iOS, and Android.</Text>
       </View>
 
       <Text style={st.section}>ACCOUNT</Text>
@@ -11010,14 +13214,38 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         <TouchableOpacity style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14}} onPress={()=>setEditPw(true)}>
           <I.Edit s={20} c={theme.primary}/><Text style={{color:theme.text,flex:1,fontSize:15}}>Change Password</Text><I.Right s={20} c="#64748B"/>
         </TouchableOpacity>
-        <TouchableOpacity style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14}} onPress={onShowTutorial}>
+        <View style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)'}}>
+          <I.Mic s={20} c={theme.primary}/>
+          <Text style={{color:theme.text,flex:1,fontSize:15}}>Weekly Newsletter</Text>
+          <Switch
+            value={profile.newsletterOptIn !== false}
+            onValueChange={(v:boolean)=>onUpdate({newsletterOptIn:v})}
+            trackColor={{false:'rgba(128,128,128,0.25)',true:theme.primary+'60'}}
+            thumbColor={profile.newsletterOptIn !== false ? theme.primary : '#94A3B8'}
+          />
+        </View>
+        <Text style={{color:'#64748B',fontSize:11,paddingHorizontal:34,paddingBottom:8,marginTop:-6,lineHeight:16}}>Receive weekly learning tips, feature updates, and community highlights. You can unsubscribe anytime.</Text>
+        <TouchableOpacity style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)'}} onPress={onShowTutorial}>
           <I.Book s={20} c={theme.primary}/><Text style={{color:theme.text,flex:1,fontSize:15}}>View Tutorial</Text><I.Right s={20} c="#64748B"/>
         </TouchableOpacity>
+        {onLogout&&<TouchableOpacity style={{flexDirection:'row',alignItems:'center',paddingVertical:14,gap:14,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.1)'}} onPress={()=>{
+          if(Platform.OS==='web') {
+            const g:any = globalThis as any;
+            if(typeof g.confirm==='function' && !g.confirm('Log Out\n\nAre you sure you want to log out?')) return;
+          }
+          onLogout();
+        }}>
+          <I.X s={20} c="#EF4444"/><Text style={{color:'#EF4444',flex:1,fontSize:15,fontWeight:'600'}}>Log Out</Text><I.Right s={20} c="#64748B"/>
+        </TouchableOpacity>}
       </View>
 
       <Text style={st.section}>POINT SYSTEM</Text>
       <View style={[st.card,{backgroundColor:theme.card}]}>
-        <Text style={{color:'#94A3B8',fontSize:14,lineHeight:24}}>🥉 Bronze = +100pts{'\n'}🥈 Silver = +250pts{'\n'}🥇 Gold = +500pts{'\n'}🏆 Trait = +1000pts{'\n\n'}Level up every 500 points!</Text>
+        <Text style={{color:theme.text,fontSize:15,fontWeight:'700',marginBottom:8}}>Earning Points</Text>
+        <Text style={{color:'#94A3B8',fontSize:14,lineHeight:24}}>🥉 Bronze medal = +100 pts{'\n'}🥈 Silver medal = +250 pts{'\n'}🥇 Gold medal = +500 pts{'\n'}🏆 Trait medal = +1,000 pts{'\n'}🎮 Game correct answer = +8 pts</Text>
+        <View style={{height:1,backgroundColor:'rgba(128,128,128,0.12)',marginVertical:12}}/>
+        <Text style={{color:theme.text,fontSize:15,fontWeight:'700',marginBottom:8}}>Level Scaling</Text>
+        <Text style={{color:'#94A3B8',fontSize:14,lineHeight:24}}>Levels 1–10: 100 pts each (fast!){'\n'}Levels 10–100: 250 pts each{'\n'}Levels 100–1,000: 500 pts each{'\n'}Levels 1,000+: 1,000 pts each{'\n\n'}The higher you climb, the more each level means.</Text>
       </View>
 
       <Modal visible={showColorPicker} transparent animationType="fade">
@@ -11030,15 +13258,15 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
               ))}
             </View>
             <View style={{alignItems:'center',marginBottom:12}}>
-              <View style={{width:64,height:64,borderRadius:12,backgroundColor:isValidHex(tempColor)?normalizeHexColor(tempColor):theme.card,borderWidth:2,borderColor:'rgba(255,255,255,0.2)'}}/>
+              <View style={{width:64,height:64,borderRadius:12,backgroundColor:isValidHex(tempColor)?normalizeHexColor(tempColor):theme.card,borderWidth:2,borderColor:'rgba(128,128,128,0.3)'}}/>
               <Text style={{color:'#64748B',fontSize:11,marginTop:6}}>Live preview</Text>
             </View>
-            <TextInput style={{borderWidth:1,borderColor:'rgba(255,255,255,0.1)',borderRadius:10,padding:12,fontSize:14,textAlign:'center',color:theme.text,marginBottom:8}} value={tempColor} onChangeText={v=>setTempColor(normalizeHexColor(v))} placeholder="#HEXCODE" placeholderTextColor="#64748B" autoCapitalize="characters"/>
+            <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:10,padding:12,fontSize:14,textAlign:'center',color:theme.text,marginBottom:8}} value={tempColor} onChangeText={v=>setTempColor(normalizeHexColor(v))} placeholder="#HEXCODE" placeholderTextColor="#64748B" autoCapitalize="characters"/>
             <Text style={{color:isValidHex(tempColor)?'#34D399':'#F59E0B',fontSize:11,textAlign:'center',marginBottom:16}}>
               {isValidHex(tempColor)?'Valid HEX color':'Use #RRGGBB or #RGB'}
             </Text>
             <View style={{flexDirection:'row',gap:12}}>
-              <TouchableOpacity onPress={()=>setShowColorPicker(false)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
+              <TouchableOpacity onPress={()=>setShowColorPicker(false)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
               <TouchableOpacity onPress={saveCustomThemeColor} style={{flex:1,opacity:isValidHex(tempColor)?1:0.6}} disabled={!isValidHex(tempColor)}>
                 <LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}><Text style={{color:'white',fontWeight:'600'}}>Save</Text></LinearGradient>
               </TouchableOpacity>
@@ -11051,7 +13279,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
         <View style={st.overlay}>
           <View style={[st.card,{backgroundColor:theme.card,maxWidth:340,width:'100%'}]}>
             <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:16,textAlign:'center'}}>Change Password</Text>
-            <TextInput style={{borderWidth:1,borderColor:'rgba(255,255,255,0.1)',borderRadius:12,padding:14,fontSize:16,color:theme.text,marginBottom:10}} placeholder="New password..." placeholderTextColor="#64748B" value={pw} onChangeText={setPw} secureTextEntry={!showPw}/>
+            <TextInput style={{borderWidth:1,borderColor:'rgba(128,128,128,0.18)',borderRadius:12,padding:14,fontSize:16,color:theme.text,marginBottom:10}} placeholder="New password..." placeholderTextColor="#64748B" value={pw} onChangeText={setPw} secureTextEntry={!showPw}/>
             <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
               <Text style={{color:pw.length>=10?'#34D399':pw.length>=6?'#F59E0B':'#F87171',fontSize:12,fontWeight:'700'}}>
                 {pw.length>=10?'Strong':pw.length>=6?'Medium':'Too short'}
@@ -11062,7 +13290,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
             </View>
             <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Use at least 6 characters. 10+ is recommended.</Text>
             <View style={{flexDirection:'row',gap:12}}>
-              <TouchableOpacity onPress={()=>{setEditPw(false);setShowPw(false);setPw('');}} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
+              <TouchableOpacity onPress={()=>{setEditPw(false);setShowPw(false);setPw('');}} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)',alignItems:'center'}}><Text style={{color:'#94A3B8'}}>Cancel</Text></TouchableOpacity>
               <TouchableOpacity onPress={savePassword} style={{flex:1,opacity:pw.trim().length>=6?1:0.6}} disabled={pw.trim().length<6}><LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}><Text style={{color:'white',fontWeight:'600'}}>Save</Text></LinearGradient></TouchableOpacity>
             </View>
           </View>
@@ -11072,33 +13300,81 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
       {/* API Keys Modal */}
       <Modal visible={showApiKeys} transparent animationType="fade">
         <View style={st.overlay}>
-          <View style={[st.card,{backgroundColor:theme.card,maxWidth:380,width:'100%'}]}>
-            <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>API Keys</Text>
-            <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>Stored securely on your device</Text>
+          <ScrollView style={{maxHeight:SH*0.85}} contentContainerStyle={{alignItems:'center',padding:20}}>
+          <View style={[st.card,{backgroundColor:theme.card,maxWidth:400,width:'100%'}]}>
+            <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>AI Providers</Text>
+            <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>All keys are stored securely on your device</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Cerebras API Key <Text style={{color:'#EF4444'}}>(required)</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Cerebras API Key <Text style={{color:showCustomProvider?'#64748B':'#EF4444'}}>{showCustomProvider?'(recommended free option)':'(required unless custom set)'}</Text></Text>
             <TextInput
-              style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
+              style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
               placeholder="csk-..." placeholderTextColor="#475569"
               value={cerebrasKey} onChangeText={setCerebrasKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
             />
             <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at cloud.cerebras.ai → API Keys → Create</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#F59E0B'}}>(for podcast live voice chat only)</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#F59E0B'}}>(for podcast live voice only)</Text></Text>
             <TextInput
-              style={{borderWidth:1,borderColor:'rgba(255,255,255,0.12)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
+              style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
               placeholder="AIzaSy..." placeholderTextColor="#475569"
               value={geminiKey} onChangeText={setGeminiKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
             />
-            <Text style={{color:'#64748B',fontSize:11,marginBottom:20}}>Free at aistudio.google.com → Get API Key</Text>
+            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at aistudio.google.com → Get API Key</Text>
+
+            {/* Custom Provider Toggle */}
+            <TouchableOpacity onPress={()=>setShowCustomProvider(!showCustomProvider)} style={{flexDirection:'row',alignItems:'center',gap:10,paddingVertical:10,marginBottom:showCustomProvider?12:4,borderTopWidth:1,borderTopColor:'rgba(128,128,128,0.15)'}}>
+              <View style={{width:22,height:22,borderRadius:6,borderWidth:2,borderColor:showCustomProvider?theme.primary:'rgba(128,128,128,0.3)',backgroundColor:showCustomProvider?theme.primary:'transparent',alignItems:'center',justifyContent:'center'}}>
+                {showCustomProvider&&<Text style={{color:'white',fontSize:13,fontWeight:'700'}}>✓</Text>}
+              </View>
+              <View style={{flex:1}}>
+                <Text style={{color:theme.text,fontSize:14,fontWeight:'600'}}>Use Custom AI Provider</Text>
+                <Text style={{color:'#64748B',fontSize:11}}>OpenAI, Groq, Together, Mistral, Deepseek, etc.</Text>
+              </View>
+            </TouchableOpacity>
+
+            {showCustomProvider&&(
+              <View style={{marginBottom:16}}>
+                <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:4}}>Provider Name</Text>
+                <TextInput
+                  style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:10,padding:12,fontSize:14,color:theme.text,marginBottom:10,backgroundColor:'rgba(0,0,0,0.2)'}}
+                  placeholder="e.g. OpenAI, Groq, Together..." placeholderTextColor="#475569"
+                  value={customName} onChangeText={setCustomName} autoCapitalize="words"
+                />
+                <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:4}}>API Key</Text>
+                <TextInput
+                  style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:10,padding:12,fontSize:14,color:theme.text,marginBottom:10,backgroundColor:'rgba(0,0,0,0.2)'}}
+                  placeholder="sk-..." placeholderTextColor="#475569"
+                  value={customKey} onChangeText={setCustomKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
+                />
+                <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:4}}>Base URL</Text>
+                <TextInput
+                  style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:10,padding:12,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
+                  placeholder="https://api.openai.com/v1" placeholderTextColor="#475569"
+                  value={customUrl} onChangeText={setCustomUrl} autoCapitalize="none" autoCorrect={false}
+                />
+                <Text style={{color:'#64748B',fontSize:10,marginBottom:10,lineHeight:14}}>Common URLs: api.openai.com/v1 · api.groq.com/openai/v1 · api.together.xyz/v1 · api.mistral.ai/v1 · api.deepseek.com/v1 · api.fireworks.ai/inference/v1</Text>
+                <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'600',marginBottom:4}}>Model Name</Text>
+                <TextInput
+                  style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:10,padding:12,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
+                  placeholder="e.g. gpt-4o-mini, llama-3.1-70b..." placeholderTextColor="#475569"
+                  value={customModel} onChangeText={setCustomModel} autoCapitalize="none" autoCorrect={false}
+                />
+                <Text style={{color:'#64748B',fontSize:10,lineHeight:14}}>Check your provider's docs for available model names</Text>
+              </View>
+            )}
 
             <View style={{flexDirection:'row',gap:12}}>
-              <TouchableOpacity onPress={()=>setShowApiKeys(false)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.15)',alignItems:'center'}}>
+              <TouchableOpacity onPress={()=>setShowApiKeys(false)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.25)',alignItems:'center'}}>
                 <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={async()=>{
                 await ApiKeys.saveCerebrasKey(cerebrasKey);
                 await ApiKeys.saveGeminiKey(geminiKey);
+                if(showCustomProvider && customKey.trim() && customUrl.trim() && customModel.trim()) {
+                  await ApiKeys.saveCustomProvider(customKey,customUrl,customModel,customName||'Custom');
+                } else if(!showCustomProvider) {
+                  await ApiKeys.saveCustomProvider('','','','');
+                }
                 Alert.alert('Saved','API keys updated. They are stored securely on your device.');
                 setShowApiKeys(false);
               }} style={{flex:1}}>
@@ -11108,6 +13384,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
               </TouchableOpacity>
             </View>
           </View>
+          </ScrollView>
         </View>
       </Modal>
 
@@ -11153,7 +13430,379 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
           </View>
         </View>
       </Modal>
+
+      {/* Save Theme Modal */}
+      <Modal visible={showSaveTheme} transparent animationType="fade">
+        <View style={st.overlay}>
+          <View style={[st.card,{backgroundColor:theme.card,maxWidth:340,width:'100%'}]}>
+            <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:6,textAlign:'center'}}>Save Theme</Text>
+            <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:16}}>Save your current color combination for quick access later.</Text>
+            <View style={{flexDirection:'row',gap:6,justifyContent:'center',marginBottom:16}}>
+              {[theme.primary,theme.secondary,theme.accent,theme.background,theme.card].map((c,i)=>(
+                <View key={i} style={{width:28,height:28,borderRadius:7,backgroundColor:c,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}/>
+              ))}
+            </View>
+            <TextInput
+              style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:15,color:theme.text,marginBottom:16,backgroundColor:'rgba(0,0,0,0.2)'}}
+              placeholder="Theme name (e.g. My Study Theme)"
+              placeholderTextColor="#64748B"
+              value={saveThemeName}
+              onChangeText={setSaveThemeName}
+              maxLength={30}
+            />
+            <View style={{flexDirection:'row',gap:12}}>
+              <TouchableOpacity onPress={()=>setShowSaveTheme(false)} style={{flex:1,paddingVertical:14,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.25)',alignItems:'center'}}>
+                <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={()=>{
+                const themeName = safeStr(saveThemeName||'').trim();
+                if(themeName.length<2) { Alert.alert('Name Too Short','Use at least 2 characters.'); return; }
+                if(savedThemes.some(t=>t.name.toLowerCase()===themeName.toLowerCase())) { Alert.alert('Name Exists','Choose a different name.'); return; }
+                const newTheme:SavedTheme = { id:`theme_${Date.now()}`, name:themeName, colors:{...theme}, createdAt:new Date().toISOString() };
+                const next = [newTheme,...savedThemes].slice(0,10);
+                setSavedThemes(next);
+                Store.save(SK.SAVED_THEMES,next);
+                setShowSaveTheme(false);
+                Alert.alert('Theme Saved',`"${themeName}" has been saved. You can apply it anytime from the Theme Presets section.`);
+              }} style={{flex:1,opacity:saveThemeName.trim().length>=2?1:0.5}} disabled={saveThemeName.trim().length<2}>
+                <LinearGradient colors={[theme.primary,theme.secondary]} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+                  <Text style={{color:'white',fontWeight:'700'}}>Save</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
+  );
+};
+
+// ========== AUTH SCREEN ==========
+const AuthScreen = ({onAuth}:{onAuth:(auth:AuthState,profileUpdates:Partial<UserProfile>)=>void}) => {
+  const [mode,setMode] = useState<'welcome'|'login'|'signup'>('welcome');
+  const [username,setUsername] = useState('');
+  const [email,setEmail] = useState('');
+  const [password,setPassword] = useState('');
+  const [confirmPw,setConfirmPw] = useState('');
+  const [showPw,setShowPw] = useState(false);
+  const [error,setError] = useState('');
+  const [loading,setLoading] = useState(false);
+
+  const validateEmail = (e:string):boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+  const handleSignup = async () => {
+    setError('');
+    const cleanUser = safeStr(username||'').replace(/[^A-Za-z0-9_.-]/g,'').trim();
+    const cleanEmail = safeStr(email||'').trim().toLowerCase();
+    const cleanPw = safeStr(password||'').trim();
+    if(cleanUser.length<3) { setError('Username must be at least 3 characters.'); return; }
+    if(cleanUser.length>20) { setError('Username must be 20 characters or less.'); return; }
+    if(!validateEmail(cleanEmail)) { setError('Please enter a valid email address.'); return; }
+    if(cleanPw.length<6) { setError('Password must be at least 6 characters.'); return; }
+    if(cleanPw!==confirmPw) { setError('Passwords do not match.'); return; }
+    setLoading(true);
+    try {
+      if(supabase && _supabaseConfigured()) {
+        // Real Supabase signup with email verification
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password: cleanPw,
+          options: { data: { username: cleanUser } },
+        });
+        if(signUpError) {
+          // Handle common Supabase errors with user-friendly messages
+          if(signUpError.message.includes('already registered')) setError('An account with this email already exists. Try logging in.');
+          else if(signUpError.message.includes('valid email')) setError('Please enter a valid email address.');
+          else setError(signUpError.message);
+          setLoading(false);
+          return;
+        }
+        if(data?.user) {
+          // Check if email confirmation is required
+          if(data.user.confirmed_at || data.session) {
+            // Email confirmed or auto-confirmed — log them in
+            _supabaseUserId = data.user.id;
+            const auth:AuthState = { isLoggedIn:true, username:cleanUser, email:cleanEmail, provider:'supabase', createdAt:new Date().toISOString(), supabaseId:data.user.id };
+            onAuth(auth, { username:cleanUser, email:cleanEmail, password:'', authProvider:'supabase', newsletterOptIn:true });
+          } else {
+            // Email confirmation required
+            setError('');
+            Alert.alert('Check Your Email', `We sent a confirmation link to ${cleanEmail}. Please verify your email and then log in.`);
+          }
+        }
+      } else {
+        // Fallback: local-only signup (Supabase not configured)
+        // Local signup (no backend configured)
+        const auth:AuthState = { isLoggedIn:true, username:cleanUser, email:cleanEmail, provider:'local', createdAt:new Date().toISOString() };
+        onAuth(auth, { username:cleanUser, email:cleanEmail, password:cleanPw, authProvider:'local', newsletterOptIn:true });
+      }
+    } catch(e:any) {
+      setError(e?.message || 'Signup failed. Please try again.');
+    }
+    setLoading(false);
+  };
+
+  const handleLogin = async () => {
+    setError('');
+    const cleanEmail = safeStr(email||'').trim().toLowerCase();
+    const cleanPw = safeStr(password||'').trim();
+    if(!validateEmail(cleanEmail)&&cleanEmail.length<3) { setError('Enter your email or username.'); return; }
+    if(cleanPw.length<6) { setError('Password must be at least 6 characters.'); return; }
+    setLoading(true);
+    try {
+      if(supabase && _supabaseConfigured()) {
+        // Real Supabase login
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password: cleanPw,
+        });
+        if(signInError) {
+          if(signInError.message.includes('Invalid login')) setError('Incorrect email or password.');
+          else if(signInError.message.includes('Email not confirmed')) setError('Please check your email and confirm your account first.');
+          else setError(signInError.message);
+          setLoading(false);
+          return;
+        }
+        if(data?.user) {
+          _supabaseUserId = data.user.id;
+          const username = data.user.user_metadata?.username || cleanEmail.split('@')[0] || 'Learner';
+          // Pull user data from cloud into local storage
+          await Store.syncFromCloud();
+          const auth:AuthState = { isLoggedIn:true, username, email:cleanEmail, provider:'supabase', createdAt:data.user.created_at || new Date().toISOString(), supabaseId:data.user.id };
+          onAuth(auth, {});
+        }
+      } else {
+        // Fallback: local-only login (Supabase not configured)
+        const storedProfile = await Store.load<UserProfile>(SK.PROFILE,defaultProfile);
+        const storedAuth = await Store.load<AuthState|null>(SK.AUTH,null);
+        if(storedAuth && (storedAuth.email===cleanEmail || storedAuth.username===cleanEmail)) {
+          if(storedProfile.password && storedProfile.password!==cleanPw) {
+            setError('Incorrect password. Please try again.');
+            setLoading(false);
+            return;
+          }
+          onAuth({...storedAuth,isLoggedIn:true},{});
+        } else {
+          const auth:AuthState = { isLoggedIn:true, username:cleanEmail.split('@')[0]||'Learner', email:cleanEmail, provider:'local', createdAt:new Date().toISOString() };
+          onAuth(auth, { email:cleanEmail, password:cleanPw, authProvider:'local' });
+        }
+      }
+    } catch(e:any) {
+      setError(e?.message || 'Login failed. Please try again.');
+    }
+    setLoading(false);
+  };
+
+  const handleForgotPassword = async () => {
+    const cleanEmail = safeStr(email||'').trim().toLowerCase();
+    if(!validateEmail(cleanEmail)) { setError('Enter a valid email address first, then tap Forgot Password.'); return; }
+    setLoading(true);
+    try {
+      if(supabase && _supabaseConfigured()) {
+        // Real password reset via Supabase — sends email with magic link
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+          redirectTo: Platform.OS === 'web' ? window.location.origin : undefined,
+        });
+        if(resetError) {
+          setError(resetError.message);
+        } else {
+          setError('');
+          Alert.alert('Check Your Email', `If an account exists for ${cleanEmail}, we sent a password reset link. Check your inbox (and spam folder).`);
+        }
+      } else {
+        // Fallback: local password reset
+        const storedAuth = await Store.load<AuthState|null>(SK.AUTH,null);
+        if(!storedAuth || (storedAuth.email!==cleanEmail && storedAuth.username!==cleanEmail)) {
+          setError('No account found with that email.');
+          setLoading(false);
+          return;
+        }
+        if(Platform.OS==='web') {
+          const g:any = globalThis as any;
+          const newPw = typeof g.prompt==='function' ? safeStr(g.prompt('Enter a new password (at least 6 characters):','')) : '';
+          if(!newPw || newPw.trim().length<6) { setError('Password must be at least 6 characters.'); setLoading(false); return; }
+          const profile = await Store.load<UserProfile>(SK.PROFILE,defaultProfile);
+          await Store.save(SK.PROFILE,{...profile,password:newPw.trim()});
+          Alert.alert('Password Reset','Your password has been updated. You can now log in with your new password.');
+          setError('');
+        } else {
+          Alert.alert('Reset Password','Reset your password directly.',
+            [{text:'Cancel',style:'cancel'},{text:'Reset',onPress:async()=>{
+              const profile = await Store.load<UserProfile>(SK.PROFILE,defaultProfile);
+              await Store.save(SK.PROFILE,{...profile,password:''});
+              Alert.alert('Password Cleared','Your password has been removed. Log in and set a new one.');
+            }}]);
+        }
+      }
+    } catch(e:any) {
+      setError(e?.message || 'Password reset failed. Please try again.');
+    }
+    setLoading(false);
+  };
+
+  const handleGoogleSignIn = async () => {
+    if(!supabase || !_supabaseConfigured()) {
+      setError('Google Sign-In requires backend configuration. Please use email signup for now.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: Platform.OS === 'web' ? window.location.origin : undefined,
+        },
+      });
+      if(oauthError) {
+        setError(oauthError.message);
+      }
+      // On web, this redirects to Google's OAuth page.
+      // After redirect back, checkAuth() in the main component picks up the session.
+    } catch(e:any) {
+      setError(e?.message || 'Google Sign-In failed. Please try email signup.');
+    }
+    setLoading(false);
+  };
+
+  if(mode==='welcome') {
+    return (
+      <View style={{flex:1,backgroundColor:'#0F0F1A',justifyContent:'center',alignItems:'center',padding:24}}>
+        <StatusBar style="light"/>
+        <View style={{alignItems:'center',marginBottom:48}}>
+          <View style={{width:90,height:90,borderRadius:22,backgroundColor:'#6366F1',alignItems:'center',justifyContent:'center',marginBottom:20}}>
+            <Text style={{fontSize:42}}>📚</Text>
+          </View>
+          <Text style={{fontSize:36,fontWeight:'800',color:'#E2E8F0',marginBottom:8}}>Auto Learn</Text>
+          <Text style={{fontSize:16,color:'#94A3B8',textAlign:'center',lineHeight:24,maxWidth:320}}>Learn without feeling like you're studying. AI-powered quizzes, games, podcasts, and study guides.</Text>
+        </View>
+
+        <View style={{width:'100%',maxWidth:340,gap:14}}>
+          <TouchableOpacity onPress={()=>setMode('signup')} disabled={loading}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:16,borderRadius:14,alignItems:'center'}}>
+              <Text style={{color:'white',fontSize:16,fontWeight:'700'}}>Create Account</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+
+          <TouchableOpacity onPress={()=>setMode('login')} disabled={loading} style={{paddingVertical:16,borderRadius:14,alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.25)'}}>
+            <Text style={{color:'#A5B4FC',fontSize:16,fontWeight:'600'}}>Log In</Text>
+          </TouchableOpacity>
+
+          {_supabaseConfigured() && (
+            <>
+              <View style={{flexDirection:'row',alignItems:'center',marginVertical:4}}>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+                <Text style={{color:'#64748B',fontSize:13,marginHorizontal:12}}>or</Text>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+              </View>
+              <TouchableOpacity onPress={handleGoogleSignIn} disabled={loading} style={{flexDirection:'row',paddingVertical:14,borderRadius:14,alignItems:'center',justifyContent:'center',gap:10,backgroundColor:'#fff',opacity:loading?0.7:1}}>
+                <Text style={{fontSize:20}}>G</Text>
+                <Text style={{color:'#1F2937',fontSize:16,fontWeight:'600'}}>Continue with Google</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+
+        <Text style={{color:'#475569',fontSize:12,marginTop:32,textAlign:'center',lineHeight:18,maxWidth:300}}>By continuing, you agree to Auto Learn's Terms of Service and Privacy Policy. You'll be subscribed to our weekly newsletter — you can unsubscribe anytime in Settings.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <KeyboardAvoidingView style={{flex:1,backgroundColor:'#0F0F1A'}} behavior={Platform.OS==='ios'?'padding':undefined}>
+      <StatusBar style="light"/>
+      <ScrollView contentContainerStyle={{flexGrow:1,justifyContent:'center',padding:24}}>
+        <TouchableOpacity onPress={()=>setMode('welcome')} style={{position:'absolute',top:60,left:24,flexDirection:'row',alignItems:'center',gap:6}}>
+          <I.Left s={20} c="#94A3B8"/>
+          <Text style={{color:'#94A3B8',fontSize:15}}>Back</Text>
+        </TouchableOpacity>
+
+        <View style={{alignItems:'center',marginBottom:32}}>
+          <Text style={{fontSize:28,fontWeight:'800',color:'#E2E8F0',marginBottom:6}}>{mode==='signup'?'Create Account':'Welcome Back'}</Text>
+          <Text style={{fontSize:15,color:'#94A3B8'}}>{mode==='signup'?'Set up your learning profile':'Log in to continue learning'}</Text>
+        </View>
+
+        <View style={{width:'100%',maxWidth:340,alignSelf:'center',gap:12}}>
+          {mode==='signup'&&(
+            <View>
+              <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'700',marginBottom:6,letterSpacing:0.5}}>USERNAME</Text>
+              <TextInput
+                style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:16,color:'#E2E8F0',backgroundColor:'rgba(128,128,128,0.08)'}}
+                placeholder="Choose a username"
+                placeholderTextColor="#475569"
+                value={username}
+                onChangeText={setUsername}
+                autoCapitalize="none"
+                maxLength={20}
+              />
+            </View>
+          )}
+
+          <View>
+            <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'700',marginBottom:6,letterSpacing:0.5}}>EMAIL</Text>
+            <TextInput
+              style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:16,color:'#E2E8F0',backgroundColor:'rgba(128,128,128,0.08)'}}
+              placeholder="you@example.com"
+              placeholderTextColor="#475569"
+              value={email}
+              onChangeText={setEmail}
+              keyboardType="email-address"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+          </View>
+
+          <View>
+            <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'700',marginBottom:6,letterSpacing:0.5}}>PASSWORD</Text>
+            <View style={{flexDirection:'row',alignItems:'center',borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,backgroundColor:'rgba(128,128,128,0.08)'}}>
+              <TextInput
+                style={{flex:1,padding:14,fontSize:16,color:'#E2E8F0'}}
+                placeholder="At least 6 characters"
+                placeholderTextColor="#475569"
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry={!showPw}
+              />
+              <TouchableOpacity onPress={()=>setShowPw(!showPw)} style={{paddingHorizontal:14}}>
+                <Text style={{color:'#64748B',fontSize:13}}>{showPw?'Hide':'Show'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {mode==='signup'&&(
+            <View>
+              <Text style={{color:'#94A3B8',fontSize:12,fontWeight:'700',marginBottom:6,letterSpacing:0.5}}>CONFIRM PASSWORD</Text>
+              <TextInput
+                style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:16,color:'#E2E8F0',backgroundColor:'rgba(128,128,128,0.08)'}}
+                placeholder="Re-enter password"
+                placeholderTextColor="#475569"
+                value={confirmPw}
+                onChangeText={setConfirmPw}
+                secureTextEntry={!showPw}
+              />
+            </View>
+          )}
+
+          {!!error&&<Text style={{color:'#EF4444',fontSize:13,fontWeight:'600',textAlign:'center'}}>{error}</Text>}
+
+          <TouchableOpacity onPress={mode==='signup'?handleSignup:handleLogin} disabled={loading} style={{marginTop:8,opacity:loading?0.7:1}}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:16,borderRadius:14,alignItems:'center'}}>
+              {loading ? <ActivityIndicator color="white"/> : <Text style={{color:'white',fontSize:16,fontWeight:'700'}}>{mode==='signup'?'Create Account':'Log In'}</Text>}
+            </LinearGradient>
+          </TouchableOpacity>
+
+          {mode==='login'&&(
+            <TouchableOpacity onPress={handleForgotPassword} style={{alignItems:'center',paddingVertical:10}}>
+              <Text style={{color:'#A5B4FC',fontSize:13,fontWeight:'600'}}>Forgot Password?</Text>
+            </TouchableOpacity>
+          )}
+
+          <TouchableOpacity onPress={()=>setMode(mode==='signup'?'login':'signup')} style={{alignItems:'center',paddingVertical:12}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>{mode==='signup'?'Already have an account? ':'Don\'t have an account? '}<Text style={{color:'#A5B4FC',fontWeight:'700'}}>{mode==='signup'?'Log In':'Sign Up'}</Text></Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -11161,15 +13810,17 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,theme}:{profile:U
 const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void}) => {
   const [step,setStep] = useState(0);
   const steps = [
-    {e:'📚',t:'Welcome to Auto Learn!',d:'Learn without feeling like you\'re studying. Upload notes, take quizzes, play games, or chat with an AI expert!'},
-    {e:'🔑',t:'Set Up AI Access',d:'To use Auto Learn, you\'ll need free API keys. Go to Profile > API Keys after this tutorial to add them:\n\n• Cerebras (required: text generation) — cloud.cerebras.ai\n• Gemini (podcast live voice chat only) — aistudio.google.com\n\nAudiobook narration uses Kokoro AI (runs locally, no key needed). Both API keys are free! You can set them up later.'},
-    {e:'📖',t:'Learn Tab',d:'Upload PDF/TXT notes, or type what you want to learn. Set study session goals and the AI tracks your progress.'},
-    {e:'✍️',t:'Quiz Tab',d:'Fully customizable quizzes - multiple choice, fill-in-blank, short response, scenario questions. Control question types and count!'},
-    {e:'🎮',t:'Games Tab',d:'Pop Scholar, Brain Blocks, Lexicon - fun games with AI learning interruptions. Wrong answers end your run!'},
-    {e:'🎙️',t:'Podcast Tab',d:'You\'re the host, AI is the expert. Chat about topics while you cook, game, or exercise. Listen to AI responses aloud!'},
-    {e:'👥',t:'Friends & Orgs',d:'Add friends, see what they study, create organizations with leaderboards!'},
-    {e:'🏅',t:'Medal System',d:'Bronze (25%) → Silver (50%) → Gold (75%) → Trait (100%). Earn points for each medal and level up!'},
-    {e:'🚀',t:'You\'re Ready!',d:'Head to Profile > API Keys to add your keys, then add a topic in the Learn tab. Learn your way - quiz, games, or podcast. Good luck!'},
+    {e:'📚',t:'Welcome to Auto Learn!',d:'The smarter way to study. Upload your notes or type any topic — Auto Learn builds lessons, quizzes, games, podcasts, and study guides around your material using AI.'},
+    {e:'🔑',t:'Quick Setup',d:'You need one free API key to get started:\n\n• Cerebras — powers all AI features (lessons, quizzes, games)\n  Get it free at cloud.cerebras.ai\n\n• Gemini — optional, enables live podcast voice chat\n  Free at aistudio.google.com\n\nGo to Profile → API Keys to add them after this tutorial.'},
+    {e:'📖',t:'Learn',d:'Upload PDF/TXT notes or describe what you want to learn. Auto Learn generates structured lessons broken into sections with detailed explanations, examples, and key concepts. Read through lessons or have them read aloud with the built-in audiobook narrator.'},
+    {e:'📝',t:'Study Guides',d:'Generate concise, segmented study guides from your topics. Each guide breaks material into focused, bite-sized segments with bullet points. Mark sections as "Familiar" or "Know it" to track your review progress.'},
+    {e:'✍️',t:'Quizzes & Tests',d:'Take fully customizable quizzes with multiple choice, fill-in-blank, short response, and scenario questions. Set your question count (10, 20, 30, or 60+) and the AI generates unique, challenging questions every time. Earn XP for correct answers.'},
+    {e:'🎮',t:'Learning Games',d:'Three games that make studying fun:\n\n• Concept Clash — shoot and match bubbles with AI quizzes\n• Grid Master — clear rows and columns on a puzzle grid\n• Word Lab — guess topic-related words in 6 tries\n\nAI interrupts with questions to keep you sharp. Wrong answers end your run!'},
+    {e:'🎙️',t:'Podcast',d:'Turn any topic into a conversation. You\'re the host, AI is the expert. Ask questions, get detailed answers, and listen with natural AI voice. Perfect for learning while cooking, exercising, or commuting.'},
+    {e:'👥',t:'Friends & Organizations',d:'Connect with real users by username. View friends\' profiles, see their level and study progress, send nudges, and create XP challenges with deadlines. Create or join organizations for group accountability with study streaks and leaderboards.'},
+    {e:'🏅',t:'Leveling & Medals',d:'Every topic earns medals as you progress:\n\n🥉 Bronze at 25% → 🥈 Silver at 50%\n🥇 Gold at 75% → 🏆 Trait at 100%\n\nMedals award XP that levels you up. Your level scales progressively — easy at first, more prestigious as you climb. Track your traits, concepts learned, and legacy tree in your Profile.'},
+    {e:'🎨',t:'Make It Yours',d:'Customize your experience in Profile:\n\n• Choose from preset themes or create your own color scheme\n• Save custom themes for quick switching\n• Set your profile picture and username\n• Choose your podcast and audiobook voice\n\nLight and dark themes available!'},
+    {e:'🚀',t:'You\'re All Set!',d:'Here\'s how to start:\n\n1. Go to Profile → API Keys and add your AI provider key (Cerebras is free, or bring your own)\n2. Head to Learn and create your first topic\n3. Study your way — lessons, quizzes, games, or podcast\n\nEverything you need to learn effectively, all in one place. Let\'s go!'},
   ];
   const s = steps[step];
   return (
@@ -11180,10 +13831,10 @@ const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void
           <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>{s.t}</Text>
           <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:24}}>{s.d}</Text>
           <View style={{flexDirection:'row',gap:8,marginBottom:24}}>
-            {steps.map((_,i)=>(<View key={i} style={{width:i===step?20:8,height:8,borderRadius:4,backgroundColor:i===step?'#6366F1':'rgba(255,255,255,0.2)'}}/>))}
+            {steps.map((_,i)=>(<View key={i} style={{width:i===step?20:8,height:8,borderRadius:4,backgroundColor:i===step?'#6366F1':'rgba(128,128,128,0.3)'}}/>))}
           </View>
           <View style={{flexDirection:'row',gap:12}}>
-            {step>0&&<TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,borderWidth:1,borderColor:'rgba(255,255,255,0.2)'}}><Text style={{color:'#94A3B8',fontSize:15}}>Back</Text></TouchableOpacity>}
+            {step>0&&<TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}><Text style={{color:'#94A3B8',fontSize:15}}>Back</Text></TouchableOpacity>}
             <TouchableOpacity onPress={()=>step<steps.length-1?setStep(step+1):onComplete()}>
               <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
                 <Text style={{color:'white',fontSize:15,fontWeight:'600'}}>{step<steps.length-1?'Next':'Get Started!'}</Text>
@@ -11204,9 +13855,79 @@ export default function App() {
   const [activeTab,setActiveTab] = useState('learn');
   const [showTutorial,setShowTutorial] = useState(false);
   const [isLoading,setIsLoading] = useState(true);
+  const [authState,setAuthState] = useState<AuthState|null>(null);
+  const [authChecked,setAuthChecked] = useState(false);
   const theme = profile.themeColors;
 
-  useEffect(()=>{ loadData(); setupAudioSession(); },[]);
+  useEffect(()=>{ checkAuth(); setupAudioSession(); },[]);
+
+  const checkAuth = async () => {
+    // First check for existing Supabase session
+    if(supabase && _supabaseConfigured()) {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if(session?.user) {
+          _supabaseUserId = session.user.id;
+          // Sync data from cloud on session restore
+          await Store.syncFromCloud();
+          const username = session.user.user_metadata?.username || session.user.email?.split('@')[0] || 'Learner';
+          const auth:AuthState = {
+            isLoggedIn:true,
+            username,
+            email:session.user.email,
+            provider:'supabase',
+            createdAt:session.user.created_at || new Date().toISOString(),
+            supabaseId:session.user.id,
+          };
+          await Store.save(SK.AUTH,auth);
+          setAuthState(auth);
+          await loadData();
+          return;
+        }
+      } catch(e){ console.warn('[Auth] Supabase session check failed:', e); }
+    }
+    // Fallback: check local auth
+    const auth = await Store.load<AuthState|null>(SK.AUTH,null);
+    if(auth && auth.isLoggedIn) {
+      if(auth.supabaseId) _supabaseUserId = auth.supabaseId;
+      setAuthState(auth);
+      await loadData();
+    } else {
+      setAuthChecked(true);
+      setIsLoading(false);
+    }
+  };
+
+  const handleAuth = async (auth:AuthState, profileUpdates:Partial<UserProfile>) => {
+    await Store.save(SK.AUTH,auth);
+    setAuthState(auth);
+    if(auth.supabaseId) _supabaseUserId = auth.supabaseId;
+    // Update profile with auth info
+    if(Object.keys(profileUpdates).length>0) {
+      const existingProfile = await Store.load<UserProfile>(SK.PROFILE,defaultProfile);
+      const updated = {...defaultProfile,...existingProfile,...profileUpdates};
+      await Store.save(SK.PROFILE,updated);
+    }
+    await loadData();
+    // After first login/signup, push any existing local data to cloud
+    if(auth.provider === 'supabase') {
+      Store.pushToCloud().catch(()=>{});
+    }
+  };
+
+  const handleLogout = async () => {
+    // Sign out from Supabase
+    if(supabase && _supabaseConfigured()) {
+      try { await supabase.auth.signOut(); } catch(_){}
+    }
+    await Store.save(SK.AUTH,null);
+    _supabaseUserId = null;
+    _cerebrasApiKey = '';
+    _geminiApiKey = '';
+    _customProviderKey = ''; _customProviderUrl = ''; _customProviderModel = ''; _customProviderName = '';
+    setAuthState(null);
+    setAuthChecked(true);
+  };
 
   // Pre-activate audio session on app start so first playback is instant
   const setupAudioSession = async () => {
@@ -11218,17 +13939,25 @@ export default function App() {
 
   const loadData = async () => {
     setIsLoading(true);
-    await ApiKeys.loadAll(); // Load per-user API keys and voice preference from device storage
-    // Kokoro TTS model is loaded on-demand when user first clicks play (not on startup)
-    // This prevents the 87MB model download from making the page unresponsive on load
+    await ApiKeys.loadAll();
     const [t,p,pr,tut] = await Promise.all([
       Store.load<Topic[]>(SK.TOPICS,[]),
       Store.load<UserProfile>(SK.PROFILE,defaultProfile),
       Store.load<QuizPreset[]>(SK.PRESETS,[defaultPreset]),
       Store.load<boolean>(SK.TUTORIAL,false),
     ]);
-    setTopics(t); setProfile(p); if(pr.length>0)setPresets(pr); if(!tut)setShowTutorial(true);
+    // Migrate old profiles: add missing fields
+    const migratedProfile:UserProfile = {
+      ...defaultProfile,
+      ...p,
+      totalConceptsLearned: p.totalConceptsLearned || t.reduce((s:number,tp:Topic)=>s+tp.concepts.filter((c:Concept)=>c.mastered).length,0),
+      traitTopicIds: p.traitTopicIds || t.filter((tp:Topic)=>tp.medal==='trait').map((tp:Topic)=>tp.id),
+      level: getLevelFromPoints(p.totalPoints||0),
+    };
+    if(!p.totalConceptsLearned||!p.traitTopicIds) Store.save(SK.PROFILE,migratedProfile);
+    setTopics(t); setProfile(migratedProfile); if(pr.length>0)setPresets(pr); if(!tut)setShowTutorial(true);
     setIsLoading(false);
+    setAuthChecked(true);
   };
 
   const handleAddTopic = async (t:Topic) => {
@@ -11267,8 +13996,14 @@ export default function App() {
       return u;
     });
   };
-  const handleUpdateProfile = async (updates:Partial<UserProfile>) => { const u={...profile,...updates}; setProfile(u); Store.save(SK.PROFILE,u); };
-  const handleSavePreset = async (p:QuizPreset) => { const u=[...presets,p]; setPresets(u); Store.save(SK.PRESETS,u); };
+  const handleUpdateProfile = async (updates:Partial<UserProfile>) => {
+    const u={...profile,...updates};
+    setProfile(u);
+    Store.save(SK.PROFILE,u);
+    // Sync public profile to Supabase for social features
+    SocialDB.syncPublicProfile(u).catch(()=>{});
+  };
+  const handleSavePreset = async (p:QuizPreset) => { setPresets(prev => { const u=[...prev,p]; Store.save(SK.PRESETS,u); return u; }); };
   const handleTutorialComplete = async () => { setShowTutorial(false); Store.save(SK.TUTORIAL,true); handleUpdateProfile({tutorialCompleted:true}); };
 
   const tabs = [
@@ -11281,11 +14016,16 @@ export default function App() {
   ];
 
   if(isLoading) return (
-    <View style={{flex:1,justifyContent:'center',alignItems:'center',backgroundColor:theme.background}}>
-      <ActivityIndicator size="large" color={theme.primary}/>
-      <Text style={{color:theme.text,marginTop:16,fontSize:16}}>Loading Auto Learn...</Text>
+    <View style={{flex:1,justifyContent:'center',alignItems:'center',backgroundColor:'#0F0F1A'}}>
+      <ActivityIndicator size="large" color="#6366F1"/>
+      <Text style={{color:'#E2E8F0',marginTop:16,fontSize:16}}>Loading Auto Learn...</Text>
     </View>
   );
+
+  // Show auth screen if not logged in
+  if(!authState || !authState.isLoggedIn) {
+    return <AuthScreen onAuth={handleAuth}/>;
+  }
 
   const renderScreen = () => {
     switch(activeTab){
@@ -11293,24 +14033,26 @@ export default function App() {
       case 'quiz': return <QuizScreen topics={topics} presets={presets} onSavePreset={handleSavePreset} onUpdateTopic={handleUpdateTopic} onUpdateProfile={handleUpdateProfile} profile={profile} theme={theme}/>;
       case 'games': return <GamesScreen topics={topics} onUpdateTopic={handleUpdateTopic} onUpdateProfile={handleUpdateProfile} profile={profile} theme={theme}/>;
       case 'podcast': return <PodcastScreen topics={topics} theme={theme}/>;
-      case 'friends': return <FriendsScreen profile={profile} theme={theme}/>;
-      case 'profile': return <ProfileScreen profile={profile} topics={topics} onUpdate={handleUpdateProfile} onShowTutorial={()=>setShowTutorial(true)} theme={theme}/>;
+      case 'friends': return <FriendsScreen profile={profile} onUpdateProfile={handleUpdateProfile} theme={theme}/>;
+      case 'profile': return <ProfileScreen profile={profile} topics={topics} onUpdate={handleUpdateProfile} onShowTutorial={()=>setShowTutorial(true)} onLogout={handleLogout} theme={theme}/>;
       default: return null;
     }
   };
 
+  const adaptive = _themeAdaptive(theme);
+
   return (
     <View style={{flex:1,backgroundColor:theme.background}}>
-      <StatusBar style="light"/>
+      <StatusBar style={adaptive.statusBar}/>
       <TutorialModal visible={showTutorial} onComplete={handleTutorialComplete}/>
       {renderScreen()}
-      <View style={{flexDirection:'row',paddingTop:6,paddingBottom:28,paddingHorizontal:4,borderTopWidth:1,borderTopColor:'rgba(255,255,255,0.08)',backgroundColor:theme.card}}>
+      <View style={{flexDirection:'row',paddingTop:6,paddingBottom:28,paddingHorizontal:4,borderTopWidth:1,borderTopColor:adaptive.tabBorder,backgroundColor:adaptive.tabBar}}>
         {tabs.map(tab=>{
           const Icon=tab.icon; const active=activeTab===tab.id;
           return (
             <TouchableOpacity key={tab.id} style={{flex:1,alignItems:'center',paddingVertical:6,borderRadius:10,backgroundColor:active?theme.primary+'20':'transparent'}} onPress={()=>setActiveTab(tab.id)}>
-              <Icon s={20} c={active?theme.primary:'#64748B'}/>
-              <Text style={{fontSize:10,fontWeight:'500',marginTop:2,color:active?theme.primary:'#64748B'}}>{tab.label}</Text>
+              <Icon s={20} c={active?theme.primary:adaptive.mutedLight}/>
+              <Text style={{fontSize:10,fontWeight:'500',marginTop:2,color:active?theme.primary:adaptive.mutedLight}}>{tab.label}</Text>
             </TouchableOpacity>
           );
         })}
@@ -11326,12 +14068,12 @@ const st = StyleSheet.create({
   title:{fontSize:26,fontWeight:'700',marginBottom:8},
   sub:{fontSize:15,color:'#64748B',marginBottom:24},
   section:{fontSize:12,color:'#64748B',fontWeight:'600',letterSpacing:1,marginTop:24,marginBottom:12},
-  card:{borderRadius:16,padding:20,marginBottom:16,borderWidth:1,borderColor:'rgba(255,255,255,0.08)'},
+  card:{borderRadius:16,padding:20,marginBottom:16,borderWidth:1,borderColor:'rgba(128,128,128,0.15)'},
   cardTitle:{fontSize:18,fontWeight:'600',marginBottom:8},
   input:{fontSize:16,marginBottom:16},
   btn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:10,paddingVertical:16,borderRadius:14,marginBottom:16},
   btnText:{color:'white',fontSize:16,fontWeight:'600'},
-  progBg:{height:10,backgroundColor:'rgba(255,255,255,0.1)',borderRadius:5,overflow:'hidden'},
+  progBg:{height:10,backgroundColor:'rgba(128,128,128,0.15)',borderRadius:5,overflow:'hidden'},
   progFill:{height:'100%',borderRadius:5},
-  overlay:{flex:1,backgroundColor:'rgba(0,0,0,0.7)',justifyContent:'center',alignItems:'center',padding:20},
+  overlay:{flex:1,backgroundColor:'rgba(0,0,0,0.55)',justifyContent:'center',alignItems:'center',padding:20},
 });
