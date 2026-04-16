@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Alert,
   ActivityIndicator, Switch, Modal, Dimensions, KeyboardAvoidingView, Platform, useWindowDimensions,
-  Animated, FlatList, LayoutAnimation, RefreshControl,
+  Animated, FlatList, LayoutAnimation, RefreshControl, Linking,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -1167,8 +1167,10 @@ const UsageTracker = {
 
 // ── Global Cerebras API request queue ──────────────────────────────────────
 // Serializes all Cerebras requests. 1M tokens/day, 60K TPM — very generous limits.
+// Tracks cooldowns per model to handle rate limiting more gracefully.
 let _cerebrasQueue: Promise<void> = Promise.resolve();
 let _cerebrasCooldownUntil: number = 0;
+let _cerebrasModelCooldowns: { [model: string]: number } = {};
 function enqueueCerebras<T>(fn: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     _cerebrasQueue = _cerebrasQueue.then(async () => {
@@ -2277,6 +2279,12 @@ const AI = {
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
         // Try models in quality order — fall back if a model returns 404 (unavailable on free tier)
         for(const model of CEREBRAS_MODELS) {
+          // Skip if this model is in cooldown
+          const modelCooldownMs = (_cerebrasModelCooldowns[model] || 0) - Date.now();
+          if(modelCooldownMs > 0) {
+            console.warn(`AI: Cerebras model ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s`);
+            continue;
+          }
           const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
             method:'POST',
             headers:{'Content-Type':'application/json','Authorization':`Bearer ${_cerebrasApiKey}`},
@@ -2288,20 +2296,23 @@ const AI = {
             continue;
           }
           if(r.status===429) {
+            // Exponential backoff: start at 15s, cap at 120s
             const retryAfter = r.headers.get('retry-after');
-            const waitMs = retryAfter ? Math.max(parseFloat(retryAfter)||30, 30) * 1000 : 60000;
-            console.warn(`AI: Cerebras 429 — waiting ${Math.round(waitMs/1000)}s`);
-            _cerebrasCooldownUntil = Math.max(_cerebrasCooldownUntil, Date.now() + waitMs);
-            return '';
+            let waitMs = retryAfter ? parseFloat(retryAfter)||30 : 15;
+            waitMs = Math.max(15, Math.min(120, waitMs * 1000));
+            console.warn(`AI: Cerebras 429 on ${model} — waiting ${Math.round(waitMs/1000)}s`);
+            _cerebrasModelCooldowns[model] = Date.now() + waitMs;
+            // Set global cooldown to 15s to avoid hammering (other models can still work)
+            _cerebrasCooldownUntil = Math.max(_cerebrasCooldownUntil, Date.now() + 15000);
+            continue; // Try next model instead of giving up
           }
           if(r.status===401) { this._safeAlert('Invalid Cerebras Key','Your Cerebras API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-          if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status}`); return ''; }
+          if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status} on ${model}`); continue; }
           const d = await r.json();
           const text = d?.choices?.[0]?.message?.content;
           if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
-          return '';
         }
-        console.warn('AI: All Cerebras models failed');
+        console.warn('AI: All Cerebras models failed or rate-limited');
         return '';
       } catch(e:any) {
         if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
@@ -2781,6 +2792,16 @@ ${sourceBlock}
 Concepts to teach (cover ALL of these):
 ${conceptList}
 
+CONTENT FILTERS (EXCLUDE — these are noise, not teachable content):
+- Course logistics, schedules, exam/quiz dates, office hours, assignment deadlines
+- Professor announcements, grade breakdowns, previous test scores, class averages, score distributions
+- Practice questions from the source (understand them but do not reproduce them as lesson content)
+- Slide numbers, page headers/footers, watermarks, filenames, copyright lines
+- Class-discussion prompts ("Class Discussion:", "Discussion Question:") — conversation starters, not teachable material. Absorb the underlying topic but do not present the question itself.
+- Instructor anecdotes unrelated to the subject
+- Administrative notes ("re-read chapter X", "see syllabus")
+Focus ONLY on subject-matter content that teaches this section's theme.
+
 LENGTH REQUIREMENT: Write at least 2-3 full paragraphs (each 80-120 words) for EACH concept listed above. If there are 4 concepts, that means at least 8 paragraphs. The "lesson" field MUST total 800-1200 words. A lesson under 600 words will be rejected.
 
 FORMAT RULES:
@@ -2844,11 +2865,28 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
     const alreadyCoveredBlock = alreadyCoveredTitles && alreadyCoveredTitles.length > 0
       ? `\nALREADY COVERED IN PREVIOUS SECTIONS (DO NOT REPEAT ANY OF THESE — skip them entirely):\n${alreadyCoveredTitles.map((t,i)=>`${i+1}. ${t}`).join('\n')}\n\nIf a concept from the list below was already covered above, DO NOT create a segment for it. Only cover NEW material that has not appeared yet.\n`
       : '';
-    const p = `You are creating a CONCISE study guide for "${topicTitle}" — section: "${section.title}".
+    const p = `You are creating a COMPLETE but EFFICIENTLY-WORDED study guide for "${topicTitle}" — section: "${section.title}".
 ${lessonContext}${sourceContext}
 CONCEPTS TO COVER (only if NOT already covered):
 ${conceptList}
 ${alreadyCoveredBlock}
+COMPLETENESS MANDATE (MOST IMPORTANT RULE):
+- The student must be able to read this study guide and know EVERYTHING they need to know from this section — nothing important omitted
+- Scan the source material for EVERY distinct theory, term, case, principle, formula, example, date, or fact that fits the section theme — each deserves a segment (or a bullet within a related segment)
+- If the source lists numbered items (e.g., Theory 1, Theory 2, Theory 3, Theory 4, Theory 5) — ALL of them must appear. Never skip a number in a sequence.
+- Before finishing, mentally re-scan the source: is there anything important you skipped? If yes, add it.
+- Err on the side of MORE segments over fewer. It is better to have 12 focused segments than 6 segments with gaps.
+
+CONTENT FILTERS (EXCLUDE from your output — these are noise, not content):
+- Course logistics: class schedules, quiz/test/exam dates, office hours, assignment deadlines
+- Professor-specific announcements, grade breakdowns, previous test scores, score distributions, class averages
+- Practice questions / sample problems from the source (use them to understand what's important, but do not reproduce them as segments)
+- Slide numbers, page headers/footers, document watermarks, copyright notices, filenames
+- Meta-discussion prompts aimed at the class ("Class Discussion:", "Discussion Question:") — these are conversation starters, not teachable content. You may absorb the underlying topic but do not present the question itself.
+- Instructor anecdotes unrelated to the subject matter
+- Administrative notes ("re-read chapter X", "see syllabus")
+Focus ONLY on subject-matter content that teaches the section theme.
+
 CRITICAL RULE — NO REPETITION:
 - Each concept/topic must appear EXACTLY ONCE in the entire study guide
 - If a concept was already covered in a previous section, SKIP IT completely — do not create a segment for it
@@ -2858,7 +2896,8 @@ CRITICAL RULE — NO REPETITION:
 
 SEGMENTATION RULES:
 Each segment covers ONE focused idea. A single concept may become multiple segments ONLY if it has genuinely distinct sub-ideas that were NOT previously covered.
-Progress through concepts systematically — go topic by topic in a logical order.
+Progress through concepts systematically — go topic by topic in a logical order, preserving the order of the source when chapters/classes are present.
+If the source is organized by chapter/class/unit (e.g., "Class 18", "Chapter 7"), maintain that order so multi-section selections stay cleanly grouped.
 
 TITLE RULES (CRITICAL — varied, descriptive titles):
 - Each title must be UNIQUE and SPECIFIC to the actual content
@@ -2990,11 +3029,12 @@ Generate exactly ${count} questions. Each question must test REAL knowledge from
 
 CRITICAL RULES FOR EVERY QUESTION:
 1. The question text must be a REAL, specific, educational question — e.g., "What are the three elements required for promissory estoppel?", "Which type of contract involves only one party making a promise?", "In a bilateral contract, how many promises are exchanged?"
-2. NEVER generate vague questions like "Which of the following is an example of [concept name]?" or "What best describes [concept name]?" — these are lazy and do not test understanding
-3. The question must be answerable from the material without needing to see the concept name as a hint
-4. Each answer option must be 5-25 words long — not too short (single word) and not too long (full paragraphs)
-5. All 4 options must be similar in length and style — a student should NOT be able to guess the answer by picking the longest or most detailed option
-6. PROOFREAD everything: fix all typos, spelling errors, and grammar issues
+2. NEVER generate vague questions like "Which of the following is an example of [concept name]?", "What best describes [concept name]?", or "Which describes [chapter/section name]?" — these are lazy and do not test understanding
+3. NEVER ask about course logistics, test/quiz dates, score statistics, or meta-content — focus purely on the subject matter
+4. The question must be answerable from the material without needing to see the concept name as a hint
+5. Each answer option must be 5-25 words long — not too short (single word) and not too long (full paragraphs)
+6. All 4 options must be similar in length and style — a student should NOT be able to guess the answer by picking the longest or most detailed option
+7. PROOFREAD everything: fix all typos, spelling errors, and grammar issues
 
 FOR MULTIPLE_CHOICE:
 - 4 options, one correct, three strong distractors
@@ -3062,17 +3102,28 @@ Return ONLY valid JSON:
         }
       } catch(e){}
     }
-    // Final fallback: generate questions using descriptions (only if AI completely fails)
-    // Use descriptions to form real questions, not concept names as answers
+    // Final fallback: generate real questions from descriptions with varied, specific phrasing
+    // (only fires if AI completely fails — filter meta-named concepts and rotate templates so
+    //  users don't see formulaic "which describes X?" questions)
     const shorten = (s:string, max:number=80) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
-    return _shuffle(concepts).slice(0,count).map((c,i)=>{
-      // Build a real question from the description
+    const isGenericName = (n:string) => /^(chapter|week|lesson|slide|section|part|unit|module|overview|introduction|lecture|class|quiz|test|exam|summary|topic|notes?)\b/i.test((n||'').trim()) || (n||'').trim().length < 3;
+    const usable = concepts.filter(c => !isGenericName(c.name) && c.description && c.description.length > 20);
+    const pool = usable.length >= 2 ? usable : concepts;
+    const qTemplates = [
+      (name:string) => `What is a defining characteristic of ${name}?`,
+      (name:string) => `Which statement most accurately describes ${name}?`,
+      (name:string) => `How is ${name} best understood in this context?`,
+      (name:string) => `What is the most important thing to know about ${name}?`,
+      (name:string) => `Which of the following is true of ${name}?`,
+    ];
+    return _shuffle(pool).slice(0,count).map((c,i)=>{
       const desc = shorten(c.description, 80);
-      const others = concepts.filter(c2=>c2.id!==c.id);
+      const others = concepts.filter(c2=>c2.id!==c.id && c2.description && c2.description.length>15);
       const distractorDescs = _shuffle(others).slice(0,3).map(c2=>shorten(c2.description,80));
-      while(distractorDescs.length<3) distractorDescs.push(`A process that involves analyzing ${safeStr(topic.title)} from a different perspective`);
+      while(distractorDescs.length<3) distractorDescs.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 80));
       const opts = _shuffle([desc,...distractorDescs]);
-      return { id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:`In the context of ${topic.title}, which of the following correctly describes ${c.name}?`, options:opts, correctAnswer:desc, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty };
+      const template = qTemplates[i % qTemplates.length];
+      return { id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:template(c.name), options:opts, correctAnswer:desc, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty };
     });
   },
 
@@ -3169,22 +3220,22 @@ ${msgs}
 Host's latest turn:
 "${_compactSpeech(lastUserTurn, 260)}"
 
-Respond as the expert. Be warm, natural, and conversational — like a real podcast phone call. Share specific, interesting knowledge only after directly responding to what Host just said.
+Respond as the expert. Be warm, natural, and conversational — like a real podcast phone call. Share specific, interesting knowledge only after directly responding to what the host just said.
 
 IMPORTANT RULES:
 - 3-5 sentences, spoken naturally as if talking out loud
-- Address the user ONLY as "Host" when directly addressing them
-- NEVER invent or guess the user's name
-- If Host interrupted, adapt immediately to that interruption instead of finishing your old point
-- Be reactive: answer Host's exact request first. If Host asks about a person/topic, stay on that exact person/topic
-- If Host's request is ambiguous or partial, ask one short clarifying question instead of assuming facts
-- Do not insert made-up claims, made-up names, or details Host did not ask for
+- DO NOT say "Host" in this response. Only say "Host" at the very start of the conversation or when resuming after a pause. In normal flowing conversation, just speak to them directly without addressing them by any name.
+- NEVER invent or guess the user's real name
+- If the host interrupted, adapt immediately to that interruption instead of finishing your old point
+- Be reactive: answer the host's exact request first. If they ask about a person/topic, stay on that exact person/topic
+- If the request is ambiguous or partial, ask one short clarifying question instead of assuming facts
+- Do not insert made-up claims, made-up names, or details that weren't asked for
 - Avoid boilerplate phrases like "that's a great question" unless genuinely needed
-- After sharing your answer, ask Host one concise follow-up question to keep the conversation flowing
+- After sharing your answer, naturally end with a concise follow-up question to keep the conversation flowing
 - NEVER use markdown, bullet points, or formatting — this is SPOKEN audio, not text
 - No asterisks, hashtags, or special characters — just natural speech
 - Occasionally reference things the host said earlier to show you're listening
-- Avoid repeating the same explanation from prior turns`;
+- NEVER repeat an explanation, example, analogy, or insight you already shared in prior turns — always bring a fresh angle`;
     // Podcast uses cross-provider fallback: Gemini first, then Cerebras
     const result = await this.callForPodcast(p, 2, signal);
     const normalized = result ? this._normalizePodcastText(result) : '';
@@ -3213,17 +3264,17 @@ ${msgs}
 Your most recent spoken chunk:
 "${_compactSpeech(lastAiTurn, 260)}"
 
-Continue with the next spoken chunk. Move forward to a NEW subtopic, teach deeply with concrete examples, useful analogies, and practical takeaways, and keep it engaging and educational.
+Continue with the next spoken chunk. Move forward to a NEW subtopic that you have NOT already covered, teach deeply with concrete examples, useful analogies, and practical takeaways, and keep it engaging and educational.
 
 IMPORTANT RULES:
 - 5-8 spoken sentences
-- Address the user ONLY as "Host" when directly addressing them
-- NEVER invent or guess the user's name
+- DO NOT say "Host" in this chunk. You already addressed them earlier. Now just teach — speak to them directly without a name.
+- NEVER invent or guess the user's real name
 - Do NOT ask a follow-up question at the end of this chunk
 - End with a natural bridge sentence that can flow into the next chunk
-- Mention that Host can jump in anytime only occasionally (not every chunk)
 - NEVER use markdown, bullet points, or formatting
-- Avoid repeating wording from previous chunks`;
+- COVERAGE: Each chunk must teach NEW material. Scan your prior chunks in the conversation above — if you're about to repeat an example, analogy, definition, or insight you already gave, choose a genuinely different angle instead.
+- Keep advancing through the topic — do not circle back to points you already made`;
     const result = await this.callForPodcast(p, 2, signal);
     return result || `Host, here's another angle on ${topic}. One useful way to understand it is to break it into core principles, then look at how those principles show up in real situations. When you connect theory to concrete examples, the topic becomes much easier to retain and apply in practice.`;
   },
@@ -3246,12 +3297,13 @@ OTHER CONCEPTS: ${otherInfo}
 
 RULES:
 1. Write a SPECIFIC, educational question — e.g., "What are the three required elements of promissory estoppel?", "Which type of contract involves only one promise?"
-2. NEVER write lazy questions like "Which describes X?" or "What is an example of X?"
-3. Create exactly 4 options, each 5-20 words long, all similar length
-4. One correct answer, three plausible wrong answers (misconceptions, partial truths, related-but-wrong)
-5. NEVER use "None of the above", "Not related to", or any generic filler
-6. Correct answer position must be randomized
-7. Fix all typos and grammar
+2. NEVER write lazy questions like "Which describes X?", "What is an example of X?", or "Which best describes [chapter/section]?"
+3. NEVER ask about course logistics, test dates, or meta-content — focus purely on the subject matter
+4. Create exactly 4 options, each 5-20 words long, all similar length
+5. One correct answer, three plausible wrong answers (misconceptions, partial truths, related-but-wrong)
+6. NEVER use "None of the above", "Not related to", or any generic filler
+7. Correct answer position must be randomized
+8. Fix all typos and grammar
 
 Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct option text","options":["Option A","Option B","Option C","Option D"]}`;
     // Try with retry
@@ -3273,14 +3325,21 @@ Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct optio
         }
       } catch(e){}
     }
-    // Fallback: use shortened DESCRIPTIONS as options (meaningful content, not raw names)
+    // Fallback: varied real questions using DESCRIPTIONS as options (no formulaic "which describes X?")
     const shorten = (s:string, max:number=60) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
     const correctDesc = shorten(c.description);
-    const others = concepts.filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const others = concepts.filter(x=>x.id!==c.id && x.description && x.description.length>15).sort(()=>Math.random()-0.5).slice(0,3);
     const distractorDescs = others.map(x=>shorten(x.description));
-    while(distractorDescs.length<3) distractorDescs.push(`A method for evaluating ${safeStr(topic.title)} outcomes`);
+    while(distractorDescs.length<3) distractorDescs.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 60));
     const allOpts = [correctDesc,...distractorDescs].sort(()=>Math.random()-0.5);
-    return { question:`In ${topic.title}, which of the following correctly describes ${c.name}?`, answer:correctDesc, options:allOpts.slice(0,4), conceptId:c.id };
+    const gameTemplates = [
+      (name:string) => `What is a defining characteristic of ${name}?`,
+      (name:string) => `Which statement most accurately describes ${name}?`,
+      (name:string) => `What is the key thing to know about ${name}?`,
+      (name:string) => `Which of the following is true of ${name}?`,
+    ];
+    const qText = gameTemplates[Math.floor(Math.random()*gameTemplates.length)](c.name);
+    return { question:qText, answer:correctDesc, options:allOpts.slice(0,4), conceptId:c.id };
   },
 
   async getWordleWords(topic:Topic,count:number=5):Promise<{word:string;hint:string;conceptId:string}[]> {
@@ -3318,8 +3377,10 @@ IMPORTANT: Words must be exactly 4-6 letters, uppercase, single words only (no s
     const c = pool[Math.floor(Math.random()*pool.length)];
     if(!c) return {text:`${topic.title} is a fascinating subject.`,question:'Did you find this interesting?',answer:'Yes',options:['Yes','No','Maybe','Not sure']};
     const p = `About "${c.name}" (${c.description}) for topic "${topic.title}".
-STRICT: Write EXACTLY 2 short sentences (max 30 words total) teaching one key fact. Then a multiple-choice question testing that fact.
-IMPORTANT: All 4 answer options must be real, specific answers. NEVER use placeholder labels like "correct", "wrong1", "incorrect".
+STRICT: Write EXACTLY 2 short sentences (max 30 words total) teaching one key subject-matter fact. Then a multiple-choice question testing that fact.
+NEVER use the lazy phrasing "Which describes X?" or "What best describes X?" — ask a specific, educational question.
+NEVER reference course logistics, test dates, or meta-content — focus only on the subject matter.
+All 4 answer options must be real, specific answers (not placeholder labels like "correct", "wrong1").
 Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific question about what was taught?","answer":"The correct answer","options":["The correct answer","Plausible wrong 1","Plausible wrong 2","Plausible wrong 3"]}`;
     const r = await this.call(p);
     try {
@@ -3337,12 +3398,18 @@ Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific qu
         }
       }
     } catch(e){}
-    // Fallback with concept descriptions as options
+    // Fallback with concept descriptions as options and varied question phrasing
     const shorten = (s:string,max:number=60)=>s.length>max?s.substring(0,max).replace(/\s+\S*$/,'...'):s;
-    const others = (topic.concepts||[]).filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const others = (topic.concepts||[]).filter(x=>x.id!==c.id && x.description && x.description.length>15).sort(()=>Math.random()-0.5).slice(0,3);
     const fallbackOpts = [shorten(c.description),...others.map(x=>shorten(x.description))];
-    while(fallbackOpts.length<4) fallbackOpts.push(`A process for analyzing ${safeStr(topic.title)} outcomes`);
-    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:`In ${topic.title}, which correctly describes ${c.name}?`,answer:shorten(c.description),options:fallbackOpts.sort(()=>Math.random()-0.5).slice(0,4),conceptId:c.id};
+    while(fallbackOpts.length<4) fallbackOpts.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 60));
+    const snippetTemplates = [
+      (name:string) => `What is most true about ${name}?`,
+      (name:string) => `Which statement best captures ${name}?`,
+      (name:string) => `What is a defining trait of ${name}?`,
+    ];
+    const qText = snippetTemplates[Math.floor(Math.random()*snippetTemplates.length)](c.name);
+    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:qText,answer:shorten(c.description),options:fallbackOpts.sort(()=>Math.random()-0.5).slice(0,4),conceptId:c.id};
   },
 
   async getStudyEstimate(topic:Topic, goal:string, mode?:'quiz'|'games'|'mixed'):Promise<string> {
@@ -9337,13 +9404,13 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           )}
         </View>
 
-        {/* Question overlay */}
+        {/* Question overlay — theme-aware so it matches the rest of the app */}
         {showQ&&gameQ&&(
-          <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:'rgba(0,0,0,0.92)',justifyContent:'center',padding:24,zIndex:100}}>
-            {gameQ.teachText&&<Text style={{color:'#A78BFA',fontSize:12,fontWeight:'600',marginBottom:12,textAlign:'center'}}>{gameQ.teachText}</Text>}
-            <Text style={{color:'white',fontSize:18,fontWeight:'600',textAlign:'center',lineHeight:26,marginBottom:20}}>{gameQ.question}</Text>
+          <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:_isLightTheme(theme.background)?'rgba(255,255,255,0.96)':'rgba(15,23,42,0.94)',justifyContent:'center',padding:24,zIndex:100,borderWidth:1,borderColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.15)':'rgba(255,255,255,0.08)'}}>
+            {gameQ.teachText&&<Text style={{color:theme.primary,fontSize:12,fontWeight:'600',marginBottom:12,textAlign:'center'}}>{gameQ.teachText}</Text>}
+            <Text style={{color:theme.text,fontSize:18,fontWeight:'600',textAlign:'center',lineHeight:26,marginBottom:20}}>{gameQ.question}</Text>
             {(gameQ.options||[]).map((o,i)=>(
-              <TouchableOpacity key={i} style={{backgroundColor:'rgba(128,128,128,0.15)',padding:14,borderRadius:12,marginBottom:10}} onPress={()=>{
+              <TouchableOpacity key={i} style={{backgroundColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.08)':'rgba(255,255,255,0.06)',padding:14,borderRadius:12,marginBottom:10,borderWidth:1,borderColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.15)':'rgba(255,255,255,0.08)'}} onPress={()=>{
                 const correct=safeStr(o).trim().toLowerCase()===safeStr(gameQ.answer).trim().toLowerCase();
                 setQAnswered(a=>a+1);
                 if(correct){
@@ -9357,7 +9424,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                   setStep('results');
                 }
               }}>
-                <Text style={{color:'white',fontSize:15,textAlign:'center'}}>{o}</Text>
+                <Text style={{color:theme.text,fontSize:15,textAlign:'center'}}>{o}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -9918,18 +9985,30 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
       : '';
     // System instruction matches the Auto podcast character spec
     return (
-      `Your name is Auto. You are an expert podcast guest and brilliant teacher. ` +
-      `IMPORTANT: Always address the listener as "Host" — never use real names, nicknames, ` +
-      `or made-up names. Say "Host" when speaking to or about the listener.\n\n` +
+      `Your name is Auto. You are an expert podcast guest and brilliant teacher.\n\n` +
+      `HOW TO ADDRESS THE LISTENER:\n` +
+      `- Use "Host" ONLY at the very beginning of the conversation, or when resuming after a pause or interruption.\n` +
+      `- Do NOT say "Host" in every response. In the flow of natural conversation, avoid addressing them by any name — just speak to them like a friend.\n` +
+      `- NEVER invent or guess a real name, nickname, or made-up name for the listener.\n` +
+      `- When you must address them, "Host" is the only acceptable term.\n\n` +
+      `DEPTH AND DETAIL:\n` +
+      `When the listener asks a question or requests an explanation, provide COMPREHENSIVE, detail-heavy responses that demonstrate deep expertise. Include:\n` +
+      `- Specific examples, case studies, and real-world applications\n` +
+      `- Key principles, frameworks, and underlying logic\n` +
+      `- Nuanced distinctions between related concepts\n` +
+      `- Historical context or evolution of the idea\n` +
+      `- Do NOT say things are "key and important" without explaining WHY they matter and WHAT they accomplish. Be specific.\n` +
+      `Speak naturally and avoid jargon, but never sacrifice substantive detail for brevity.\n\n` +
       `You are enthusiastic, warm, conversational, and deeply knowledgeable on whatever topic ` +
-      `the Host brings to you. Speak naturally — use transitions, show genuine curiosity, and keep ` +
+      `the listener brings to you. Speak naturally — use transitions, show genuine curiosity, and keep ` +
       `the conversation flowing. After making a point or answering a question, naturally continue ` +
       `to the next insight or angle on the topic — you are the expert guest sharing your knowledge. ` +
-      `If the Host speaks or interrupts, respond to them warmly. If the Host says "one second", ` +
+      `If the listener speaks or interrupts, respond to them warmly. If they say "one second", ` +
       `"hold on", or anything indicating they are temporarily busy, stop talking and wait until ` +
       `they speak again. Never break character. ` +
-      `Your goal is to make the Host feel like they are having a real, flowing conversation with the ` +
-      `world's most knowledgeable and engaging friend — not a turn-based Q&A.\n\n` +
+      `Your goal is to make the listener feel like they are having a real, flowing conversation with the ` +
+      `world's most knowledgeable and engaging friend — not a turn-based Q&A, and not someone who says "Host" every 10 seconds.\n\n` +
+      `AVOID REPETITION: Never repeat an insight, example, or analogy you have already shared in this conversation. If you find yourself about to cover ground you already covered, pivot to a fresh angle instead.\n\n` +
       `The current topic is "${topicTitle}".\n\n` +
       summaryBlock
     );
@@ -10788,12 +10867,14 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
     if(!sessionRef.current || pausedRef.current || contextPausedRef.current) return;
     if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
 
-    // Monologue mode (muted): immediately send continuation prompt so AI keeps talking
-    if(muteSelfRef.current) {
+    // Monologue mode: immediately send continuation prompt so AI keeps talking.
+    // Decoupled from mute state — monologue keeps flowing even after user unmutes,
+    // until the user actually speaks (handleUserSpeech flips mode back to 'interactive').
+    if(conversationModeRef.current === 'monologue') {
       setTimeout(()=>{
         if(!sessionRef.current || pausedRef.current || contextPausedRef.current) return;
-        if(!muteSelfRef.current) return; // user unmuted during timeout
-        void sendLivePrompt('Continue your lecture on this topic. Move to the next key insight.', { markLoading: false });
+        if(conversationModeRef.current !== 'monologue') return; // switched to interactive during timeout
+        void sendLivePrompt('Continue your monologue on this topic. Move forward to a NEW insight you have not yet covered — do not repeat earlier points.', { markLoading: false });
       }, 300);
       return;
     }
@@ -10986,6 +11067,12 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
     }
     lastUserSpeechAtRef.current = Date.now();
     if(silenceTimerRef.current){ clearTimeout(silenceTimerRef.current); silenceTimerRef.current=null; }
+
+    // Real user utterance — exit monologue mode (if we were in it) and go interactive.
+    // This is where the monologue-keeps-flowing-after-unmute loop naturally ends.
+    if(conversationModeRef.current === 'monologue' && !muteSelfRef.current) {
+      setConversationMode('interactive');
+    }
 
     if(detectEndSessionCue(normalized)) {
       cancelInFlightAI();
@@ -11182,7 +11269,8 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
         }
       }
       setMuteSelf(false);
-      setConversationMode('interactive');
+      // Stay in monologue mode after unmute — AI keeps flowing until user actually speaks.
+      // handleUserSpeech will flip mode to 'interactive' when it detects a real user utterance.
       if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
       // Reuse existing live session — just restart mic streaming (no reconnection needed)
       if(useMicCaptureRef.current && liveSessionRef.current) {
@@ -11238,9 +11326,10 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
         setTimeout(()=>startListening(), 140);
         if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current=null; }
       }
-      // In monologue mode, AI needs a prompt to resume lecturing since mic is muted
+      // In monologue mode, AI needs a prompt to resume lecturing since mic is muted.
+      // Signal to the AI that this is a RESUME so it briefly greets "Host" before continuing.
       if(muteSelfRef.current && liveSessionRef.current) {
-        void sendLivePrompt('Continue your lecture on this topic. Pick up from where you left off and share the next key insight.', { markLoading: false });
+        void sendLivePrompt('Host just resumed the podcast after a pause. Briefly say "Welcome back, Host" in one short sentence, then continue the monologue with a NEW insight you have not yet covered.', { markLoading: false });
       }
     } else {
       // Pause via UI button — also clear contextual pause state
@@ -13791,6 +13880,20 @@ const AuthScreen = ({onAuth}:{onAuth:(auth:AuthState,profileUpdates:Partial<User
             </LinearGradient>
           </TouchableOpacity>
 
+          {_supabaseConfigured() && (
+            <>
+              <View style={{flexDirection:'row',alignItems:'center',marginVertical:10}}>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+                <Text style={{color:'#64748B',fontSize:13,marginHorizontal:12}}>or</Text>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+              </View>
+              <TouchableOpacity onPress={handleGoogleSignIn} disabled={loading} style={{flexDirection:'row',paddingVertical:14,borderRadius:14,alignItems:'center',justifyContent:'center',gap:10,backgroundColor:'#fff',opacity:loading?0.7:1}}>
+                <Text style={{fontSize:20,fontWeight:'700',color:'#4285F4'}}>G</Text>
+                <Text style={{color:'#1F2937',fontSize:16,fontWeight:'600'}}>Continue with Google</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
           {mode==='login'&&(
             <TouchableOpacity onPress={handleForgotPassword} style={{alignItems:'center',paddingVertical:10}}>
               <Text style={{color:'#A5B4FC',fontSize:13,fontWeight:'600'}}>Forgot Password?</Text>
@@ -13807,41 +13910,329 @@ const AuthScreen = ({onAuth}:{onAuth:(auth:AuthState,profileUpdates:Partial<User
 };
 
 // ========== TUTORIAL ==========
+// Two-phase design per UX spec:
+//   Phase 1 (MANDATORY): API key setup — can't be skipped. Users are walked through
+//           getting their free Cerebras key (and optional Gemini key) step-by-step,
+//           with clickable "Open in browser" buttons and paste fields right there.
+//   Phase 2 (OPTIONAL): Feature tour — skippable. Shows what each tab does.
 const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void}) => {
   const [step,setStep] = useState(0);
-  const steps = [
-    {e:'📚',t:'Welcome to Auto Learn!',d:'The smarter way to study. Upload your notes or type any topic — Auto Learn builds lessons, quizzes, games, podcasts, and study guides around your material using AI.'},
-    {e:'🔑',t:'Quick Setup',d:'You need one free API key to get started:\n\n• Cerebras — powers all AI features (lessons, quizzes, games)\n  Get it free at cloud.cerebras.ai\n\n• Gemini — optional, enables live podcast voice chat\n  Free at aistudio.google.com\n\nGo to Profile → API Keys to add them after this tutorial.'},
+  // Key inputs live in tutorial state (mirrors what's saved to SecretStore once valid)
+  const [cerebrasInput,setCerebrasInput] = useState('');
+  const [geminiInput,setGeminiInput] = useState('');
+  const [cerebrasSaved,setCerebrasSaved] = useState(false);
+  const [geminiSaved,setGeminiSaved] = useState(false);
+  const [savingKey,setSavingKey] = useState<'cerebras'|'gemini'|null>(null);
+  const [keyError,setKeyError] = useState('');
+
+  // On open, detect if user already has a Cerebras key (e.g. returning user, or set via signup flow)
+  // If so, skip straight to the feature tour so we don't hassle them.
+  useEffect(()=>{
+    if(!visible) return;
+    (async ()=>{
+      await ApiKeys.loadAll();
+      if(_cerebrasApiKey && _cerebrasApiKey.length > 10) setCerebrasSaved(true);
+      if(_geminiApiKey && _geminiApiKey.length > 10) setGeminiSaved(true);
+      // If Cerebras is already set, user has completed Phase 1 — jump to Phase 2
+      if(_cerebrasApiKey && _cerebrasApiKey.length > 10) setStep(4);
+    })();
+  },[visible]);
+
+  const openUrl = (url:string) => {
+    try {
+      if(Platform.OS==='web' && typeof window !== 'undefined') {
+        window.open(url,'_blank','noopener,noreferrer');
+      } else {
+        Linking.openURL(url).catch(()=>{});
+      }
+    } catch(_){}
+  };
+
+  const saveCerebras = async () => {
+    setKeyError('');
+    const k = cerebrasInput.trim();
+    if(!k) { setKeyError('Please paste your Cerebras API key.'); return; }
+    if(!k.toLowerCase().startsWith('csk-')) { setKeyError('That doesn\'t look like a Cerebras key. It should start with "csk-".'); return; }
+    setSavingKey('cerebras');
+    try {
+      await ApiKeys.saveCerebrasKey(k);
+      setCerebrasSaved(true);
+      setCerebrasInput('');
+      setStep(2); // advance to Gemini step
+    } catch(e:any) {
+      setKeyError(e?.message || 'Failed to save the key. Please try again.');
+    }
+    setSavingKey(null);
+  };
+
+  const saveGemini = async () => {
+    setKeyError('');
+    const k = geminiInput.trim();
+    if(!k) { setKeyError('Please paste your Gemini key, or tap "Skip for now".'); return; }
+    setSavingKey('gemini');
+    try {
+      await ApiKeys.saveGeminiKey(k);
+      setGeminiSaved(true);
+      setGeminiInput('');
+      setStep(3);
+    } catch(e:any) {
+      setKeyError(e?.message || 'Failed to save the key. Please try again.');
+    }
+    setSavingKey(null);
+  };
+
+  // ──────────────────────────────────────────────────────────
+  // PHASE 1 STEPS (mandatory — user cannot dismiss the modal)
+  // ──────────────────────────────────────────────────────────
+  // step 0: Welcome & explain setup
+  // step 1: Get Cerebras key (required)
+  // step 2: Get Gemini key (optional — can skip)
+  // step 3: All set! → branch into feature tour or finish
+  // ──────────────────────────────────────────────────────────
+  // PHASE 2 STEPS (optional — step 4+)
+  // ──────────────────────────────────────────────────────────
+  const tourSteps = [
     {e:'📖',t:'Learn',d:'Upload PDF/TXT notes or describe what you want to learn. Auto Learn generates structured lessons broken into sections with detailed explanations, examples, and key concepts. Read through lessons or have them read aloud with the built-in audiobook narrator.'},
     {e:'📝',t:'Study Guides',d:'Generate concise, segmented study guides from your topics. Each guide breaks material into focused, bite-sized segments with bullet points. Mark sections as "Familiar" or "Know it" to track your review progress.'},
     {e:'✍️',t:'Quizzes & Tests',d:'Take fully customizable quizzes with multiple choice, fill-in-blank, short response, and scenario questions. Set your question count (10, 20, 30, or 60+) and the AI generates unique, challenging questions every time. Earn XP for correct answers.'},
     {e:'🎮',t:'Learning Games',d:'Three games that make studying fun:\n\n• Concept Clash — shoot and match bubbles with AI quizzes\n• Grid Master — clear rows and columns on a puzzle grid\n• Word Lab — guess topic-related words in 6 tries\n\nAI interrupts with questions to keep you sharp. Wrong answers end your run!'},
     {e:'🎙️',t:'Podcast',d:'Turn any topic into a conversation. You\'re the host, AI is the expert. Ask questions, get detailed answers, and listen with natural AI voice. Perfect for learning while cooking, exercising, or commuting.'},
     {e:'👥',t:'Friends & Organizations',d:'Connect with real users by username. View friends\' profiles, see their level and study progress, send nudges, and create XP challenges with deadlines. Create or join organizations for group accountability with study streaks and leaderboards.'},
-    {e:'🏅',t:'Leveling & Medals',d:'Every topic earns medals as you progress:\n\n🥉 Bronze at 25% → 🥈 Silver at 50%\n🥇 Gold at 75% → 🏆 Trait at 100%\n\nMedals award XP that levels you up. Your level scales progressively — easy at first, more prestigious as you climb. Track your traits, concepts learned, and legacy tree in your Profile.'},
-    {e:'🎨',t:'Make It Yours',d:'Customize your experience in Profile:\n\n• Choose from preset themes or create your own color scheme\n• Save custom themes for quick switching\n• Set your profile picture and username\n• Choose your podcast and audiobook voice\n\nLight and dark themes available!'},
-    {e:'🚀',t:'You\'re All Set!',d:'Here\'s how to start:\n\n1. Go to Profile → API Keys and add your AI provider key (Cerebras is free, or bring your own)\n2. Head to Learn and create your first topic\n3. Study your way — lessons, quizzes, games, or podcast\n\nEverything you need to learn effectively, all in one place. Let\'s go!'},
+    {e:'🏅',t:'Leveling & Medals',d:'Every topic earns medals as you progress:\n\n🥉 Bronze at 25% → 🥈 Silver at 50%\n🥇 Gold at 75% → 🏆 Trait at 100%\n\nMedals award XP that levels you up. Your level scales progressively — easy at first, more prestigious as you climb.'},
+    {e:'🎨',t:'Make It Yours',d:'Customize your experience in Profile:\n\n• Choose from preset themes or create your own color scheme\n• Save custom themes for quick switching\n• Set your profile picture and username\n• Choose your podcast and audiobook voice'},
+    {e:'🚀',t:'You\'re All Set!',d:'You\'re ready to go. Head to the Learn tab and create your first topic — upload notes or just type what you want to learn. Let\'s go!'},
   ];
-  const s = steps[step];
-  return (
-    <Modal visible={visible} transparent animationType="fade">
-      <View style={st.overlay}>
-        <View style={{backgroundColor:'#1A1A2E',borderRadius:24,padding:32,alignItems:'center',marginHorizontal:20,maxWidth:360}}>
-          <Text style={{fontSize:64,marginBottom:16}}>{s.e}</Text>
-          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>{s.t}</Text>
-          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:24}}>{s.d}</Text>
-          <View style={{flexDirection:'row',gap:8,marginBottom:24}}>
-            {steps.map((_,i)=>(<View key={i} style={{width:i===step?20:8,height:8,borderRadius:4,backgroundColor:i===step?'#6366F1':'rgba(128,128,128,0.3)'}}/>))}
+
+  const inPhase1 = step < 4;
+  const totalSteps = 4 + tourSteps.length; // 4 setup steps + tour
+  const tourIndex = step - 4;
+
+  // Render the current step
+  const renderContent = () => {
+    // Phase 1 — Step 0: Welcome
+    if(step === 0) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>👋</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Welcome to Auto Learn</Text>
+          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:16}}>Let's get you set up. It takes <Text style={{color:'#E2E8F0',fontWeight:'700'}}>30 seconds to 2 minutes</Text>.</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:24}}>Auto Learn uses AI to build your lessons, quizzes, games, and study guides. To keep the app free for you, you plug in your own <Text style={{color:'#E2E8F0',fontWeight:'700'}}>free AI API key</Text> from Cerebras. I'll walk you through it.</Text>
+        </>
+      );
+    }
+    // Phase 1 — Step 1: Cerebras (required)
+    if(step === 1) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🔑</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Step 1: Get your free Cerebras key</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:12}}>Cerebras powers all AI features. It's 100% free — no credit card.</Text>
+          <View style={{alignSelf:'stretch',backgroundColor:'rgba(99,102,241,0.08)',borderRadius:12,padding:14,marginBottom:14,borderWidth:1,borderColor:'rgba(99,102,241,0.2)'}}>
+            <Text style={{color:'#E2E8F0',fontSize:13,lineHeight:20}}>
+              <Text style={{fontWeight:'700'}}>1.</Text> Tap <Text style={{fontWeight:'700'}}>Open Cerebras</Text> below{'\n'}
+              <Text style={{fontWeight:'700'}}>2.</Text> Sign up with Google (fastest){'\n'}
+              <Text style={{fontWeight:'700'}}>3.</Text> Click <Text style={{fontWeight:'700'}}>"API Keys"</Text> in the sidebar{'\n'}
+              <Text style={{fontWeight:'700'}}>4.</Text> Click <Text style={{fontWeight:'700'}}>"Create API Key"</Text> and copy it{'\n'}
+              <Text style={{fontWeight:'700'}}>5.</Text> Come back here and paste it below
+            </Text>
           </View>
-          <View style={{flexDirection:'row',gap:12}}>
-            {step>0&&<TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}><Text style={{color:'#94A3B8',fontSize:15}}>Back</Text></TouchableOpacity>}
-            <TouchableOpacity onPress={()=>step<steps.length-1?setStep(step+1):onComplete()}>
-              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
-                <Text style={{color:'white',fontSize:15,fontWeight:'600'}}>{step<steps.length-1?'Next':'Get Started!'}</Text>
+          <TouchableOpacity onPress={()=>openUrl('https://cloud.cerebras.ai/platform/api-keys')} style={{alignSelf:'stretch',marginBottom:14}}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>🌐 Open Cerebras in a new tab</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+          <TextInput
+            value={cerebrasInput}
+            onChangeText={setCerebrasInput}
+            placeholder="Paste your csk-... key here"
+            placeholderTextColor="#64748B"
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry={false}
+            style={{alignSelf:'stretch',backgroundColor:'rgba(128,128,128,0.12)',color:'#E2E8F0',borderRadius:12,paddingVertical:12,paddingHorizontal:14,fontSize:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8}}
+          />
+          {cerebrasSaved && <Text style={{color:'#34D399',fontSize:13,marginBottom:8,fontWeight:'600'}}>✓ Cerebras key saved</Text>}
+          {!!keyError && <Text style={{color:'#EF4444',fontSize:13,marginBottom:8,textAlign:'center'}}>{keyError}</Text>}
+        </>
+      );
+    }
+    // Phase 1 — Step 2: Gemini (optional)
+    if(step === 2) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🎙️</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Step 2: Gemini (optional)</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:12}}>Gemini enables the <Text style={{color:'#E2E8F0',fontWeight:'700'}}>live voice podcast</Text>. Also free. Skip if you don't care about the podcast tab.</Text>
+          <View style={{alignSelf:'stretch',backgroundColor:'rgba(99,102,241,0.08)',borderRadius:12,padding:14,marginBottom:14,borderWidth:1,borderColor:'rgba(99,102,241,0.2)'}}>
+            <Text style={{color:'#E2E8F0',fontSize:13,lineHeight:20}}>
+              <Text style={{fontWeight:'700'}}>1.</Text> Tap <Text style={{fontWeight:'700'}}>Open Google AI Studio</Text>{'\n'}
+              <Text style={{fontWeight:'700'}}>2.</Text> Sign in with your Google account{'\n'}
+              <Text style={{fontWeight:'700'}}>3.</Text> Click <Text style={{fontWeight:'700'}}>"Create API Key"</Text>{'\n'}
+              <Text style={{fontWeight:'700'}}>4.</Text> Copy the key and paste it below
+            </Text>
+          </View>
+          <TouchableOpacity onPress={()=>openUrl('https://aistudio.google.com/app/apikey')} style={{alignSelf:'stretch',marginBottom:14}}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>🌐 Open Google AI Studio</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+          <TextInput
+            value={geminiInput}
+            onChangeText={setGeminiInput}
+            placeholder="Paste your AIzaSy... key here"
+            placeholderTextColor="#64748B"
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry={false}
+            style={{alignSelf:'stretch',backgroundColor:'rgba(128,128,128,0.12)',color:'#E2E8F0',borderRadius:12,paddingVertical:12,paddingHorizontal:14,fontSize:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8}}
+          />
+          {geminiSaved && <Text style={{color:'#34D399',fontSize:13,marginBottom:8,fontWeight:'600'}}>✓ Gemini key saved</Text>}
+          {!!keyError && <Text style={{color:'#EF4444',fontSize:13,marginBottom:8,textAlign:'center'}}>{keyError}</Text>}
+        </>
+      );
+    }
+    // Phase 1 — Step 3: Ready, branch into tour or skip
+    if(step === 3) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🎉</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>You're ready to learn!</Text>
+          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:14}}>Your API key is saved securely on your device. You can always change it in <Text style={{color:'#E2E8F0',fontWeight:'700'}}>Profile → API Keys</Text>.</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:20}}>Want a quick tour of what each tab does? (Takes 30 seconds.)</Text>
+        </>
+      );
+    }
+    // Phase 2 — feature tour
+    const ts = tourSteps[tourIndex];
+    if(!ts) return null;
+    return (
+      <>
+        <Text style={{fontSize:64,marginBottom:16}}>{ts.e}</Text>
+        <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>{ts.t}</Text>
+        <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:24}}>{ts.d}</Text>
+      </>
+    );
+  };
+
+  // Footer buttons per-step
+  const renderFooter = () => {
+    if(step === 0) {
+      return (
+        <TouchableOpacity onPress={()=>setStep(1)}>
+          <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:32,borderRadius:12}}>
+            <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Let's go →</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      );
+    }
+    if(step === 1) {
+      // Required — can only advance after saving
+      return (
+        <>
+          {cerebrasSaved ? (
+            <TouchableOpacity onPress={()=>setStep(2)}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:28,borderRadius:12}}>
+                <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Next →</Text>
               </LinearGradient>
             </TouchableOpacity>
-          </View>
+          ) : (
+            <TouchableOpacity onPress={saveCerebras} disabled={savingKey==='cerebras'}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:28,borderRadius:12,opacity:savingKey==='cerebras'?0.6:1}}>
+                {savingKey==='cerebras' ? <ActivityIndicator color="white"/> : <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Save & Continue</Text>}
+              </LinearGradient>
+            </TouchableOpacity>
+          )}
+        </>
+      );
+    }
+    if(step === 2) {
+      return (
+        <View style={{flexDirection:'row',gap:10}}>
+          <TouchableOpacity onPress={()=>setStep(3)} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip for now</Text>
+          </TouchableOpacity>
+          {geminiSaved ? (
+            <TouchableOpacity onPress={()=>setStep(3)}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+                <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Next →</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity onPress={saveGemini} disabled={savingKey==='gemini'}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,opacity:savingKey==='gemini'?0.6:1}}>
+                {savingKey==='gemini' ? <ActivityIndicator color="white"/> : <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Save & Next</Text>}
+              </LinearGradient>
+            </TouchableOpacity>
+          )}
         </View>
+      );
+    }
+    if(step === 3) {
+      return (
+        <View style={{flexDirection:'row',gap:10}}>
+          <TouchableOpacity onPress={onComplete} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip tour</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={()=>setStep(4)}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Show me around →</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    // Tour footer
+    const isLastTour = tourIndex >= tourSteps.length - 1;
+    return (
+      <View style={{flexDirection:'row',gap:10}}>
+        {step > 4 && (
+          <TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Back</Text>
+          </TouchableOpacity>
+        )}
+        {!isLastTour && (
+          <TouchableOpacity onPress={onComplete} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip rest</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity onPress={()=>isLastTour?onComplete():setStep(step+1)}>
+          <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+            <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>{isLastTour?'Get Started!':'Next'}</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
+  // Dots: highlight position, visually separate Phase 1 (first 4) from Phase 2 (rest)
+  const renderDots = () => (
+    <View style={{flexDirection:'row',gap:6,marginBottom:20,flexWrap:'wrap',justifyContent:'center',maxWidth:260}}>
+      {Array.from({length: totalSteps}).map((_,i)=>{
+        const isPhase1 = i < 4;
+        const isCurrent = i === step;
+        return <View key={i} style={{width:isCurrent?18:6,height:6,borderRadius:3,backgroundColor:isCurrent?(isPhase1?'#F59E0B':'#6366F1'):'rgba(128,128,128,0.25)'}}/>;
+      })}
+    </View>
+  );
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={()=>{
+      // Block hardware back dismissal during Phase 1 (mandatory)
+      if(!inPhase1) onComplete();
+    }}>
+      <View style={st.overlay}>
+        <ScrollView contentContainerStyle={{flexGrow:1,justifyContent:'center',alignItems:'center',padding:20}} keyboardShouldPersistTaps="handled">
+          <View style={{backgroundColor:'#1A1A2E',borderRadius:24,padding:28,alignItems:'center',width:'100%',maxWidth:420}}>
+            {inPhase1 && (
+              <View style={{alignSelf:'flex-start',marginBottom:10,paddingHorizontal:10,paddingVertical:4,borderRadius:999,backgroundColor:'rgba(245,158,11,0.15)'}}>
+                <Text style={{color:'#F59E0B',fontSize:11,fontWeight:'700',letterSpacing:0.5}}>SETUP • {Math.min(step+1,4)} of 4</Text>
+              </View>
+            )}
+            {renderContent()}
+            {renderDots()}
+            {renderFooter()}
+          </View>
+        </ScrollView>
       </View>
     </Modal>
   );
