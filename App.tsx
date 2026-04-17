@@ -1128,8 +1128,16 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-// Cerebras models in quality order. qwen-3-235b (235B MoE, 65K context) is the primary.
-const CEREBRAS_MODELS = ['qwen-3-235b-a22b-instruct-2507', 'llama-4-scout-17b-16e-instruct', 'llama3.1-8b'];
+// Cerebras models — ordered by rate limits (RPM) for reliability, NOT raw quality.
+// llama3.1-8b: 30 RPM, 60K TPM — primary (plenty of capacity for quizzes/games/lessons)
+// qwen-3-235b: 5 RPM only, 65K context — reserved for large-context tasks (document extraction)
+// Free tier has strict per-minute limits; putting qwen first caused constant 429 errors.
+const CEREBRAS_MODELS = ['llama3.1-8b', 'qwen-3-235b-a22b-instruct-2507'];
+// Per-model RPM limits (free tier). Used for proactive throttling.
+const CEREBRAS_MODEL_RPM: { [model: string]: number } = {
+  'llama3.1-8b': 30,
+  'qwen-3-235b-a22b-instruct-2507': 5,
+};
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
 const PODCAST_API_TIMEOUT_MS = 18000;
@@ -1166,11 +1174,35 @@ const UsageTracker = {
 };
 
 // ── Global Cerebras API request queue ──────────────────────────────────────
-// Serializes all Cerebras requests. 1M tokens/day, 60K TPM — very generous limits.
-// Tracks cooldowns per model to handle rate limiting more gracefully.
+// Serializes all Cerebras requests and proactively throttles to stay under per-model RPM limits.
+// Free tier: llama3.1-8b = 30 RPM, qwen-3-235b = 5 RPM.
 let _cerebrasQueue: Promise<void> = Promise.resolve();
 let _cerebrasCooldownUntil: number = 0;
 let _cerebrasModelCooldowns: { [model: string]: number } = {};
+// Track request timestamps per model (rolling 60-second window) for proactive throttling.
+let _cerebrasRequestTimestamps: { [model: string]: number[] } = {};
+
+// Record a successful request so future requests know to throttle.
+function recordCerebrasRequest(model: string): void {
+  const now = Date.now();
+  if(!_cerebrasRequestTimestamps[model]) _cerebrasRequestTimestamps[model] = [];
+  _cerebrasRequestTimestamps[model].push(now);
+  // Keep only last 60 seconds of timestamps
+  _cerebrasRequestTimestamps[model] = _cerebrasRequestTimestamps[model].filter(t => now - t < 60000);
+}
+
+// Check if model is at its RPM limit. Returns ms to wait, or 0 if safe to request.
+function getCerebrasThrottleDelay(model: string): number {
+  const rpm = CEREBRAS_MODEL_RPM[model] || 30;
+  const now = Date.now();
+  const timestamps = (_cerebrasRequestTimestamps[model] || []).filter(t => now - t < 60000);
+  _cerebrasRequestTimestamps[model] = timestamps;
+  if(timestamps.length < rpm) return 0;
+  // At limit — wait until oldest timestamp ages out (plus 500ms buffer)
+  const oldest = timestamps[0];
+  return Math.max(0, (oldest + 60000) - now) + 500;
+}
+
 function enqueueCerebras<T>(fn: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     _cerebrasQueue = _cerebrasQueue.then(async () => {
@@ -2277,12 +2309,23 @@ const AI = {
           signal.addEventListener('abort', abortBySignal, { once:true });
         }
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        // Try models in quality order — fall back if a model returns 404 (unavailable on free tier)
+        // Try models in rate-limit order (llama3.1-8b first: 30 RPM, then qwen-3-235b: 5 RPM)
         for(const model of CEREBRAS_MODELS) {
-          // Skip if this model is in cooldown
+          // Skip if this model is in cooldown from a recent 429
           const modelCooldownMs = (_cerebrasModelCooldowns[model] || 0) - Date.now();
           if(modelCooldownMs > 0) {
             console.warn(`AI: Cerebras model ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s`);
+            continue;
+          }
+          // Proactive throttle: wait if we're approaching the RPM limit for this model
+          const throttleDelay = getCerebrasThrottleDelay(model);
+          if(throttleDelay > 0 && throttleDelay < 15000) {
+            // Small wait — stay on this model
+            console.warn(`AI: Cerebras ${model} approaching ${CEREBRAS_MODEL_RPM[model]} RPM, waiting ${Math.round(throttleDelay/1000)}s`);
+            await new Promise(r => setTimeout(r, throttleDelay));
+          } else if(throttleDelay >= 15000) {
+            // Long wait — try next model instead
+            console.warn(`AI: Cerebras ${model} at RPM limit, trying next model`);
             continue;
           }
           const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
@@ -2291,6 +2334,8 @@ const AI = {
             body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:maxTokens}),
             signal:controller.signal,
           });
+          // Record the request attempt immediately (counts against RPM regardless of success)
+          recordCerebrasRequest(model);
           if(r.status===404) {
             console.warn(`AI: Cerebras model ${model} not available, trying next...`);
             continue;
