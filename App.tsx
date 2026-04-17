@@ -1128,16 +1128,17 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-// Cerebras models — ordered by rate limits (RPM) for reliability, NOT raw quality.
-// llama3.1-8b: 30 RPM, 60K TPM — primary (plenty of capacity for quizzes/games/lessons)
-// qwen-3-235b: 5 RPM only, 65K context — reserved for large-context tasks (document extraction)
-// Free tier has strict per-minute limits; putting qwen first caused constant 429 errors.
-const CEREBRAS_MODELS = ['llama3.1-8b', 'qwen-3-235b-a22b-instruct-2507'];
+// Cerebras models — qwen-3-235b (235B MoE, 65K context) is the quality primary.
+// llama3.1-8b is only a fallback when qwen is at its 5 RPM cap or returns an error.
+// Goal: qwen 90%+ of the time via proactive pacing; llama only when qwen is unavailable.
+const CEREBRAS_MODELS = ['qwen-3-235b-a22b-instruct-2507', 'llama3.1-8b'];
 // Per-model RPM limits (free tier). Used for proactive throttling.
 const CEREBRAS_MODEL_RPM: { [model: string]: number } = {
-  'llama3.1-8b': 30,
   'qwen-3-235b-a22b-instruct-2507': 5,
+  'llama3.1-8b': 30,
 };
+// Max time to wait for a qwen slot before falling through to llama (30s = acceptable UX pause).
+const CEREBRAS_MAX_WAIT_FOR_QWEN_MS = 30000;
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
 const PODCAST_API_TIMEOUT_MS = 18000;
@@ -2309,23 +2310,28 @@ const AI = {
           signal.addEventListener('abort', abortBySignal, { once:true });
         }
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        // Try models in rate-limit order (llama3.1-8b first: 30 RPM, then qwen-3-235b: 5 RPM)
+        // Try models in quality order: qwen-3-235b first (best quality, 5 RPM).
+        // Only fall back to llama3.1-8b if qwen is genuinely unavailable (wait would exceed
+        // CEREBRAS_MAX_WAIT_FOR_QWEN_MS, qwen returned 429 despite wait, or server error).
         for(const model of CEREBRAS_MODELS) {
+          const isPrimaryQwen = model === 'qwen-3-235b-a22b-instruct-2507';
           // Skip if this model is in cooldown from a recent 429
           const modelCooldownMs = (_cerebrasModelCooldowns[model] || 0) - Date.now();
           if(modelCooldownMs > 0) {
             console.warn(`AI: Cerebras model ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s`);
             continue;
           }
-          // Proactive throttle: wait if we're approaching the RPM limit for this model
+          // Proactive throttle: wait if we're approaching the RPM limit for this model.
+          // For qwen (primary), be patient — wait up to CEREBRAS_MAX_WAIT_FOR_QWEN_MS (30s)
+          // so users stay on the high-quality model 90%+ of the time.
           const throttleDelay = getCerebrasThrottleDelay(model);
-          if(throttleDelay > 0 && throttleDelay < 15000) {
-            // Small wait — stay on this model
-            console.warn(`AI: Cerebras ${model} approaching ${CEREBRAS_MODEL_RPM[model]} RPM, waiting ${Math.round(throttleDelay/1000)}s`);
+          const maxWait = isPrimaryQwen ? CEREBRAS_MAX_WAIT_FOR_QWEN_MS : 5000;
+          if(throttleDelay > 0 && throttleDelay <= maxWait) {
+            console.warn(`AI: Cerebras ${model} at ${CEREBRAS_MODEL_RPM[model]} RPM cap, waiting ${Math.round(throttleDelay/1000)}s for slot`);
             await new Promise(r => setTimeout(r, throttleDelay));
-          } else if(throttleDelay >= 15000) {
-            // Long wait — try next model instead
-            console.warn(`AI: Cerebras ${model} at RPM limit, trying next model`);
+          } else if(throttleDelay > maxWait) {
+            // Slot wait exceeds our patience for this model — try fallback
+            console.warn(`AI: Cerebras ${model} slot wait ${Math.round(throttleDelay/1000)}s exceeds ${Math.round(maxWait/1000)}s — falling back`);
             continue;
           }
           const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
@@ -8356,19 +8362,25 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           ) : null}
           <Text style={{color:theme.primary,fontSize:11,fontWeight:'700',letterSpacing:1,marginBottom:8}}>ANSWER TO CONTINUE</Text>
           <Text style={{color:theme.text,fontSize:18,fontWeight:'600',marginBottom:20,lineHeight:26}}>{safeStr(gameQ.question)}</Text>
-          {(gameQ.options||[]).map((o,i)=>(
-            <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
-              const res = answerInterruption(o, step==='bubble'||step==='blocks');
-              if(!res.correct&&step==='bubble') setBpGameOver(true);
-              else if(!res.correct&&step==='blocks') setBbGameOver(true);
-            }}>
-              <Text style={{color:theme.text,fontSize:15}}>{safeStr(o)}</Text>
-            </TouchableOpacity>
-          ))}
+          {(gameQ.options||[]).map((o,i)=>{
+            // Strip accidental "Option A:", "A)", "A." prefixes AI sometimes emits
+            const clean = safeStr(o).replace(/^\s*(option\s+)?[A-Da-d][\).:\-]\s*/i,'').trim();
+            return (
+              <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
+                const fatal = step==='bubble'||step==='blocks'||step==='slider';
+                const res = answerInterruption(o, fatal);
+                if(!res.correct&&step==='bubble') setBpGameOver(true);
+                else if(!res.correct&&step==='blocks') setBbGameOver(true);
+                else if(!res.correct&&step==='slider'){ setSlGameOver(true); saveHighScore('slider',slScore); setStep('results'); }
+              }}>
+                <Text style={{color:theme.text,fontSize:15}}>{clean}</Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
       </View>
     );
-  },[showQ,gameQ,theme,answerInterruption,step]);
+  },[showQ,gameQ,theme,answerInterruption,step,slScore]);
 
   // ══════════════════════════════════════
   // ── CONCEPT CLASH (Bubble-style game) ──
@@ -9449,31 +9461,8 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           )}
         </View>
 
-        {/* Question overlay — theme-aware so it matches the rest of the app */}
-        {showQ&&gameQ&&(
-          <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:_isLightTheme(theme.background)?'rgba(255,255,255,0.96)':'rgba(15,23,42,0.94)',justifyContent:'center',padding:24,zIndex:100,borderWidth:1,borderColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.15)':'rgba(255,255,255,0.08)'}}>
-            {gameQ.teachText&&<Text style={{color:theme.primary,fontSize:12,fontWeight:'600',marginBottom:12,textAlign:'center'}}>{gameQ.teachText}</Text>}
-            <Text style={{color:theme.text,fontSize:18,fontWeight:'600',textAlign:'center',lineHeight:26,marginBottom:20}}>{gameQ.question}</Text>
-            {(gameQ.options||[]).map((o,i)=>(
-              <TouchableOpacity key={i} style={{backgroundColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.08)':'rgba(255,255,255,0.06)',padding:14,borderRadius:12,marginBottom:10,borderWidth:1,borderColor:_isLightTheme(theme.background)?'rgba(99,102,241,0.15)':'rgba(255,255,255,0.08)'}} onPress={()=>{
-                const correct=safeStr(o).trim().toLowerCase()===safeStr(gameQ.answer).trim().toLowerCase();
-                setQAnswered(a=>a+1);
-                if(correct){
-                  setQCorrect(c=>c+1); setXpEarned(x=>x+5); updateProgress(true,gameQ.conceptId);
-                  setShowQ(false); setPaused(false);
-                } else {
-                  // Wrong answer ends the game
-                  setSlGameOver(true);
-                  saveHighScore('slider',slScore);
-                  setShowQ(false); setPaused(false);
-                  setStep('results');
-                }
-              }}>
-                <Text style={{color:theme.text,fontSize:15,textAlign:'center'}}>{o}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
+        {/* Shared LEARN-snippet quiz overlay (same pattern as Grid Master) */}
+        <QOverlay/>
       </View>
     );
   }
