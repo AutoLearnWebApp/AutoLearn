@@ -2785,11 +2785,29 @@ Return ONLY valid JSON:
     return { overview:`${concept.name} is a key concept in ${topicTitle}. ${concept.description} Understanding this concept is essential for building a strong foundation.`, keyTakeaways:[concept.description,'This is a foundational concept','Practice and repetition will help solidify understanding'], examples:['Apply this concept in everyday situations','Look for real-world examples around you'], analogies:[], commonMistakes:[], loaded:true };
   },
 
-  // In-memory cache for AI results — prevents re-spending tokens when user re-clicks.
-  // Cleared on full page reload. Keys are stable hashes of inputs.
+  // Two-layer cache for AI results:
+  //   1) In-memory Map (fastest, lost on reload)
+  //   2) AsyncStorage (persists across reloads/days — keyed by stable input hash)
+  // Once a section is generated, it never needs to be regenerated. This is the single
+  // biggest contributor to "works first try every time" because most user clicks become
+  // cache hits with zero API calls.
   _overviewCache: new Map<string, SectionOverview>(),
   _snippetCache: new Map<string, {text:string;question:string;answer:string;options:string[];conceptId?:string}[]>(),
   _gameQCache: new Map<string, {question:string;answer:string;options:string[];conceptId?:string}[]>(),
+
+  _overviewStorageKey(cacheKey:string):string { return `ai_overview_v1:${cacheKey}`; },
+  async _loadOverviewFromDisk(cacheKey:string):Promise<SectionOverview|null> {
+    try {
+      const raw = await AsyncStorage.getItem(this._overviewStorageKey(cacheKey));
+      if(!raw) return null;
+      const parsed = JSON.parse(raw);
+      if(parsed && parsed.lesson && this._wordCount(parsed.lesson) >= 500) return parsed as SectionOverview;
+    } catch(e){}
+    return null;
+  },
+  async _saveOverviewToDisk(cacheKey:string, value:SectionOverview):Promise<void> {
+    try { await AsyncStorage.setItem(this._overviewStorageKey(cacheKey), JSON.stringify(value)); } catch(e){}
+  },
 
   async generateSectionOverview(
     section:{title:string;description:string;concepts:{name:string;description:string}[]},
@@ -2799,8 +2817,14 @@ Return ONLY valid JSON:
   ):Promise<SectionOverview> {
     // Cache check — re-clicking the same section returns instantly with zero tokens.
     const cacheKey = `${topicTitle}|${section.title}|${(section.concepts||[]).length}|${(sourceContent||'').length}|${sourceMode}`;
-    const cached = (this as any)._overviewCache.get(cacheKey);
-    if(cached) { console.log(`AI: cache HIT — section overview "${section.title}"`); return cached; }
+    const memCached = (this as any)._overviewCache.get(cacheKey);
+    if(memCached) { console.log(`AI: mem-cache HIT — section overview "${section.title}"`); return memCached; }
+    const diskCached = await this._loadOverviewFromDisk(cacheKey);
+    if(diskCached) {
+      console.log(`AI: disk-cache HIT — section overview "${section.title}"`);
+      (this as any)._overviewCache.set(cacheKey, diskCached);
+      return diskCached;
+    }
     // --- Step 1: Clean source content ONCE (OCR repair, noise removal) ---
     let cleanedSource = '';
     if(sourceContent) {
@@ -2945,8 +2969,9 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
         console.warn(`AI overview: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — using as-is`);
       }
       const polished = this._polishSectionOverview({ ...normalized, loaded: true });
-      // Cache for repeat-clicks within this session
+      // Cache in-memory + on disk so this section never needs to be regenerated
       try { (this as any)._overviewCache.set(cacheKey, polished); } catch(e){}
+      this._saveOverviewToDisk(cacheKey, polished); // fire-and-forget
       return polished;
     } catch(e:any) {
       throw new Error('AI_GENERATION_FAILED');
