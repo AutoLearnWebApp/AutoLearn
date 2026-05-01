@@ -1192,6 +1192,30 @@ function recordCerebrasRequest(model: string): void {
   _cerebrasRequestTimestamps[model] = _cerebrasRequestTimestamps[model].filter(t => now - t < 60000);
 }
 
+// Track tokens used per model (rolling 60s window) so we can avoid the TPM limit.
+// qwen-3-235b TPM = 30K — a single 8K-token call can blow it; track to throttle proactively.
+const CEREBRAS_MODEL_TPM: { [model: string]: number } = {
+  'qwen-3-235b-a22b-instruct-2507': 30000,
+  'llama3.1-8b': 60000,
+};
+let _cerebrasTokenLog: { [model: string]: { t: number; tokens: number }[] } = {};
+function recordCerebrasTokens(model: string, tokens: number): void {
+  const now = Date.now();
+  if(!_cerebrasTokenLog[model]) _cerebrasTokenLog[model] = [];
+  _cerebrasTokenLog[model].push({ t: now, tokens });
+  _cerebrasTokenLog[model] = _cerebrasTokenLog[model].filter(e => now - e.t < 60000);
+}
+function getCerebrasTokenUsage(model: string): number {
+  const now = Date.now();
+  const log = (_cerebrasTokenLog[model] || []).filter(e => now - e.t < 60000);
+  _cerebrasTokenLog[model] = log;
+  return log.reduce((s, e) => s + e.tokens, 0);
+}
+// Estimate how many tokens a request will cost (~4 chars/token + completion budget).
+function estimateCerebrasTokens(prompt: string, maxTokens: number): number {
+  return Math.ceil((prompt || '').length / 4) + maxTokens;
+}
+
 // Check if model is at its RPM limit. Returns ms to wait, or 0 if safe to request.
 function getCerebrasThrottleDelay(model: string): number {
   const rpm = CEREBRAS_MODEL_RPM[model] || 30;
@@ -2310,57 +2334,65 @@ const AI = {
           signal.addEventListener('abort', abortBySignal, { once:true });
         }
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        // Try models in quality order: qwen-3-235b first (best quality, 5 RPM).
-        // Only fall back to llama3.1-8b if qwen is genuinely unavailable (wait would exceed
-        // CEREBRAS_MAX_WAIT_FOR_QWEN_MS, qwen returned 429 despite wait, or server error).
+        // Hard cap maxTokens — most callers don't need 8K; capping protects TPM budget.
+        const safeMaxTokens = Math.min(maxTokens, 4096);
+        const estTokens = estimateCerebrasTokens(prompt, safeMaxTokens);
+        // Try models in quality order: qwen-3-235b first (best quality, 5 RPM, 30K TPM).
+        // Fall back to llama3.1-8b if qwen is unavailable (cooldown, RPM cap, TPM cap, 429, error).
         for(const model of CEREBRAS_MODELS) {
           const isPrimaryQwen = model === 'qwen-3-235b-a22b-instruct-2507';
           // Skip if this model is in cooldown from a recent 429
           const modelCooldownMs = (_cerebrasModelCooldowns[model] || 0) - Date.now();
           if(modelCooldownMs > 0) {
-            console.warn(`AI: Cerebras model ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s`);
+            console.warn(`AI: Cerebras ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s — skipping`);
             continue;
           }
-          // Proactive throttle: wait if we're approaching the RPM limit for this model.
-          // For qwen (primary), be patient — wait up to CEREBRAS_MAX_WAIT_FOR_QWEN_MS (30s)
-          // so users stay on the high-quality model 90%+ of the time.
+          // Proactive RPM throttle
           const throttleDelay = getCerebrasThrottleDelay(model);
           const maxWait = isPrimaryQwen ? CEREBRAS_MAX_WAIT_FOR_QWEN_MS : 5000;
           if(throttleDelay > 0 && throttleDelay <= maxWait) {
             console.warn(`AI: Cerebras ${model} at ${CEREBRAS_MODEL_RPM[model]} RPM cap, waiting ${Math.round(throttleDelay/1000)}s for slot`);
             await new Promise(r => setTimeout(r, throttleDelay));
           } else if(throttleDelay > maxWait) {
-            // Slot wait exceeds our patience for this model — try fallback
-            console.warn(`AI: Cerebras ${model} slot wait ${Math.round(throttleDelay/1000)}s exceeds ${Math.round(maxWait/1000)}s — falling back`);
+            console.warn(`AI: Cerebras ${model} RPM wait ${Math.round(throttleDelay/1000)}s exceeds ${Math.round(maxWait/1000)}s — falling back`);
             continue;
           }
+          // Proactive TPM throttle — biggest cause of unexpected 429s on qwen
+          const tpmLimit = CEREBRAS_MODEL_TPM[model] || 60000;
+          const tokensInWindow = getCerebrasTokenUsage(model);
+          if(tokensInWindow + estTokens > tpmLimit * 0.9) {
+            console.warn(`AI: Cerebras ${model} would exceed ${tpmLimit} TPM (${tokensInWindow} used + ${estTokens} estimated) — falling back`);
+            continue;
+          }
+          console.log(`AI: Cerebras → ${model} (est ${estTokens} tok, ${tokensInWindow}/${tpmLimit} TPM used)`);
           const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
             method:'POST',
             headers:{'Content-Type':'application/json','Authorization':`Bearer ${_cerebrasApiKey}`},
-            body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:maxTokens}),
+            body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:safeMaxTokens}),
             signal:controller.signal,
           });
-          // Record the request attempt immediately (counts against RPM regardless of success)
           recordCerebrasRequest(model);
-          if(r.status===404) {
-            console.warn(`AI: Cerebras model ${model} not available, trying next...`);
-            continue;
-          }
+          if(r.status===404) { console.warn(`AI: Cerebras model ${model} not available, trying next...`); continue; }
           if(r.status===429) {
-            // Exponential backoff: start at 15s, cap at 120s
+            // Real 429 → put THIS model on a real 45s cooldown and immediately fall back
+            // to the next model. Don't block the queue globally — that just slows everything.
             const retryAfter = r.headers.get('retry-after');
-            let waitMs = retryAfter ? parseFloat(retryAfter)||30 : 15;
-            waitMs = Math.max(15, Math.min(120, waitMs * 1000));
-            console.warn(`AI: Cerebras 429 on ${model} — waiting ${Math.round(waitMs/1000)}s`);
+            let waitSec = retryAfter ? parseFloat(retryAfter) : 0;
+            if(!isFinite(waitSec) || waitSec <= 0) waitSec = 45;
+            const waitMs = Math.max(15000, Math.min(120000, waitSec * 1000));
+            console.warn(`AI: Cerebras 429 on ${model} — cooling down ${Math.round(waitMs/1000)}s, falling back now`);
             _cerebrasModelCooldowns[model] = Date.now() + waitMs;
-            // Set global cooldown to 15s to avoid hammering (other models can still work)
-            _cerebrasCooldownUntil = Math.max(_cerebrasCooldownUntil, Date.now() + 15000);
-            continue; // Try next model instead of giving up
+            // Burn the TPM budget for this model so we don't immediately retry
+            recordCerebrasTokens(model, tpmLimit);
+            continue;
           }
           if(r.status===401) { this._safeAlert('Invalid Cerebras Key','Your Cerebras API key appears invalid. Check it in Profile > API Keys.'); return ''; }
           if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status} on ${model}`); continue; }
           const d = await r.json();
           const text = d?.choices?.[0]?.message?.content;
+          // Charge TPM ledger with whatever the API reports, falling back to estimate
+          const usedTokens = d?.usage?.total_tokens || estTokens;
+          recordCerebrasTokens(model, usedTokens);
           if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
         }
         console.warn('AI: All Cerebras models failed or rate-limited');
@@ -2753,12 +2785,22 @@ Return ONLY valid JSON:
     return { overview:`${concept.name} is a key concept in ${topicTitle}. ${concept.description} Understanding this concept is essential for building a strong foundation.`, keyTakeaways:[concept.description,'This is a foundational concept','Practice and repetition will help solidify understanding'], examples:['Apply this concept in everyday situations','Look for real-world examples around you'], analogies:[], commonMistakes:[], loaded:true };
   },
 
+  // In-memory cache for AI results — prevents re-spending tokens when user re-clicks.
+  // Cleared on full page reload. Keys are stable hashes of inputs.
+  _overviewCache: new Map<string, SectionOverview>(),
+  _snippetCache: new Map<string, {text:string;question:string;answer:string;options:string[];conceptId?:string}[]>(),
+  _gameQCache: new Map<string, {question:string;answer:string;options:string[];conceptId?:string}[]>(),
+
   async generateSectionOverview(
     section:{title:string;description:string;concepts:{name:string;description:string}[]},
     topicTitle:string,
     sourceContent?:string,
     sourceMode:'expand'|'strict'='expand'
   ):Promise<SectionOverview> {
+    // Cache check — re-clicking the same section returns instantly with zero tokens.
+    const cacheKey = `${topicTitle}|${section.title}|${(section.concepts||[]).length}|${(sourceContent||'').length}|${sourceMode}`;
+    const cached = (this as any)._overviewCache.get(cacheKey);
+    if(cached) { console.log(`AI: cache HIT — section overview "${section.title}"`); return cached; }
     // --- Step 1: Clean source content ONCE (OCR repair, noise removal) ---
     let cleanedSource = '';
     if(sourceContent) {
@@ -2902,7 +2944,10 @@ Return ONLY valid JSON. Here is an example of the expected format and depth:
       if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
         console.warn(`AI overview: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — using as-is`);
       }
-      return this._polishSectionOverview({ ...normalized, loaded: true });
+      const polished = this._polishSectionOverview({ ...normalized, loaded: true });
+      // Cache for repeat-clicks within this session
+      try { (this as any)._overviewCache.set(cacheKey, polished); } catch(e){}
+      return polished;
     } catch(e:any) {
       throw new Error('AI_GENERATION_FAILED');
     }
@@ -3128,31 +3173,57 @@ Return ONLY valid JSON:
       return true;
     };
 
-    // Try AI generation with retry
+    // Try AI generation with retry, sized exactly for `count` questions to save tokens
+    // (~200 tokens per question + 300 for JSON wrapping; capped at 4096 for safety).
+    const batchMaxTokens = Math.min(4096, Math.max(800, count * 220 + 300));
+    const buildQuestions = (parsed:any, attempt:number):Question[] => {
+      return (parsed?.questions||[])
+        .filter((q:any) => t.includes(q.type||'multiple_choice'))
+        .filter(isValidQuestion)
+        .map((q:any,i:number)=>{
+          const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
+          let qType = q.type||'multiple_choice';
+          let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
+          const correctAns = safeStr(q.correctAnswer);
+          if((qType==='multiple_choice'||qType==='scenario') && options.length>=2) {
+            options = _shuffle(options);
+          }
+          return { id:`q_${Date.now()}_${i}_${attempt}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
+        });
+    };
+
+    let collected:Question[] = [];
     for(let attempt=0;attempt<2;attempt++) {
       try {
-        const r = await this.call(p);
+        const r = await this.call(p, 2, batchMaxTokens);
         const m = r.match(/\{[\s\S]*\}/);
         if(m) {
           const parsed = JSON.parse(m[0]);
-          const validQuestions = (parsed.questions||[])
-            .filter((q:any) => t.includes(q.type||'multiple_choice'))
-            .filter(isValidQuestion)
-            .map((q:any,i:number)=>{
-              const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
-              let qType = q.type||'multiple_choice';
-              let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
-              const correctAns = safeStr(q.correctAnswer);
-              // Shuffle options
-              if((qType==='multiple_choice'||qType==='scenario') && options.length>=2) {
-                options = _shuffle(options);
-              }
-              return { id:`q_${Date.now()}_${i}_${attempt}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
-            });
-          if(validQuestions.length >= Math.min(count, 3)) return validQuestions;
+          const valid = buildQuestions(parsed, attempt);
+          if(valid.length > 0) { collected = valid; break; }
         }
       } catch(e){}
     }
+
+    // Auto-repair the count: too many → splice, too few → top-up call.
+    if(collected.length > count) return collected.slice(0, count);
+    if(collected.length > 0 && collected.length < count) {
+      const missing = count - collected.length;
+      try {
+        const topUpPrompt = p.replace(`creating ${count} quiz questions`, `creating ${missing} additional quiz questions`)
+                            .replace(`Generate exactly ${count} questions`, `Generate exactly ${missing} new questions`);
+        const topUpTokens = Math.min(4096, Math.max(800, missing * 220 + 300));
+        const r = await this.call(topUpPrompt, 1, topUpTokens);
+        const m = r.match(/\{[\s\S]*\}/);
+        if(m) {
+          const parsed = JSON.parse(m[0]);
+          const more = buildQuestions(parsed, 99);
+          collected = [...collected, ...more].slice(0, count);
+        }
+      } catch(e){}
+      if(collected.length >= Math.min(count, 3)) return collected;
+    }
+    if(collected.length >= Math.min(count, 3)) return collected;
     // Final fallback: generate real questions from descriptions with varied, specific phrasing
     // (only fires if AI completely fails — filter meta-named concepts and rotate templates so
     //  users don't see formulaic "which describes X?" questions)
@@ -3357,10 +3428,10 @@ RULES:
 8. Fix all typos and grammar
 
 Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct option text","options":["Option A","Option B","Option C","Option D"]}`;
-    // Try with retry
+    // Try with retry — small token cap, single MCQ doesn't need 4096 tokens
     for(let attempt=0;attempt<2;attempt++) {
       try {
-        const r = await this.call(p);
+        const r = await this.call(p, 1, 500);
         const m = r.match(/\{[\s\S]*\}/);
         if(m) {
           const parsed = JSON.parse(m[0]);
@@ -3401,7 +3472,7 @@ Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct optio
 Generate ${count} words that are 4-6 letters long, related to these concepts. Each word should be a single common English word connected to the topic.
 Return ONLY a JSON array: [{"word":"WORD","hint":"Brief hint about this word","conceptId":"which concept it relates to"}]
 IMPORTANT: Words must be exactly 4-6 letters, uppercase, single words only (no spaces/hyphens).`;
-    const r = await this.call(p);
+    const r = await this.call(p, 1, Math.min(1000, count * 80 + 200));
     try {
       const m = r.match(/\[[\s\S]*\]/);
       if(m) {
@@ -3433,7 +3504,7 @@ NEVER use the lazy phrasing "Which describes X?" or "What best describes X?" —
 NEVER reference course logistics, test dates, or meta-content — focus only on the subject matter.
 All 4 answer options must be real, specific answers (not placeholder labels like "correct", "wrong1").
 Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific question about what was taught?","answer":"The correct answer","options":["The correct answer","Plausible wrong 1","Plausible wrong 2","Plausible wrong 3"]}`;
-    const r = await this.call(p);
+    const r = await this.call(p, 1, 600);
     try {
       const m = r.match(/\{[\s\S]*\}/);
       if(m) {
