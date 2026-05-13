@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Alert,
   ActivityIndicator, Switch, Modal, Dimensions, KeyboardAvoidingView, Platform, useWindowDimensions,
-  Animated, FlatList, LayoutAnimation, RefreshControl,
+  Animated, FlatList, LayoutAnimation, RefreshControl, Linking,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -80,7 +80,7 @@ try {
 }
 let _supabaseUserId: string | null = null;
 // ========== PER-USER API KEYS (stored locally on device) ==========
-let _cerebrasApiKey = '';
+let _groqApiKey = '';
 let _geminiApiKey = '';
 // Custom OpenAI-compatible provider (user-configured)
 let _customProviderKey = '';
@@ -510,7 +510,7 @@ const I = {
 // ========== STORAGE ==========
 interface SavedTheme { id:string; name:string; colors:ThemeColors; createdAt:string; }
 interface AuthState { isLoggedIn:boolean; username:string; email?:string; provider:'local'|'google'|'supabase'; createdAt:string; supabaseId?:string; }
-const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', CEREBRAS_KEY:'@al_cerebras_key', GEMINI_KEY:'@al_gemini_key', CUSTOM_PROVIDER:'@al_custom_provider', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice', REFERRALS:'@al_referrals', STUDY_GUIDES:'@al_study_guides', SAVED_THEMES:'@al_saved_themes', AUTH:'@al_auth' };
+const SK = { TOPICS:'@al_topics', PROFILE:'@al_profile', PRESETS:'@al_presets', TUTORIAL:'@al_tut', FRIENDS:'@al_friends', ORGS:'@al_orgs', FRIEND_CHALLENGES:'@al_friend_challenges', HIGHSCORES:'@al_highscores', GROQ_KEY:'@al_groq_key', GEMINI_KEY:'@al_gemini_key', CUSTOM_PROVIDER:'@al_custom_provider', VOICE:'@al_voice', PODCAST_VOICE:'@al_podcast_voice', AUDIOBOOK_VOICE:'@al_audiobook_voice', REFERRALS:'@al_referrals', STUDY_GUIDES:'@al_study_guides', SAVED_THEMES:'@al_saved_themes', AUTH:'@al_auth' };
 type GeminiVoiceOption = { name:string; label:string; gender:'male'|'female'|'neutral'; style:string; };
 const GEMINI_TTS_VOICE_OPTIONS:GeminiVoiceOption[] = [
   { name:'Zephyr', label:'Zephyr - Bright', gender:'male', style:'bright and articulate' },
@@ -579,7 +579,7 @@ const _normalizePodcastVoice = (v:string|null|undefined):string => {
 const CLOUD_SYNC_KEYS = new Set([
   SK.TOPICS, SK.PROFILE, SK.PRESETS, SK.TUTORIAL, SK.FRIENDS, SK.ORGS,
   SK.FRIEND_CHALLENGES, SK.HIGHSCORES, SK.REFERRALS, SK.STUDY_GUIDES,
-  SK.SAVED_THEMES, SK.CEREBRAS_KEY, SK.GEMINI_KEY, SK.CUSTOM_PROVIDER,
+  SK.SAVED_THEMES, SK.GROQ_KEY, SK.GEMINI_KEY, SK.CUSTOM_PROVIDER,
   SK.VOICE, SK.PODCAST_VOICE, SK.AUDIOBOOK_VOICE,
 ]);
 
@@ -1065,7 +1065,7 @@ const _looksLikeGeminiKey = (key:string):boolean => /^AIza[0-9A-Za-z_-]{20,}$/.t
 // API keys + voice selection use secure storage when available, with AsyncStorage fallback.
 const ApiKeys = {
   async loadAll():Promise<void> {
-    try { _cerebrasApiKey = _cleanStored(await SecretStore.getItem(SK.CEREBRAS_KEY)); } catch(_){ _cerebrasApiKey=''; }
+    try { _groqApiKey = _cleanStored(await SecretStore.getItem(SK.GROQ_KEY)); } catch(_){ _groqApiKey=''; }
     try { _geminiApiKey = _cleanStored(await SecretStore.getItem(SK.GEMINI_KEY)); } catch(_){ _geminiApiKey=''; }
     try {
       const cp = await Store.load<{key:string;url:string;model:string;name:string}>(SK.CUSTOM_PROVIDER,{key:'',url:'',model:'',name:''});
@@ -1075,10 +1075,10 @@ const ApiKeys = {
     try { _podcastVoiceName = _normalizePodcastVoice(await SecretStore.getItem(SK.PODCAST_VOICE)); } catch(_){ _podcastVoiceName=PODCAST_DEFAULT_VOICE; }
     try { _audiobookVoiceName = _normalizeAudiobookVoice(await SecretStore.getItem(SK.AUDIOBOOK_VOICE)); } catch(_){ _audiobookVoiceName=AUDIOBOOK_DEFAULT_VOICE; }
   },
-  async saveCerebrasKey(key:string):Promise<void> {
-    _cerebrasApiKey = key.trim();
-    await SecretStore.setItem(SK.CEREBRAS_KEY, _cerebrasApiKey);
-    delete _missingKeyAlerted['cerebras'];
+  async saveGroqKey(key:string):Promise<void> {
+    _groqApiKey = key.trim();
+    await SecretStore.setItem(SK.GROQ_KEY, _groqApiKey);
+    delete _missingKeyAlerted['groq'];
   },
   async saveGeminiKey(key:string):Promise<void> {
     _geminiApiKey = key.trim();
@@ -1106,12 +1106,12 @@ const ApiKeys = {
     _audiobookVoiceName = next;
     await SecretStore.setItem(SK.AUDIOBOOK_VOICE, next);
   },
-  getCerebrasKey:()=>_cerebrasApiKey, getGeminiKey:()=>_geminiApiKey, getVoiceName:()=>_selectedVoiceName,
+  getGroqKey:()=>_groqApiKey, getGeminiKey:()=>_geminiApiKey, getVoiceName:()=>_selectedVoiceName,
   getPodcastVoice:()=>_podcastVoiceName, getAudiobookVoice:()=>_audiobookVoiceName,
-  hasCerebrasKey:()=>_cerebrasApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
+  hasGroqKey:()=>_groqApiKey.length>0, hasGeminiKey:()=>_geminiApiKey.length>0,
   hasLikelyGeminiKey:()=>_looksLikeGeminiKey(_geminiApiKey),
   hasCustomProvider:()=>_customProviderKey.length>0 && _customProviderUrl.length>0 && _customProviderModel.length>0,
-  hasAnyTextKey:()=>_cerebrasApiKey.length>0 || (_customProviderKey.length>0 && _customProviderUrl.length>0 && _customProviderModel.length>0),
+  hasAnyTextKey:()=>_groqApiKey.length>0 || (_customProviderKey.length>0 && _customProviderUrl.length>0 && _customProviderModel.length>0),
   getCustomProvider:()=>({key:_customProviderKey,url:_customProviderUrl,model:_customProviderModel,name:_customProviderName}),
 };
 
@@ -1128,8 +1128,22 @@ const GEMINI_LIVE_MODELS = [
   // Fallbacks
   'gemini-2.0-flash-live-001',
 ];
-// Cerebras models in quality order. qwen-3-235b (235B MoE, 65K context) is the primary.
-const CEREBRAS_MODELS = ['qwen-3-235b-a22b-instruct-2507', 'llama-4-scout-17b-16e-instruct', 'llama3.1-8b'];
+// Groq model fallback chain — free tier at console.groq.com.
+//   llama-3.3-70b-versatile        (70B dense, 128K ctx, 30 RPM, 12K TPM, 1K RPD) — primary
+//   meta-llama/llama-4-scout-17b-16e-instruct (MoE, 30 RPM, 30K TPM, 1K RPD) — fallback
+// NOTE: llama-3.1-8b-instant was removed — its 8K context is too small for lesson prompts (413).
+const GROQ_MODELS = [
+  'llama-3.3-70b-versatile',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+];
+// Per-model RPM limits (free tier).
+const GROQ_MODEL_RPM: { [model: string]: number } = {
+  'llama-3.3-70b-versatile': 30,
+  'meta-llama/llama-4-scout-17b-16e-instruct': 30,
+};
+// Max time to wait for a model's RPM slot before falling to the next model.
+// Both models are 30 RPM so throttle waits are short — 5s cap is generous.
+const GROQ_MAX_WAIT_MS = 5000;
 const DAILY_REQUEST_LIMIT = 1000;
 const PODCAST_ABORT_ERROR = '__podcast_request_aborted__';
 const PODCAST_API_TIMEOUT_MS = 18000;
@@ -1165,16 +1179,64 @@ const UsageTracker = {
   },
 };
 
-// ── Global Cerebras API request queue ──────────────────────────────────────
-// Serializes all Cerebras requests. 1M tokens/day, 60K TPM — very generous limits.
-let _cerebrasQueue: Promise<void> = Promise.resolve();
-let _cerebrasCooldownUntil: number = 0;
-function enqueueCerebras<T>(fn: () => Promise<T>): Promise<T> {
+// ── Global Groq API request queue ──────────────────────────────────────
+// Serializes all Groq requests and proactively throttles to stay under per-model RPM limits.
+// Free tier: llama-3.3-70b = 30 RPM, llama-3.1-8b = 30 RPM.
+let _groqQueue: Promise<void> = Promise.resolve();
+let _groqCooldownUntil: number = 0;
+let _groqModelCooldowns: { [model: string]: number } = {};
+// Track request timestamps per model (rolling 60-second window) for proactive throttling.
+let _groqRequestTimestamps: { [model: string]: number[] } = {};
+// Cache of models that returned 404 ("not available on your tier"). Persisted to disk so
+// we don't waste 200ms hitting them on every request. Cleared if the user clears app data.
+let _groqUnavailableModels: Set<string> = new Set();
+let _groqUnavailableLoaded = false;
+const GROQ_UNAVAILABLE_STORAGE_KEY = '@al_groq_unavailable_v1';
+async function loadGroqUnavailable():Promise<void> {
+  if(_groqUnavailableLoaded) return;
+  _groqUnavailableLoaded = true;
+  try {
+    const raw = await AsyncStorage.getItem(GROQ_UNAVAILABLE_STORAGE_KEY);
+    if(raw) {
+      const parsed = JSON.parse(raw);
+      if(Array.isArray(parsed)) parsed.forEach((m:any) => { if(typeof m === 'string') _groqUnavailableModels.add(m); });
+    }
+  } catch(e){}
+}
+function markGroqUnavailable(model:string):void {
+  if(_groqUnavailableModels.has(model)) return;
+  _groqUnavailableModels.add(model);
+  try { AsyncStorage.setItem(GROQ_UNAVAILABLE_STORAGE_KEY, JSON.stringify(Array.from(_groqUnavailableModels))); } catch(e){}
+}
+
+// Record a successful request so future requests know to throttle.
+function recordGroqRequest(model: string): void {
+  const now = Date.now();
+  if(!_groqRequestTimestamps[model]) _groqRequestTimestamps[model] = [];
+  _groqRequestTimestamps[model].push(now);
+  // Keep only last 60 seconds of timestamps
+  _groqRequestTimestamps[model] = _groqRequestTimestamps[model].filter(t => now - t < 60000);
+}
+
+
+// Check if model is at its RPM limit. Returns ms to wait, or 0 if safe to request.
+function getGroqThrottleDelay(model: string): number {
+  const rpm = GROQ_MODEL_RPM[model] || 30;
+  const now = Date.now();
+  const timestamps = (_groqRequestTimestamps[model] || []).filter(t => now - t < 60000);
+  _groqRequestTimestamps[model] = timestamps;
+  if(timestamps.length < rpm) return 0;
+  // At limit — wait until oldest timestamp ages out (plus 500ms buffer)
+  const oldest = timestamps[0];
+  return Math.max(0, (oldest + 60000) - now) + 500;
+}
+
+function enqueueGroq<T>(fn: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    _cerebrasQueue = _cerebrasQueue.then(async () => {
-      const waitMs = _cerebrasCooldownUntil - Date.now();
+    _groqQueue = _groqQueue.then(async () => {
+      const waitMs = _groqCooldownUntil - Date.now();
       if (waitMs > 0) {
-        console.warn(`AI: Cerebras queue waiting ${Math.round(waitMs/1000)}s for cooldown`);
+        console.warn(`AI: Groq queue waiting ${Math.round(waitMs/1000)}s for cooldown`);
         await new Promise(r => setTimeout(r, waitMs));
       }
       try { resolve(await fn()); }
@@ -1184,11 +1246,11 @@ function enqueueCerebras<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 const AI = {
-  _showMissingKeyAlert(provider:'cerebras'|'gemini'):void {
+  _showMissingKeyAlert(provider:'groq'|'gemini'):void {
     if(_missingKeyAlerted[provider]) return;
     _missingKeyAlerted[provider]=true;
-    if(provider==='cerebras') {
-      Alert.alert('AI Provider Key Required','Add an AI provider key in Profile > API Keys.\n\nCerebras offers free keys at cloud.cerebras.ai, or use any OpenAI-compatible provider (OpenAI, Groq, Together, etc.).',[{text:'OK'}]);
+    if(provider==='groq') {
+      Alert.alert('AI Provider Key Required','Add an AI provider key in Profile > API Keys.\n\nGroq offers free keys at console.groq.com, or use any OpenAI-compatible provider.',[{text:'OK'}]);
     } else {
       Alert.alert('Gemini API Key Required','Add your Gemini API key in Profile > API Keys for live podcast voice chat.\n\nGet a free key at aistudio.google.com',[{text:'OK'}]);
     }
@@ -2260,12 +2322,12 @@ const AI = {
 
 
 
-  async callCerebras(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=8192):Promise<string> {
-    if(!_cerebrasApiKey) { return ''; }
+  async callGroq(prompt:string, _retries:number=0, signal?:AbortSignal, timeoutMs:number=30000, temperature:number=0.4, maxTokens:number=8192):Promise<string> {
+    if(!_groqApiKey) { return ''; }
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const canRequest = await UsageTracker.canMakeRequest();
     if(!canRequest) { console.warn('AI: Daily limit reached'); return ''; }
-    return enqueueCerebras(async () => {
+    return enqueueGroq(async () => {
       const controller = new AbortController();
       const abortBySignal = () => controller.abort();
       let timeout:any = null;
@@ -2275,37 +2337,65 @@ const AI = {
           signal.addEventListener('abort', abortBySignal, { once:true });
         }
         timeout = setTimeout(()=>controller.abort(), Math.max(4000, timeoutMs));
-        // Try models in quality order — fall back if a model returns 404 (unavailable on free tier)
-        for(const model of CEREBRAS_MODELS) {
-          const r = await fetch('https://api.cerebras.ai/v1/chat/completions',{
+        // Hard cap maxTokens — most callers don't need 8K; capping protects TPM budget.
+        const safeMaxTokens = Math.min(maxTokens, 4096);
+        // Load (once) the persisted list of models that returned 404 on this account so we
+        // can skip them entirely instead of paying 200ms for every fetch that's guaranteed to fail.
+        await loadGroqUnavailable();
+        // Try models in quality order: llama-3.3-70b first (best quality, 30 RPM),
+        // then llama-3.1-8b (fast fallback, 30 RPM, 14.4K RPD).
+        for(const model of GROQ_MODELS) {
+          // Skip models known to be unavailable on this Groq account (cached 404)
+          if(_groqUnavailableModels.has(model)) continue;
+          // Skip if this model is in cooldown from a recent 429
+          const modelCooldownMs = (_groqModelCooldowns[model] || 0) - Date.now();
+          if(modelCooldownMs > 0) {
+            console.warn(`AI: Groq ${model} cooling down for ${Math.round(modelCooldownMs/1000)}s — skipping`);
+            continue;
+          }
+          // Proactive RPM throttle — wait briefly if near limit, skip if wait is too long.
+          const throttleDelay = getGroqThrottleDelay(model);
+          if(throttleDelay > 0 && throttleDelay <= GROQ_MAX_WAIT_MS) {
+            console.warn(`AI: Groq ${model} at ${GROQ_MODEL_RPM[model]} RPM cap, waiting ${Math.round(throttleDelay/1000)}s for slot`);
+            await new Promise(r => setTimeout(r, throttleDelay));
+          } else if(throttleDelay > GROQ_MAX_WAIT_MS) {
+            console.warn(`AI: Groq ${model} RPM wait ${Math.round(throttleDelay/1000)}s exceeds ${Math.round(GROQ_MAX_WAIT_MS/1000)}s — falling back`);
+            continue;
+          }
+          console.log(`AI: Groq → ${model}`);
+          const r = await fetch('https://api.groq.com/openai/v1/chat/completions',{
             method:'POST',
-            headers:{'Content-Type':'application/json','Authorization':`Bearer ${_cerebrasApiKey}`},
-            body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_completion_tokens:maxTokens}),
+            headers:{'Content-Type':'application/json','Authorization':`Bearer ${_groqApiKey}`},
+            body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature,max_tokens:safeMaxTokens}),
             signal:controller.signal,
           });
+          recordGroqRequest(model);
           if(r.status===404) {
-            console.warn(`AI: Cerebras model ${model} not available, trying next...`);
+            console.warn(`AI: Groq model ${model} not available — caching and trying next...`);
+            markGroqUnavailable(model);
             continue;
           }
           if(r.status===429) {
+            // Rate limited — mark cooldown and fall through to next model.
             const retryAfter = r.headers.get('retry-after');
-            const waitMs = retryAfter ? Math.max(parseFloat(retryAfter)||30, 30) * 1000 : 60000;
-            console.warn(`AI: Cerebras 429 — waiting ${Math.round(waitMs/1000)}s`);
-            _cerebrasCooldownUntil = Math.max(_cerebrasCooldownUntil, Date.now() + waitMs);
-            return '';
+            let waitSec = retryAfter ? parseFloat(retryAfter) : 60;
+            if(!isFinite(waitSec) || waitSec <= 0) waitSec = 60;
+            const waitMs = Math.max(15000, Math.min(120000, waitSec * 1000));
+            console.warn(`AI: Groq 429 on ${model} — rate-limited, falling back (cooldown: ${Math.round(waitMs/1000)}s)`);
+            _groqModelCooldowns[model] = Date.now() + waitMs;
+            continue;
           }
-          if(r.status===401) { this._safeAlert('Invalid Cerebras Key','Your Cerebras API key appears invalid. Check it in Profile > API Keys.'); return ''; }
-          if(!r.ok) { console.warn(`AI: Cerebras HTTP ${r.status}`); return ''; }
+          if(r.status===401) { this._safeAlert('Invalid Groq Key','Your Groq API key appears invalid. Check it in Profile > API Keys.'); return ''; }
+          if(!r.ok) { console.warn(`AI: Groq HTTP ${r.status} on ${model}`); continue; }
           const d = await r.json();
           const text = d?.choices?.[0]?.message?.content;
           if(text && typeof text === 'string' && text.trim().length > 0) { await UsageTracker.increment(); return text.trim(); }
-          return '';
         }
-        console.warn('AI: All Cerebras models failed');
+        console.warn('AI: All Groq models failed or rate-limited');
         return '';
       } catch(e:any) {
         if(this._isAbortError(e) && signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
-        console.warn(`AI: Cerebras error: ${e?.message||'unknown'}`);
+        console.warn(`AI: Groq error: ${e?.message||'unknown'}`);
         return '';
       } finally {
         if(timeout) clearTimeout(timeout);
@@ -2421,25 +2511,25 @@ const AI = {
     return '';
   },
 
-  // App-wide text generation: tries custom provider first, then Cerebras. Gemini is reserved for podcast.
+  // App-wide text generation: tries custom provider first, then Groq. Gemini is reserved for podcast/voice.
   async call(prompt:string, retries:number=2, maxTokens:number=4096):Promise<string> {
     // Try custom provider first (if configured)
     if(ApiKeys.hasCustomProvider()) {
       const result = await this.callCustomProvider(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
-    // Fall back to Cerebras
-    if(_cerebrasApiKey) {
-      const result = await this.callCerebras(prompt, retries, undefined, 30000, 0.4, maxTokens);
+    // Fall back to Groq
+    if(_groqApiKey) {
+      const result = await this.callGroq(prompt, retries, undefined, 30000, 0.4, maxTokens);
       if(result && result.trim().length > 0) return result;
     }
     if(!ApiKeys.hasAnyTextKey()) {
-      this._showMissingKeyAlert('cerebras');
+      this._showMissingKeyAlert('groq');
     }
     return '';
   },
 
-  // Podcast-specific: tries Gemini first, falls back to custom provider, then Cerebras
+  // Podcast-specific: tries Gemini first, falls back to custom provider, then Groq
   async callForPodcast(prompt:string, retries:number=2, signal?:AbortSignal):Promise<string> {
     if(signal?.aborted) throw new Error(PODCAST_ABORT_ERROR);
     const quickRetries = Math.min(PODCAST_API_MAX_RETRIES, Math.max(0, retries));
@@ -2451,11 +2541,11 @@ const AI = {
       const result = await this.callCustomProvider(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
-    if(_cerebrasApiKey) {
-      const result = await this.callCerebras(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
+    if(_groqApiKey) {
+      const result = await this.callGroq(prompt, quickRetries, signal, PODCAST_API_TIMEOUT_MS);
       if(result && result.trim().length > 0) return this._normalizePodcastText(result);
     }
-    if(!_cerebrasApiKey && !_geminiApiKey && !ApiKeys.hasCustomProvider()) {
+    if(!_groqApiKey && !_geminiApiKey && !ApiKeys.hasCustomProvider()) {
       this._showMissingKeyAlert('gemini');
     }
     return '';
@@ -2691,12 +2781,46 @@ Return ONLY valid JSON:
     return { overview:`${concept.name} is a key concept in ${topicTitle}. ${concept.description} Understanding this concept is essential for building a strong foundation.`, keyTakeaways:[concept.description,'This is a foundational concept','Practice and repetition will help solidify understanding'], examples:['Apply this concept in everyday situations','Look for real-world examples around you'], analogies:[], commonMistakes:[], loaded:true };
   },
 
+  // Two-layer cache for AI results:
+  //   1) In-memory Map (fastest, lost on reload)
+  //   2) AsyncStorage (persists across reloads/days — keyed by stable input hash)
+  // Once a section is generated, it never needs to be regenerated. This is the single
+  // biggest contributor to "works first try every time" because most user clicks become
+  // cache hits with zero API calls.
+  _overviewCache: new Map<string, SectionOverview>(),
+  _snippetCache: new Map<string, {text:string;question:string;answer:string;options:string[];conceptId?:string}[]>(),
+  _gameQCache: new Map<string, {question:string;answer:string;options:string[];conceptId?:string}[]>(),
+
+  _overviewStorageKey(cacheKey:string):string { return `ai_overview_v1:${cacheKey}`; },
+  async _loadOverviewFromDisk(cacheKey:string):Promise<SectionOverview|null> {
+    try {
+      const raw = await AsyncStorage.getItem(this._overviewStorageKey(cacheKey));
+      if(!raw) return null;
+      const parsed = JSON.parse(raw);
+      if(parsed && parsed.lesson && this._wordCount(parsed.lesson) >= 500) return parsed as SectionOverview;
+    } catch(e){}
+    return null;
+  },
+  async _saveOverviewToDisk(cacheKey:string, value:SectionOverview):Promise<void> {
+    try { await AsyncStorage.setItem(this._overviewStorageKey(cacheKey), JSON.stringify(value)); } catch(e){}
+  },
+
   async generateSectionOverview(
     section:{title:string;description:string;concepts:{name:string;description:string}[]},
     topicTitle:string,
     sourceContent?:string,
     sourceMode:'expand'|'strict'='expand'
   ):Promise<SectionOverview> {
+    // Cache check — re-clicking the same section returns instantly with zero tokens.
+    const cacheKey = `${topicTitle}|${section.title}|${(section.concepts||[]).length}|${(sourceContent||'').length}|${sourceMode}`;
+    const memCached = (this as any)._overviewCache.get(cacheKey);
+    if(memCached) { console.log(`AI: mem-cache HIT — section overview "${section.title}"`); return memCached; }
+    const diskCached = await this._loadOverviewFromDisk(cacheKey);
+    if(diskCached) {
+      console.log(`AI: disk-cache HIT — section overview "${section.title}"`);
+      (this as any)._overviewCache.set(cacheKey, diskCached);
+      return diskCached;
+    }
     // --- Step 1: Clean source content ONCE (OCR repair, noise removal) ---
     let cleanedSource = '';
     if(sourceContent) {
@@ -2728,7 +2852,7 @@ Return ONLY valid JSON:
     }
 
     // --- Step 2: Require API key ---
-    if(!_cerebrasApiKey && !ApiKeys.hasCustomProvider()) {
+    if(!_groqApiKey && !ApiKeys.hasCustomProvider()) {
       throw new Error('API_KEY_MISSING');
     }
 
@@ -2781,6 +2905,16 @@ ${sourceBlock}
 Concepts to teach (cover ALL of these):
 ${conceptList}
 
+CONTENT FILTERS (EXCLUDE — these are noise, not teachable content):
+- Course logistics, schedules, exam/quiz dates, office hours, assignment deadlines
+- Professor announcements, grade breakdowns, previous test scores, class averages, score distributions
+- Practice questions from the source (understand them but do not reproduce them as lesson content)
+- Slide numbers, page headers/footers, watermarks, filenames, copyright lines
+- Class-discussion prompts ("Class Discussion:", "Discussion Question:") — conversation starters, not teachable material. Absorb the underlying topic but do not present the question itself.
+- Instructor anecdotes unrelated to the subject
+- Administrative notes ("re-read chapter X", "see syllabus")
+Focus ONLY on subject-matter content that teaches this section's theme.
+
 LENGTH REQUIREMENT: Write at least 2-3 full paragraphs (each 80-120 words) for EACH concept listed above. If there are 4 concepts, that means at least 8 paragraphs. The "lesson" field MUST total 800-1200 words. A lesson under 600 words will be rejected.
 
 FORMAT RULES:
@@ -2796,109 +2930,172 @@ FORMAT RULES:
 - PROOFREAD your output: fix all typos, spelling errors, grammatical mistakes, and broken/missing words before returning. Every sentence must be complete and readable.
 
 SUPPLEMENTARY FIELDS REQUIREMENTS:
-- keyPrinciples (5-7 items): Core truths or laws that govern the topic. Each must be complete, actionable, and non-obvious. Format: "Statement of principle: explanation of why."
-- keyTerms (5-8 items): Critical vocabulary with definitions. Format: "Term: concise definition that explains the concept in 1-2 sentences."
-- practicalApplications (3-5 items): Real-world HOW-TO actions. Each must include: (1) what to do, (2) how to do it, (3) expected outcome or benefit. Be specific with numbers/timelines.
-- commonMisconceptions (3-5 items): Highlight a WRONG belief and correct it. Format: "WRONG: [incorrect belief]. CORRECT: [accurate explanation]." Do NOT just negate — explain the actual correct principle.
+- keyPrinciples (5-7 items): Each is one complete, actionable, non-obvious sentence stating a core truth and its implication. Do NOT include the words "Statement of principle" — write the principle directly as flowing prose.
+- keyTerms (5-8 items): Each formatted as "TermName: 1-2 sentence definition that captures what the term means precisely."
+- practicalApplications (3-5 items): Each is one concrete action with specifics — what to do, how to do it, and the expected outcome with numbers or timelines.
+- commonMisconceptions (3-5 items): Each formatted as "WRONG: [misbelief]. CORRECT: [accurate explanation]." Do not just negate — explain the correct principle.
 - summary: 1-2 sentences capturing the core insight and why it matters.
 
-Return ONLY valid JSON. Here is an example of the expected format and depth:
+Return ONLY valid JSON. The example below shows the EXACT format and depth expected. Imitate the style; replace the content with material specific to the section's actual concepts.
 
-{"lesson":"Concept 1: Supply and Demand\\n\\nSupply and demand is the fundamental model that explains how prices are determined in a market economy. When consumers want more of a product than producers are willing to sell at a given price, a shortage occurs and prices rise. Conversely, when producers offer more than consumers want to buy, a surplus drives prices down. This dynamic interaction between buyers and sellers continuously adjusts until the market reaches equilibrium.\\n\\nThe equilibrium price is the point where the quantity demanded by consumers exactly matches the quantity supplied by producers. For example, if a coffee shop charges $7 per latte, few customers buy them and cups go unsold. If they drop to $2, demand surges but the shop cannot cover costs. At $4.50, the shop sells exactly as many lattes as it makes each morning — this is the equilibrium price. Any external shock, such as a frost destroying coffee crops, shifts the supply curve left, raising the equilibrium price until a new balance is found.\\n\\nConcept 2: Price Elasticity\\n\\nPrice elasticity measures how responsive quantity demanded or supplied is to changes in price. Products with high elasticity see large swings in quantity purchased when prices change slightly; products with low elasticity have stable demand regardless of price changes. For instance, luxury goods like designer handbags typically show high elasticity — a 10% price increase causes 15% fewer purchases. Essential goods like insulin show low elasticity — diabetics need it regardless of cost, so even a 50% price increase barely reduces quantity demanded. Understanding your product's elasticity is critical: raising prices on elastic products shrinks revenue, but on inelastic products increases it.\\n\\nConcept 3: Market Structures\\n\\nMarket structures vary based on the number of competitors and barriers to entry, fundamentally affecting pricing power and profitability. Perfect competition features many firms selling identical products with free entry; no single firm controls prices. Monopolies involve one seller controlling the entire market, allowing price-setting power. Oligopolies have few large competitors who watch each other's moves closely. For example, smartphone makers like Apple operate in an oligopoly — three companies dominate, and when one raises prices, others quickly follow or match. Perfect competition requires commodities where firms are price-takers, such as wheat farming where global supply determines price.","keyPrinciples":["Prices gravitate toward equilibrium where quantity demanded equals quantity supplied; persistent shortages or surpluses trigger automatic price adjustments","Elasticity determines revenue impact: raising prices increases revenue for inelastic products but decreases it for elastic ones","Market structure (competition, oligopoly, monopoly) determines how much pricing power individual firms possess","External shocks shift curves unpredictably; successful firms monitor their competitive environment continuously","Buyer psychology and expectations can drive demand independently of actual supply-side fundamentals"],"keyTerms":["Equilibrium: the price point where quantity demanded equals quantity supplied, resulting in no surplus or shortage","Elasticity: the percentage change in quantity demanded per 1% change in price; elastic goods are price-sensitive, inelastic ones are not","Oligopoly: a market with few competitors (e.g., smartphones, airlines) where firms monitor each other and pricing is interdependent","Barrier to entry: a structural obstacle preventing new competitors from entering a market; includes capital requirements, patents, or brand loyalty"],"practicalApplications":["For your product, run A/B tests at three price points with 100+ customers in each group over 4 weeks, measuring conversions and revenue to empirically determine elasticity","Map your market structure: count competitors, assess their market share, and identify switching costs for customers to determine your pricing flexibility","Set prices monthly by monitoring your actual inventory levels and comparing them to competitors; if your stock is depleting, you may be underpriced","Create a simple spreadsheet tracking your costs, competitor prices, and sales volume; update it weekly to catch demand or supply shocks early"],"commonMisconceptions":["WRONG: If demand is high, raising prices is always good. CORRECT: High demand with elastic products may actually increase revenue through volume at lower prices.","WRONG: Monopolies always maximize profit by raising prices maximally. CORRECT: Some monopolies intentionally price low to build network effects or deter regulatory action.","WRONG: Competitors always match each other's prices in oligopolies. CORRECT: Competitors sometimes compete on quality or service instead of price to avoid destructive price wars.","WRONG: Costs determine prices. CORRECT: Prices are driven by supply and demand; high-cost sellers may go bankrupt if their prices fall below costs due to competition."],"summary":"Prices emerge from the continuous interaction of supply and demand, moderated by market structure. Understanding equilibrium, elasticity, and competitive positioning enables effective pricing strategies."}`;
+EXAMPLE (subject: economics — for format reference only, do NOT use this content unless the section is about economics):
+{"lesson":"Concept 1: Equilibrium Price\\n\\nEquilibrium price is the point where the quantity of a good consumers want to buy exactly equals the quantity producers want to sell. When prices sit above this point, sellers accumulate unsold inventory and discount to clear it; when prices sit below it, shortages emerge and buyers bid prices up. The market continuously adjusts toward equilibrium without any central planner directing it.\\n\\nConsider the 2021 used-car market: chip shortages cut new-car production, demand spilled into the used market, and prices jumped roughly 40% in a year. As supply chains recovered through 2023, used-car prices retreated toward their pre-pandemic equilibrium. The same self-correcting force that drove prices up also pulled them back down.\\n\\nConcept 2: Price Elasticity\\n\\nPrice elasticity measures how sharply quantity demanded responds to a price change. Elastic goods — luxuries, restaurant meals, branded apparel — see large drops in volume when prices rise even modestly. Inelastic goods — gasoline, insulin, salt — see only small changes in volume regardless of price, because buyers have no easy substitute or cannot postpone the purchase.\\n\\nFor a coffee shop deciding whether to raise prices from $4 to $4.50, elasticity is the deciding factor: if a 12% price increase causes a 20% volume drop, total revenue falls; if volume drops only 5%, revenue rises. Most shops measure this empirically by testing prices at different stores or times.","keyPrinciples":["Markets self-correct through price signals: persistent shortages drive prices up until supply expands, restoring balance.","Price elasticity determines whether revenue rises or falls when prices change — the answer is empirical, not intuitive.","Substitutes and postponability govern elasticity: more options and flexibility mean higher elasticity.","External shocks shift supply or demand curves, creating temporary imbalances that resolve as the market adapts.","Long-run elasticity exceeds short-run elasticity because consumers have more time to find alternatives."],"keyTerms":["Equilibrium price: the price at which quantity demanded equals quantity supplied, leaving no shortage or surplus.","Elasticity: the percentage change in quantity demanded per 1% change in price.","Substitute good: an alternative product that buyers switch to when the original's price rises.","Inelastic demand: demand that changes very little in response to price changes, typical of necessities."],"practicalApplications":["Test three price points across two-week windows with at least 200 transactions per point, then compare revenue per period to identify your product's elasticity empirically.","Track competitor prices weekly in a shared spreadsheet so you spot demand shifts early — most companies notice 4-6 weeks late.","When raising prices, segment customers by elasticity (loyal subscribers vs. occasional buyers) and apply different increases to each group."],"commonMisconceptions":["WRONG: High demand always means raising prices is profitable. CORRECT: For elastic products, a hike can drop volume faster than it lifts margin, reducing total revenue.","WRONG: Markets reach perfect equilibrium and stay there. CORRECT: Real markets continuously adjust toward a moving equilibrium; the curves shift constantly with new information.","WRONG: All necessities are inelastic. CORRECT: Even necessities become elastic over long time horizons as consumers find substitutes (e.g., heating oil → heat pumps)."],"summary":"Prices and quantities reach equilibrium through continuous self-correction; elasticity determines whether changing prices lifts or drains revenue."}`;
 
-    // --- Step 4: Single AI generation call (try custom provider first, then Cerebras) ---
-    let r = '';
-    if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(prompt, 0, undefined, 60000, 0.35, 4096);
-    if(!r && _cerebrasApiKey) r = await this.callCerebras(prompt, 0, undefined, 60000, 0.35, 4096);
-    if(!r) { throw new Error('AI_GENERATION_FAILED'); }
-    try {
-      const parsed = this._parseJsonObject(r);
-      if(!parsed || !parsed.lesson) { throw new Error('AI_GENERATION_FAILED'); }
-      const normalized = {
-        lesson: safeStr(parsed.lesson||'').trim(),
-        keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-        keyTerms: Array.isArray(parsed.keyTerms) ? parsed.keyTerms.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-        practicalApplications: Array.isArray(parsed.practicalApplications) ? parsed.practicalApplications.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-        commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
-        summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
-      };
-      // Hard reject: lesson must have meaningful content
-      const wordCount = this._wordCount(normalized.lesson);
-      if(wordCount < 500) { console.warn(`AI overview: lesson too short (${wordCount} words, need 500+)`); throw new Error('AI_GENERATION_FAILED'); }
-      if(wordCount > 4000) { throw new Error('AI_GENERATION_FAILED'); }
-      // Accept output with graceful degradation — use what we have even if supplementary fields are thin
-      if(normalized.keyPrinciples.length < 2 || normalized.keyTerms.length < 2) {
-        console.warn(`AI overview: thin supplementary fields (principles:${normalized.keyPrinciples.length}, terms:${normalized.keyTerms.length}, apps:${normalized.practicalApplications.length}, misconceptions:${normalized.commonMisconceptions.length}) — using as-is`);
+    // --- Step 4: Generate with retries — each attempt tries provider chain again,
+    //     so if first model returned truncated content, we get a fresh shot at 70b
+    //     or a different fallback model.
+    const tryGenerate = async ():Promise<string> => {
+      let r = '';
+      // 40s timeout: Groq is fast (30 RPM), generous budget for network latency.
+      if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(prompt, 0, undefined, 40000, 0.35, 4096);
+      if(!r && _groqApiKey) r = await this.callGroq(prompt, 0, undefined, 40000, 0.35, 4096);
+      return r;
+    };
+
+    const validateAndNormalize = (r:string):SectionOverview|null => {
+      try {
+        const parsed = this._parseJsonObject(r);
+        if(!parsed || !parsed.lesson) return null;
+        const normalized = {
+          lesson: safeStr(parsed.lesson||'').trim(),
+          keyPrinciples: Array.isArray(parsed.keyPrinciples) ? parsed.keyPrinciples.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          keyTerms: Array.isArray(parsed.keyTerms) ? parsed.keyTerms.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          practicalApplications: Array.isArray(parsed.practicalApplications) ? parsed.practicalApplications.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          commonMisconceptions: Array.isArray(parsed.commonMisconceptions) ? parsed.commonMisconceptions.map((x:any)=>safeStr(x||'').trim()).filter(Boolean) : [],
+          summary: safeStr(parsed.summary||'').replace(/\s+/g,' ').trim(),
+        };
+        const wordCount = this._wordCount(normalized.lesson);
+        if(wordCount < 400 || wordCount > 4500) return null;
+        return this._polishSectionOverview({ ...normalized, loaded: true });
+      } catch(e){ return null; }
+    };
+
+    // Try up to 3 times — each retry rotates through the model fallback chain.
+    let polished:SectionOverview|null = null;
+    for(let attempt = 0; attempt < 3 && !polished; attempt++) {
+      const raw = await tryGenerate();
+      if(!raw) continue;
+      polished = validateAndNormalize(raw);
+      if(!polished) {
+        console.warn(`AI overview attempt ${attempt+1}/3 returned invalid/short content — retrying with next model`);
       }
-      return this._polishSectionOverview({ ...normalized, loaded: true });
-    } catch(e:any) {
-      throw new Error('AI_GENERATION_FAILED');
     }
+    if(!polished) throw new Error('AI_GENERATION_FAILED');
+
+    // Cache in-memory + on disk so this section never needs to be regenerated
+    try { (this as any)._overviewCache.set(cacheKey, polished); } catch(e){}
+    this._saveOverviewToDisk(cacheKey, polished); // fire-and-forget
+    return polished;
   },
 
   async generateStudyGuideSegments(section:{title:string;description:string;concepts:{name:string;description:string}[]}, topicTitle:string, lessonText?:string, sourceContent?:string, alreadyCoveredTitles?:string[]):Promise<{title:string;content:string}[]> {
     const concepts = (section.concepts||[]).slice(0,15);
     const conceptList = concepts.map((c,i)=>`${i+1}. ${c.name}: ${c.description}`).join('\n');
-    const lessonContext = lessonText ? `\nLESSON CONTENT (primary source — extract key facts):\n${lessonText.substring(0,6000)}\n` : '';
-    const sourceContext = sourceContent ? `\nORIGINAL SOURCE MATERIAL (extract key facts):\n${sourceContent.substring(0,4000)}\n` : '';
+    const lessonContext = lessonText ? `\nLESSON CONTENT (secondary context — derived from source):\n${lessonText.substring(0,6000)}\n` : '';
+    const sourceContext = sourceContent ? `\nORIGINAL SOURCE MATERIAL (PRIMARY GROUND TRUTH — every fact must trace back here):\n${sourceContent.substring(0,5000)}\n` : '';
     const alreadyCoveredBlock = alreadyCoveredTitles && alreadyCoveredTitles.length > 0
-      ? `\nALREADY COVERED IN PREVIOUS SECTIONS (DO NOT REPEAT ANY OF THESE — skip them entirely):\n${alreadyCoveredTitles.map((t,i)=>`${i+1}. ${t}`).join('\n')}\n\nIf a concept from the list below was already covered above, DO NOT create a segment for it. Only cover NEW material that has not appeared yet.\n`
+      ? `\nALREADY COVERED IN PREVIOUS SECTIONS (skip these entirely — do NOT repeat):\n${alreadyCoveredTitles.map((t,i)=>`${i+1}. ${t}`).join('\n')}\n`
       : '';
-    const p = `You are creating a CONCISE study guide for "${topicTitle}" — section: "${section.title}".
-${lessonContext}${sourceContext}
-CONCEPTS TO COVER (only if NOT already covered):
+    // ═══════════════════════════════════════════════════════════════════════
+    // STUDY GUIDE BUILDER — AutoLearn Skill (AI-agnostic)
+    // Full spec mirrored in STUDY_GUIDE_SKILL.md at project root.
+    // Designed to produce a comparative, table-rich, exam-prep study guide
+    // that any AI provider (Groq/Gemini/Claude/GPT/custom) can output.
+    // ═══════════════════════════════════════════════════════════════════════
+    const p = `# STUDY GUIDE BUILDER — Section: "${section.title}"
+Topic: "${topicTitle}"
+
+You are building a study-guide section in the AutoLearn format. Output ONLY a JSON array of segments. The student will read top-to-bottom, highlight what they know, and revisit what they don't. Make it complete enough that NOTHING important is missed — and dense enough that NO word is wasted.
+
+═══ THE FIVE CARDINAL RULES ═══
+1. SOURCE-ONLY FIDELITY. Every fact, name, example, formula, date, and exam tip must trace back to the SOURCE or LESSON below. NEVER invent. If the source doesn't say it, you don't say it. When in doubt, omit.
+2. COMPLETENESS. Scan the source for every distinct theory, term, case, principle, formula, example, and named entity that fits this section. None gets dropped. Numbered sequences (Theory 1, 2, 3…) must ALL appear.
+3. NO REPETITION. If a concept is already covered (see list below), skip it entirely. Each concept appears exactly once.
+4. DENSITY > LENGTH. Tables over bullets for comparisons. Bullets over paragraphs. Strip "this is important," "it's worth noting," "in other words."
+5. EXAM-TESTABLE FRAMING. Where the source signals importance (bolding, repetition, "key concept," "most tested," practice-Q overlap), emit a "★ EXAM TIP:" callout. Where the source synthesizes across ideas, emit a "💡 KEY INSIGHT:" callout. Don't manufacture either — only when source warrants.
+
+${sourceContext}${lessonContext}
+═══ CONCEPTS TO COVER (only if NOT already covered) ═══
 ${conceptList}
 ${alreadyCoveredBlock}
-CRITICAL RULE — NO REPETITION:
-- Each concept/topic must appear EXACTLY ONCE in the entire study guide
-- If a concept was already covered in a previous section, SKIP IT completely — do not create a segment for it
-- Do not restate, rephrase, or re-explain anything that has already been covered
-- Only produce segments for genuinely NEW information not seen before
-- Cover each concept THOROUGHLY the one time it appears — include all important details so it never needs to be revisited
+═══ OUTPUT FORMAT ═══
+Return ONLY a JSON array. No prose, no code fences, no preamble. Each segment:
+  { "title": "Specific Concept Name", "content": "markdown body" }
 
-SEGMENTATION RULES:
-Each segment covers ONE focused idea. A single concept may become multiple segments ONLY if it has genuinely distinct sub-ideas that were NOT previously covered.
-Progress through concepts systematically — go topic by topic in a logical order.
+Each segment covers ONE focused concept. A section typically produces 3–10 segments. Return [] if everything was already covered.
 
-TITLE RULES (CRITICAL — varied, descriptive titles):
-- Each title must be UNIQUE and SPECIFIC to the actual content
-- Use the real name of the concept, term, or distinction — not a generic pattern
-- GOOD: "Bilateral vs. Unilateral Contracts", "7 Elements of a Valid Contract", "Supply and Demand Equilibrium", "Types of Market Failure"
-- BAD: "What Is X?", "How X Works", "Key Concepts of X", "Understanding X" — these are lazy and repetitive
-- NEVER use the same title structure twice. Vary every title.
-- Titles should read like a textbook table of contents — each one tells you exactly what you'll learn
+═══ CONTENT FORMAT — THE DENSE COMPARATIVE PATTERN ═══
+Every segment follows this rhythm where possible:
 
-CONTENT FORMAT (CRITICAL — be CONCISE but COMPLETE):
-- Use bullet points as the PRIMARY format. Paragraphs are allowed only when a flowing explanation is truly needed.
-- Each bullet = one testable fact, definition, or distinction (1 sentence)
-- Bold key terms: **Term** — definition
-- Total content per segment: 3-8 bullets OR 2-4 short sentences. NO MORE.
-- Strip ALL filler: no "this is important", no "it is worth noting", no introductory sentences
-- Every word must earn its place — if removing a sentence loses no information, remove it
-- Include a brief example only when it clarifies a non-obvious point
-- Be THOROUGH — include all key details, sub-types, exceptions, and formulas the first time you cover a topic
+  [1-line purpose statement — what this concept is for, in plain language]
+  [Comparison table — the dominant structure]
+  [> ★ EXAM TIP: the test-worthy fact or pattern from the source]
+  [> 💡 KEY INSIGHT: synthesis across ideas, ONLY if the source warrants it]
 
-WHAT TO INCLUDE:
-- Definitions with precise language
-- Key distinctions between similar terms
-- Categories/types listed as bullets with **bold** labels
-- Formulas, rules, or requirements if applicable
-- One concrete example per segment ONLY if it adds clarity
-- ALL important sub-details so the topic is fully covered in one place
+Not every segment needs all four. The purpose line plus one structured element (table or bullets) is the minimum.
 
-WHAT TO EXCLUDE:
-- Introductory or transitional sentences
-- Repetition of the title in the content
-- Obvious or common-sense statements
-- Lengthy paragraphs when bullets suffice
-- Filler phrases ("In other words...", "It should be noted...", "This concept is important because...")
-- ANYTHING already covered in a previous section
+═══ TABLES (use whenever comparing or listing typed items) ═══
+GitHub-flavored markdown pipe tables. Two columns is the most common: "Type | Description", "Term | Definition", "Letter | Meaning". Use 3–4 columns when an extra axis matters (e.g., "Strategy | Market Position | Market Size | Example").
 
-Return ONLY valid JSON — an array of segments (return empty array [] if all concepts were already covered):
-[{"title":"Bilateral vs. Unilateral Contracts","content":"- **Bilateral contract** — both parties exchange promises (most common type)\\n- **Unilateral contract** — one party makes a promise in exchange for an action\\n- Example: reward posters are unilateral — payment is owed only if someone performs the action"},{"title":"7 Elements of a Valid Contract","content":"All must be present for enforceability:\\n- **Offer** — clear proposal with definite terms\\n- **Acceptance** — unqualified agreement to the offer\\n- **Consideration** — something of value exchanged\\n- **Capacity** — parties must be legally competent (age, mental fitness)\\n- **Legality** — purpose must be lawful\\n- **Consent** — free from fraud, duress, or undue influence\\n- **Written form** — required for certain contracts (Statute of Frauds)"}]`;
+  | Type | Description |
+  |---|---|
+  | **Forward Integration** | Stepping into your customer's domain. Example: Disney launching Disney+ |
+  | **Backward Integration** | Stepping into your supplier's domain. Example: Tesla manufacturing its own batteries |
+
+TABLE RULES:
+- Bold the term/name in the first column: **Term**
+- Every row has a CONCRETE example baked into the description WHEN THE SOURCE PROVIDES ONE
+- 2–4 columns max
+- Header row required, separator row required (|---|---|)
+
+═══ EXAM TIP CALLOUTS ═══
+Format: a line starting with "> ★ EXAM TIP:" — one short sentence on the test-worthy pattern.
+  > ★ EXAM TIP: Forward integration moves TOWARD the customer. Backward moves TOWARD the supplier.
+
+═══ KEY INSIGHT CALLOUTS ═══
+Format: a line starting with "> 💡 KEY INSIGHT:" — used only for synthesis across ideas.
+  > 💡 KEY INSIGHT: Technology rarely creates sustainable advantage alone — the defensible asset is a SYSTEM of tech + data + organization + customer relationships.
+
+═══ BULLETS (when a table doesn't fit) ═══
+Use for loose, non-parallel lists. Always: bold term, em-dash, definition.
+  - **Term** — definition (one sentence)
+
+═══ TITLES ═══
+Titles are a table of contents — each tells the reader exactly what they'll learn.
+  GOOD: "BCG Matrix — Portfolio Planning Tool", "Forward vs. Backward Integration", "4 Multinational Strategic Postures", "Porter's Five Forces"
+  BAD: "What Is X?", "Understanding X", "Key Concepts of X", "How X Works", "Introduction to X" — lazy templates.
+Use the REAL name from the source. Never reuse a title structure. Em-dashes (—) for clarification. Numbered counts when the source supplies them.
+
+═══ NOISE FILTER (drop silently even if they appear in source) ═══
+- Course logistics: schedules, due dates, office hours
+- Professor announcements, grade distributions, class averages
+- Practice questions reproduced verbatim (read them for emphasis hints, don't paste)
+- Slide numbers, page headers/footers, copyright, watermarks
+- Discussion prompts ("Class discussion:", "Think about…") — absorb topic, drop prompt
+- Instructor anecdotes unrelated to subject matter
+- Administrative notes ("see chapter X")
+
+═══ SELF-CHECK BEFORE RETURNING ═══
+- [ ] Every fact comes from the source — no invented examples, dates, names
+- [ ] Nothing in the already-covered list is repeated
+- [ ] At least one table OR structured bullet list per segment
+- [ ] Titles are specific and varied (no "What Is X?")
+- [ ] Filler words stripped
+- [ ] Numbered sequences from source are complete
+- [ ] Where source emphasized importance, an exam-tip callout was emitted
+- [ ] JSON valid; every segment has title + content
+
+═══ WORKED EXAMPLE (output shape — DO NOT COPY CONTENT) ═══
+[
+  {"title":"Ways to Diversify — Horizontal vs. Vertical Integration","content":"Corporate strategy is a search for **synergy**. Two of the three primary diversification methods involve integration:\\n\\n| Type | Description |\\n|---|---|\\n| **Horizontal Integration** | Expand into similar products serving the same customers; gains economies of scale. Example: Disney expanding into complementary entertainment |\\n| **Forward Vertical Integration** | Step into your customer's domain to capture revenue. Example: Disney launching Disney+ |\\n| **Backward Vertical Integration** | Step into your supplier's domain to lower costs. Example: Tesla manufacturing its own batteries |\\n\\n> ★ EXAM TIP: Forward = toward customer. Backward = toward supplier."},
+  {"title":"BCG Matrix — Portfolio Planning Tool","content":"A tool that helps multi-business firms decide where to allocate resources. Axes: **Market Growth Rate** (Y) vs. **Relative Market Share** (X).\\n\\n| Quadrant | Growth | Share | Strategic Implication |\\n|---|---|---|---|\\n| **★ Star** | High | High | Invest to maintain leadership. Example: Marvel Studios |\\n| **? Question Mark** | High | Low | Invest selectively or divest. Example: Disney+ |\\n| **$ Cash Cow** | Low | High | Harvest cash; minimal investment. Example: ESPN |\\n| **✗ Dog** | Low | Low | Divest or discontinue. Example: ABC Network |\\n\\n> ★ EXAM TIP: ESPN = Cash Cow. ABC = Dog. Marvel = Star. Disney+ = Question Mark."}
+]
+
+Now produce the JSON array for "${section.title}". Output ONLY the JSON.`;
     let r = '';
-    if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(p, 0, undefined, 60000, 0.3, 8192);
-    if(!r && _cerebrasApiKey) r = await this.callCerebras(p, 0, undefined, 60000, 0.3, 8192);
+    // Lower temperature (0.2) for higher source fidelity. Larger max_tokens to fit table-rich segments.
+    if(ApiKeys.hasCustomProvider()) r = await this.callCustomProvider(p, 0, undefined, 90000, 0.2, 8192);
+    if(!r && _groqApiKey) r = await this.callGroq(p, 0, undefined, 90000, 0.2, 8192);
     if(!r) return [];
     try {
       const m = r.match(/\[[\s\S]*\]/);
@@ -2990,11 +3187,12 @@ Generate exactly ${count} questions. Each question must test REAL knowledge from
 
 CRITICAL RULES FOR EVERY QUESTION:
 1. The question text must be a REAL, specific, educational question — e.g., "What are the three elements required for promissory estoppel?", "Which type of contract involves only one party making a promise?", "In a bilateral contract, how many promises are exchanged?"
-2. NEVER generate vague questions like "Which of the following is an example of [concept name]?" or "What best describes [concept name]?" — these are lazy and do not test understanding
-3. The question must be answerable from the material without needing to see the concept name as a hint
-4. Each answer option must be 5-25 words long — not too short (single word) and not too long (full paragraphs)
-5. All 4 options must be similar in length and style — a student should NOT be able to guess the answer by picking the longest or most detailed option
-6. PROOFREAD everything: fix all typos, spelling errors, and grammar issues
+2. NEVER generate vague questions like "Which of the following is an example of [concept name]?", "What best describes [concept name]?", or "Which describes [chapter/section name]?" — these are lazy and do not test understanding
+3. NEVER ask about course logistics, test/quiz dates, score statistics, or meta-content — focus purely on the subject matter
+4. The question must be answerable from the material without needing to see the concept name as a hint
+5. Each answer option must be 5-25 words long — not too short (single word) and not too long (full paragraphs)
+6. All 4 options must be similar in length and style — a student should NOT be able to guess the answer by picking the longest or most detailed option
+7. PROOFREAD everything: fix all typos, spelling errors, and grammar issues
 
 FOR MULTIPLE_CHOICE:
 - 4 options, one correct, three strong distractors
@@ -3037,42 +3235,79 @@ Return ONLY valid JSON:
       return true;
     };
 
-    // Try AI generation with retry
+    // Try AI generation with retry, sized exactly for `count` questions to save tokens
+    // (~200 tokens per question + 300 for JSON wrapping; capped at 4096 for safety).
+    const batchMaxTokens = Math.min(4096, Math.max(800, count * 220 + 300));
+    const buildQuestions = (parsed:any, attempt:number):Question[] => {
+      return (parsed?.questions||[])
+        .filter((q:any) => t.includes(q.type||'multiple_choice'))
+        .filter(isValidQuestion)
+        .map((q:any,i:number)=>{
+          const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
+          let qType = q.type||'multiple_choice';
+          let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
+          const correctAns = safeStr(q.correctAnswer);
+          if((qType==='multiple_choice'||qType==='scenario') && options.length>=2) {
+            options = _shuffle(options);
+          }
+          return { id:`q_${Date.now()}_${i}_${attempt}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
+        });
+    };
+
+    let collected:Question[] = [];
     for(let attempt=0;attempt<2;attempt++) {
       try {
-        const r = await this.call(p);
+        const r = await this.call(p, 2, batchMaxTokens);
         const m = r.match(/\{[\s\S]*\}/);
         if(m) {
           const parsed = JSON.parse(m[0]);
-          const validQuestions = (parsed.questions||[])
-            .filter((q:any) => t.includes(q.type||'multiple_choice'))
-            .filter(isValidQuestion)
-            .map((q:any,i:number)=>{
-              const concept = concepts.find(c=>c.name.toLowerCase().includes((q.conceptName||'').toLowerCase()))||concepts[i%Math.max(concepts.length,1)];
-              let qType = q.type||'multiple_choice';
-              let options = (q.options||[]).map((o:any)=>safeStr(o)).filter((o:string)=>o.length>0);
-              const correctAns = safeStr(q.correctAnswer);
-              // Shuffle options
-              if((qType==='multiple_choice'||qType==='scenario') && options.length>=2) {
-                options = _shuffle(options);
-              }
-              return { id:`q_${Date.now()}_${i}_${attempt}`, type:qType, question:safeStr(q.question), options, correctAnswer:correctAns, explanation:safeStr(q.explanation||''), conceptId:concept?.id||'', conceptName:safeStr(concept?.name||''), difficulty:q.difficulty||'medium' };
-            });
-          if(validQuestions.length >= Math.min(count, 3)) return validQuestions;
+          const valid = buildQuestions(parsed, attempt);
+          if(valid.length > 0) { collected = valid; break; }
         }
       } catch(e){}
     }
-    // Final fallback: generate questions using descriptions (only if AI completely fails)
-    // Use descriptions to form real questions, not concept names as answers
+
+    // Auto-repair the count: too many → splice, too few → top-up call.
+    if(collected.length > count) return collected.slice(0, count);
+    if(collected.length > 0 && collected.length < count) {
+      const missing = count - collected.length;
+      try {
+        const topUpPrompt = p.replace(`creating ${count} quiz questions`, `creating ${missing} additional quiz questions`)
+                            .replace(`Generate exactly ${count} questions`, `Generate exactly ${missing} new questions`);
+        const topUpTokens = Math.min(4096, Math.max(800, missing * 220 + 300));
+        const r = await this.call(topUpPrompt, 1, topUpTokens);
+        const m = r.match(/\{[\s\S]*\}/);
+        if(m) {
+          const parsed = JSON.parse(m[0]);
+          const more = buildQuestions(parsed, 99);
+          collected = [...collected, ...more].slice(0, count);
+        }
+      } catch(e){}
+      if(collected.length >= Math.min(count, 3)) return collected;
+    }
+    if(collected.length >= Math.min(count, 3)) return collected;
+    // Final fallback: generate real questions from descriptions with varied, specific phrasing
+    // (only fires if AI completely fails — filter meta-named concepts and rotate templates so
+    //  users don't see formulaic "which describes X?" questions)
     const shorten = (s:string, max:number=80) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
-    return _shuffle(concepts).slice(0,count).map((c,i)=>{
-      // Build a real question from the description
+    const isGenericName = (n:string) => /^(chapter|week|lesson|slide|section|part|unit|module|overview|introduction|lecture|class|quiz|test|exam|summary|topic|notes?)\b/i.test((n||'').trim()) || (n||'').trim().length < 3;
+    const usable = concepts.filter(c => !isGenericName(c.name) && c.description && c.description.length > 20);
+    const pool = usable.length >= 2 ? usable : concepts;
+    const qTemplates = [
+      (name:string) => `What is a defining characteristic of ${name}?`,
+      (name:string) => `Which statement most accurately describes ${name}?`,
+      (name:string) => `How is ${name} best understood in this context?`,
+      (name:string) => `What is the most important thing to know about ${name}?`,
+      (name:string) => `Which of the following is true of ${name}?`,
+    ];
+    return _shuffle(pool).slice(0,count).map((c,i)=>{
       const desc = shorten(c.description, 80);
-      const others = concepts.filter(c2=>c2.id!==c.id);
+      const others = concepts.filter(c2=>c2.id!==c.id && c2.description && c2.description.length>15);
       const distractorDescs = _shuffle(others).slice(0,3).map(c2=>shorten(c2.description,80));
-      while(distractorDescs.length<3) distractorDescs.push(`A process that involves analyzing ${safeStr(topic.title)} from a different perspective`);
+      while(distractorDescs.length<3) distractorDescs.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 80));
       const opts = _shuffle([desc,...distractorDescs]);
-      return { id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:`In the context of ${topic.title}, which of the following correctly describes ${c.name}?`, options:opts, correctAnswer:desc, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty };
+      const template = qTemplates[i % qTemplates.length];
+      return { id:`q_${Date.now()}_${i}`, type:'multiple_choice' as const, question:template(c.name), options:opts, correctAnswer:desc, explanation:`${c.name}: ${c.description}`, conceptId:c.id, conceptName:c.name, difficulty:c.difficulty };
     });
   },
 
@@ -3169,23 +3404,23 @@ ${msgs}
 Host's latest turn:
 "${_compactSpeech(lastUserTurn, 260)}"
 
-Respond as the expert. Be warm, natural, and conversational — like a real podcast phone call. Share specific, interesting knowledge only after directly responding to what Host just said.
+Respond as the expert. Be warm, natural, and conversational — like a real podcast phone call. Share specific, interesting knowledge only after directly responding to what the host just said.
 
 IMPORTANT RULES:
 - 3-5 sentences, spoken naturally as if talking out loud
-- Address the user ONLY as "Host" when directly addressing them
-- NEVER invent or guess the user's name
-- If Host interrupted, adapt immediately to that interruption instead of finishing your old point
-- Be reactive: answer Host's exact request first. If Host asks about a person/topic, stay on that exact person/topic
-- If Host's request is ambiguous or partial, ask one short clarifying question instead of assuming facts
-- Do not insert made-up claims, made-up names, or details Host did not ask for
+- DO NOT say "Host" in this response. Only say "Host" at the very start of the conversation or when resuming after a pause. In normal flowing conversation, just speak to them directly without addressing them by any name.
+- NEVER invent or guess the user's real name
+- If the host interrupted, adapt immediately to that interruption instead of finishing your old point
+- Be reactive: answer the host's exact request first. If they ask about a person/topic, stay on that exact person/topic
+- If the request is ambiguous or partial, ask one short clarifying question instead of assuming facts
+- Do not insert made-up claims, made-up names, or details that weren't asked for
 - Avoid boilerplate phrases like "that's a great question" unless genuinely needed
-- After sharing your answer, ask Host one concise follow-up question to keep the conversation flowing
+- After sharing your answer, naturally end with a concise follow-up question to keep the conversation flowing
 - NEVER use markdown, bullet points, or formatting — this is SPOKEN audio, not text
 - No asterisks, hashtags, or special characters — just natural speech
 - Occasionally reference things the host said earlier to show you're listening
-- Avoid repeating the same explanation from prior turns`;
-    // Podcast uses cross-provider fallback: Gemini first, then Cerebras
+- NEVER repeat an explanation, example, analogy, or insight you already shared in prior turns — always bring a fresh angle`;
+    // Podcast uses cross-provider fallback: Gemini first, then Groq
     const result = await this.callForPodcast(p, 2, signal);
     const normalized = result ? this._normalizePodcastText(result) : '';
     if(normalized && lastAiTurn && _podcastSimilarity(normalized, lastAiTurn) > 0.82) {
@@ -3213,17 +3448,17 @@ ${msgs}
 Your most recent spoken chunk:
 "${_compactSpeech(lastAiTurn, 260)}"
 
-Continue with the next spoken chunk. Move forward to a NEW subtopic, teach deeply with concrete examples, useful analogies, and practical takeaways, and keep it engaging and educational.
+Continue with the next spoken chunk. Move forward to a NEW subtopic that you have NOT already covered, teach deeply with concrete examples, useful analogies, and practical takeaways, and keep it engaging and educational.
 
 IMPORTANT RULES:
 - 5-8 spoken sentences
-- Address the user ONLY as "Host" when directly addressing them
-- NEVER invent or guess the user's name
+- DO NOT say "Host" in this chunk. You already addressed them earlier. Now just teach — speak to them directly without a name.
+- NEVER invent or guess the user's real name
 - Do NOT ask a follow-up question at the end of this chunk
 - End with a natural bridge sentence that can flow into the next chunk
-- Mention that Host can jump in anytime only occasionally (not every chunk)
 - NEVER use markdown, bullet points, or formatting
-- Avoid repeating wording from previous chunks`;
+- COVERAGE: Each chunk must teach NEW material. Scan your prior chunks in the conversation above — if you're about to repeat an example, analogy, definition, or insight you already gave, choose a genuinely different angle instead.
+- Keep advancing through the topic — do not circle back to points you already made`;
     const result = await this.callForPodcast(p, 2, signal);
     return result || `Host, here's another angle on ${topic}. One useful way to understand it is to break it into core principles, then look at how those principles show up in real situations. When you connect theory to concrete examples, the topic becomes much easier to retain and apply in practice.`;
   },
@@ -3246,18 +3481,19 @@ OTHER CONCEPTS: ${otherInfo}
 
 RULES:
 1. Write a SPECIFIC, educational question — e.g., "What are the three required elements of promissory estoppel?", "Which type of contract involves only one promise?"
-2. NEVER write lazy questions like "Which describes X?" or "What is an example of X?"
-3. Create exactly 4 options, each 5-20 words long, all similar length
-4. One correct answer, three plausible wrong answers (misconceptions, partial truths, related-but-wrong)
-5. NEVER use "None of the above", "Not related to", or any generic filler
-6. Correct answer position must be randomized
-7. Fix all typos and grammar
+2. NEVER write lazy questions like "Which describes X?", "What is an example of X?", or "Which best describes [chapter/section]?"
+3. NEVER ask about course logistics, test dates, or meta-content — focus purely on the subject matter
+4. Create exactly 4 options, each 5-20 words long, all similar length
+5. One correct answer, three plausible wrong answers (misconceptions, partial truths, related-but-wrong)
+6. NEVER use "None of the above", "Not related to", or any generic filler
+7. Correct answer position must be randomized
+8. Fix all typos and grammar
 
 Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct option text","options":["Option A","Option B","Option C","Option D"]}`;
-    // Try with retry
+    // Try with retry — small token cap, single MCQ doesn't need 4096 tokens
     for(let attempt=0;attempt<2;attempt++) {
       try {
-        const r = await this.call(p);
+        const r = await this.call(p, 1, 500);
         const m = r.match(/\{[\s\S]*\}/);
         if(m) {
           const parsed = JSON.parse(m[0]);
@@ -3273,14 +3509,21 @@ Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct optio
         }
       } catch(e){}
     }
-    // Fallback: use shortened DESCRIPTIONS as options (meaningful content, not raw names)
+    // Fallback: varied real questions using DESCRIPTIONS as options (no formulaic "which describes X?")
     const shorten = (s:string, max:number=60) => s.length>max ? s.substring(0,max).replace(/\s+\S*$/,'...') : s;
     const correctDesc = shorten(c.description);
-    const others = concepts.filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const others = concepts.filter(x=>x.id!==c.id && x.description && x.description.length>15).sort(()=>Math.random()-0.5).slice(0,3);
     const distractorDescs = others.map(x=>shorten(x.description));
-    while(distractorDescs.length<3) distractorDescs.push(`A method for evaluating ${safeStr(topic.title)} outcomes`);
+    while(distractorDescs.length<3) distractorDescs.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 60));
     const allOpts = [correctDesc,...distractorDescs].sort(()=>Math.random()-0.5);
-    return { question:`In ${topic.title}, which of the following correctly describes ${c.name}?`, answer:correctDesc, options:allOpts.slice(0,4), conceptId:c.id };
+    const gameTemplates = [
+      (name:string) => `What is a defining characteristic of ${name}?`,
+      (name:string) => `Which statement most accurately describes ${name}?`,
+      (name:string) => `What is the key thing to know about ${name}?`,
+      (name:string) => `Which of the following is true of ${name}?`,
+    ];
+    const qText = gameTemplates[Math.floor(Math.random()*gameTemplates.length)](c.name);
+    return { question:qText, answer:correctDesc, options:allOpts.slice(0,4), conceptId:c.id };
   },
 
   async getWordleWords(topic:Topic,count:number=5):Promise<{word:string;hint:string;conceptId:string}[]> {
@@ -3291,7 +3534,7 @@ Return ONLY valid JSON: {"question":"Specific question?","answer":"Correct optio
 Generate ${count} words that are 4-6 letters long, related to these concepts. Each word should be a single common English word connected to the topic.
 Return ONLY a JSON array: [{"word":"WORD","hint":"Brief hint about this word","conceptId":"which concept it relates to"}]
 IMPORTANT: Words must be exactly 4-6 letters, uppercase, single words only (no spaces/hyphens).`;
-    const r = await this.call(p);
+    const r = await this.call(p, 1, Math.min(1000, count * 80 + 200));
     try {
       const m = r.match(/\[[\s\S]*\]/);
       if(m) {
@@ -3318,10 +3561,12 @@ IMPORTANT: Words must be exactly 4-6 letters, uppercase, single words only (no s
     const c = pool[Math.floor(Math.random()*pool.length)];
     if(!c) return {text:`${topic.title} is a fascinating subject.`,question:'Did you find this interesting?',answer:'Yes',options:['Yes','No','Maybe','Not sure']};
     const p = `About "${c.name}" (${c.description}) for topic "${topic.title}".
-STRICT: Write EXACTLY 2 short sentences (max 30 words total) teaching one key fact. Then a multiple-choice question testing that fact.
-IMPORTANT: All 4 answer options must be real, specific answers. NEVER use placeholder labels like "correct", "wrong1", "incorrect".
+STRICT: Write EXACTLY 2 short sentences (max 30 words total) teaching one key subject-matter fact. Then a multiple-choice question testing that fact.
+NEVER use the lazy phrasing "Which describes X?" or "What best describes X?" — ask a specific, educational question.
+NEVER reference course logistics, test dates, or meta-content — focus only on the subject matter.
+All 4 answer options must be real, specific answers (not placeholder labels like "correct", "wrong1").
 Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific question about what was taught?","answer":"The correct answer","options":["The correct answer","Plausible wrong 1","Plausible wrong 2","Plausible wrong 3"]}`;
-    const r = await this.call(p);
+    const r = await this.call(p, 1, 600);
     try {
       const m = r.match(/\{[\s\S]*\}/);
       if(m) {
@@ -3337,12 +3582,18 @@ Return ONLY JSON:{"text":"Two short teaching sentences.","question":"Specific qu
         }
       }
     } catch(e){}
-    // Fallback with concept descriptions as options
+    // Fallback with concept descriptions as options and varied question phrasing
     const shorten = (s:string,max:number=60)=>s.length>max?s.substring(0,max).replace(/\s+\S*$/,'...'):s;
-    const others = (topic.concepts||[]).filter(x=>x.id!==c.id).sort(()=>Math.random()-0.5).slice(0,3);
+    const others = (topic.concepts||[]).filter(x=>x.id!==c.id && x.description && x.description.length>15).sort(()=>Math.random()-0.5).slice(0,3);
     const fallbackOpts = [shorten(c.description),...others.map(x=>shorten(x.description))];
-    while(fallbackOpts.length<4) fallbackOpts.push(`A process for analyzing ${safeStr(topic.title)} outcomes`);
-    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:`In ${topic.title}, which correctly describes ${c.name}?`,answer:shorten(c.description),options:fallbackOpts.sort(()=>Math.random()-0.5).slice(0,4),conceptId:c.id};
+    while(fallbackOpts.length<4) fallbackOpts.push(shorten(`A related but distinct aspect of ${safeStr(topic.title)} that does not apply here`, 60));
+    const snippetTemplates = [
+      (name:string) => `What is most true about ${name}?`,
+      (name:string) => `Which statement best captures ${name}?`,
+      (name:string) => `What is a defining trait of ${name}?`,
+    ];
+    const qText = snippetTemplates[Math.floor(Math.random()*snippetTemplates.length)](c.name);
+    return {text:`${c.name}: ${c.description.slice(0,120)}`,question:qText,answer:shorten(c.description),options:fallbackOpts.sort(()=>Math.random()-0.5).slice(0,4),conceptId:c.id};
   },
 
   async getStudyEstimate(topic:Topic, goal:string, mode?:'quiz'|'games'|'mixed'):Promise<string> {
@@ -6219,37 +6470,143 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
     const statusLabel = (s:StudyGuideItemStatus) => s==='none'?'Not reviewed':s==='familiar'?'Familiar':'Know it';
 
     // Render markdown-lite: **bold**, ## headings, and paragraphs
+    // Parse **bold** and *italic* within text (shared by tables, bullets, paragraphs)
+    const parseInline = (text:string):React.ReactNode[] => {
+      const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+      return parts.map((part,j)=>{
+        if(part.startsWith('**')&&part.endsWith('**')) {
+          return <Text key={j} style={{fontWeight:'700',color:theme.text}}>{part.slice(2,-2)}</Text>;
+        }
+        if(part.startsWith('*')&&part.endsWith('*')&&!part.startsWith('**')) {
+          return <Text key={j} style={{fontStyle:'italic',color:theme.text,opacity:0.85}}>{part.slice(1,-1)}</Text>;
+        }
+        return <Text key={j}>{part}</Text>;
+      });
+    };
+
+    // Detect a markdown pipe-table row: "| col | col |"
+    const isTableRow = (line:string) => /^\s*\|.*\|\s*$/.test(line.trim());
+    // Detect the |---|---| separator row
+    const isTableSeparator = (line:string) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line.trim());
+
+    const splitTableRow = (line:string):string[] => {
+      const t = line.trim();
+      const inner = t.startsWith('|') ? t.slice(1) : t;
+      const stripped = inner.endsWith('|') ? inner.slice(0,-1) : inner;
+      return stripped.split('|').map(c=>c.trim());
+    };
+
+    const renderTable = (rows:string[][], key:string):React.ReactNode => {
+      const header = rows[0]||[];
+      const body = rows.slice(1);
+      const _lt = _isLightTheme(theme.background);
+      const borderC = _lt ? 'rgba(0,0,0,0.12)' : 'rgba(255,255,255,0.1)';
+      const headerBg = _lt ? 'rgba(99,102,241,0.10)' : 'rgba(99,102,241,0.18)';
+      const altRowBg = _lt ? 'rgba(0,0,0,0.025)' : 'rgba(255,255,255,0.03)';
+      return (
+        <View key={key} style={{borderWidth:1,borderColor:borderC,borderRadius:8,marginVertical:8,overflow:'hidden'}}>
+          {/* Header */}
+          <View style={{flexDirection:'row',backgroundColor:headerBg}}>
+            {header.map((cell,ci)=>(
+              <View key={ci} style={{flex:1,padding:8,borderLeftWidth:ci===0?0:1,borderLeftColor:borderC}}>
+                <Text style={{color:theme.primary,fontSize:12,fontWeight:'700',letterSpacing:0.3}}>{parseInline(cell)}</Text>
+              </View>
+            ))}
+          </View>
+          {/* Body */}
+          {body.map((row,ri)=>(
+            <View key={ri} style={{flexDirection:'row',borderTopWidth:1,borderTopColor:borderC,backgroundColor:ri%2===1?altRowBg:'transparent'}}>
+              {row.map((cell,ci)=>(
+                <View key={ci} style={{flex:1,padding:8,borderLeftWidth:ci===0?0:1,borderLeftColor:borderC}}>
+                  <Text style={{color:theme.text,fontSize:13,lineHeight:19,opacity:0.92}}>{parseInline(cell)}</Text>
+                </View>
+              ))}
+            </View>
+          ))}
+        </View>
+      );
+    };
+
+    const renderCallout = (text:string, kind:'exam'|'insight'|'source', key:string):React.ReactNode => {
+      const cfg = kind==='exam'
+        ? {bg:'rgba(245,158,11,0.10)', border:'rgba(245,158,11,0.35)', label:'EXAM TIP', icon:'★', color:'#D97706'}
+        : kind==='insight'
+        ? {bg:'rgba(99,102,241,0.10)', border:'rgba(99,102,241,0.35)', label:'KEY INSIGHT', icon:'💡', color:'#6366F1'}
+        : {bg:'rgba(16,185,129,0.10)', border:'rgba(16,185,129,0.30)', label:'SOURCE', icon:'📖', color:'#10B981'};
+      return (
+        <View key={key} style={{backgroundColor:cfg.bg,borderLeftWidth:3,borderLeftColor:cfg.border,borderRadius:8,padding:10,marginVertical:6}}>
+          <Text style={{color:cfg.color,fontSize:10,fontWeight:'800',letterSpacing:1,marginBottom:4}}>{cfg.icon}  {cfg.label}</Text>
+          <Text style={{color:theme.text,fontSize:14,lineHeight:20,opacity:0.95}}>{parseInline(text)}</Text>
+        </View>
+      );
+    };
+
     const renderContent = (text:string) => {
       const lines = text.split('\n');
       const elements:React.ReactNode[] = [];
-      lines.forEach((line,i) => {
+      let i = 0;
+      while(i < lines.length) {
+        const line = lines[i];
         const trimmed = line.trim();
-        if(!trimmed) { elements.push(<View key={`sp_${i}`} style={{height:10}}/>); return; }
+        if(!trimmed) { elements.push(<View key={`sp_${i}`} style={{height:10}}/>); i++; continue; }
+
+        // ── Tables: header row + separator + body rows ──
+        if(isTableRow(line) && i+1 < lines.length && isTableSeparator(lines[i+1])) {
+          const rows:string[][] = [splitTableRow(line)];
+          let j = i + 2;
+          while(j < lines.length && isTableRow(lines[j])) {
+            rows.push(splitTableRow(lines[j]));
+            j++;
+          }
+          elements.push(renderTable(rows, `tbl_${i}`));
+          i = j;
+          continue;
+        }
+
+        // ── Callouts ──
+        // > ★ EXAM TIP: ...   OR   ★ EXAM TIP: ...
+        const examMatch = trimmed.match(/^>?\s*★?\s*EXAM TIP\s*:\s*(.+)$/i) || trimmed.match(/^>?\s*★\s*(.+)$/);
+        if(/EXAM TIP/i.test(trimmed) && examMatch) {
+          const body = trimmed.replace(/^>?\s*★?\s*EXAM TIP\s*:\s*/i,'').trim();
+          if(body) { elements.push(renderCallout(body, 'exam', `et_${i}`)); i++; continue; }
+        }
+        const insightMatch = trimmed.match(/^>?\s*(?:💡\s*)?KEY INSIGHT\s*:\s*(.+)$/i);
+        if(insightMatch) {
+          elements.push(renderCallout(insightMatch[1].trim(), 'insight', `ki_${i}`));
+          i++; continue;
+        }
+        const sourceMatch = trimmed.match(/^>?\s*(?:📖\s*)?SOURCE\s*:\s*(.+)$/i);
+        if(sourceMatch) {
+          elements.push(renderCallout(sourceMatch[1].trim(), 'source', `sn_${i}`));
+          i++; continue;
+        }
+        // Generic blockquote: > text
+        if(trimmed.startsWith('> ')) {
+          elements.push(
+            <View key={`bq_${i}`} style={{borderLeftWidth:3,borderLeftColor:'rgba(128,128,128,0.3)',paddingLeft:12,paddingVertical:4,marginVertical:4}}>
+              <Text style={{color:theme.text,fontSize:14,lineHeight:21,opacity:0.85,fontStyle:'italic'}}>{parseInline(trimmed.slice(2))}</Text>
+            </View>
+          );
+          i++; continue;
+        }
+
+        // ── Headers ──
+        if(trimmed.startsWith('### ')) {
+          elements.push(<Text key={`h3_${i}`} style={{color:theme.text,fontSize:15,fontWeight:'700',marginTop:10,marginBottom:4,lineHeight:22}}>{parseInline(trimmed.slice(4))}</Text>);
+          i++; continue;
+        }
         if(trimmed.startsWith('## ')) {
-          elements.push(<Text key={`h_${i}`} style={{color:theme.text,fontSize:17,fontWeight:'700',marginTop:14,marginBottom:6,lineHeight:24}}>{trimmed.replace('## ','')}</Text>);
-          return;
+          elements.push(<Text key={`h_${i}`} style={{color:theme.text,fontSize:17,fontWeight:'700',marginTop:14,marginBottom:6,lineHeight:24}}>{parseInline(trimmed.slice(3))}</Text>);
+          i++; continue;
         }
         if(trimmed==='---'||trimmed==='***') {
           elements.push(<View key={`hr_${i}`} style={{height:1,backgroundColor:'rgba(128,128,128,0.15)',marginVertical:10}}/>);
-          return;
+          i++; continue;
         }
-        // Bullet points
+
+        // ── Bullets ──
         const isBullet = trimmed.startsWith('- ')||trimmed.startsWith('• ');
         const bulletText = isBullet ? trimmed.slice(2) : trimmed;
-        // Parse **bold** and *italic* within text
-        const parseInline = (text:string) => {
-          // Split on **bold** first, then *italic* within remaining parts
-          const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
-          return parts.map((part,j)=>{
-            if(part.startsWith('**')&&part.endsWith('**')) {
-              return <Text key={j} style={{fontWeight:'700',color:theme.text}}>{part.slice(2,-2)}</Text>;
-            }
-            if(part.startsWith('*')&&part.endsWith('*')&&!part.startsWith('**')) {
-              return <Text key={j} style={{fontStyle:'italic',color:theme.text,opacity:0.85}}>{part.slice(1,-1)}</Text>;
-            }
-            return part;
-          });
-        };
         if(isBullet) {
           elements.push(
             <View key={`b_${i}`} style={{flexDirection:'row',paddingLeft:4,marginBottom:2}}>
@@ -6264,7 +6621,8 @@ const LearnScreen = ({topics,onAddTopic,onUpdateTopic,onDelete,onSetTab,profile,
             </Text>
           );
         }
-      });
+        i++;
+      }
       return elements;
     };
 
@@ -8244,19 +8602,25 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           ) : null}
           <Text style={{color:theme.primary,fontSize:11,fontWeight:'700',letterSpacing:1,marginBottom:8}}>ANSWER TO CONTINUE</Text>
           <Text style={{color:theme.text,fontSize:18,fontWeight:'600',marginBottom:20,lineHeight:26}}>{safeStr(gameQ.question)}</Text>
-          {(gameQ.options||[]).map((o,i)=>(
-            <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
-              const res = answerInterruption(o, step==='bubble'||step==='blocks');
-              if(!res.correct&&step==='bubble') setBpGameOver(true);
-              else if(!res.correct&&step==='blocks') setBbGameOver(true);
-            }}>
-              <Text style={{color:theme.text,fontSize:15}}>{safeStr(o)}</Text>
-            </TouchableOpacity>
-          ))}
+          {(gameQ.options||[]).map((o,i)=>{
+            // Strip accidental "Option A:", "A)", "A." prefixes AI sometimes emits
+            const clean = safeStr(o).replace(/^\s*(option\s+)?[A-Da-d][\).:\-]\s*/i,'').trim();
+            return (
+              <TouchableOpacity key={i} style={{padding:15,borderRadius:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8,backgroundColor:'rgba(128,128,128,0.07)'}} onPress={()=>{
+                const fatal = step==='bubble'||step==='blocks'||step==='slider';
+                const res = answerInterruption(o, fatal);
+                if(!res.correct&&step==='bubble') setBpGameOver(true);
+                else if(!res.correct&&step==='blocks') setBbGameOver(true);
+                else if(!res.correct&&step==='slider'){ setSlGameOver(true); saveHighScore('slider',slScore); setStep('results'); }
+              }}>
+                <Text style={{color:theme.text,fontSize:15}}>{clean}</Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
       </View>
     );
-  },[showQ,gameQ,theme,answerInterruption,step]);
+  },[showQ,gameQ,theme,answerInterruption,step,slScore]);
 
   // ══════════════════════════════════════
   // ── CONCEPT CLASH (Bubble-style game) ──
@@ -8476,14 +8840,23 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     return ()=>clearInterval(iv);
   },[bpFlying,paused,bpGrid,bpBubblePos,bpFindCluster,bpFindFloating,triggerInterruption,getBpBoardLeft,bpPlayLayout.height,BP_BUBBLE_D,BP_BUBBLE_R]);
 
-  // Check bubble pop lose condition
+  // Check bubble pop lose conditions:
+  // 1. Out of shots with bubbles remaining
+  // 2. Bubbles grew too close to the cannon (danger line)
   useEffect(()=>{
     if(step!=='bubble'||bpGameOver||bpWon||paused) return;
+    // Danger line: if any bubble occupies a row that would overlap the cannon area, game over
+    const maxSafeRows = Math.max(10, Math.floor((bpPlayLayout.height * 0.55) / BP_ROW_H));
+    const lowestBubbleRow = bpGrid.reduce((max,row,ri)=>row.some(v=>v>0)?ri:max,-1);
+    if(lowestBubbleRow >= maxSafeRows){
+      setBpGameOver(true);
+      return;
+    }
     if(bpShots<=0&&!bpFlying){
       const total = bpGrid.reduce((s,r)=>s+r.filter(v=>v>0).length,0);
       if(total>0) setBpGameOver(true);
     }
-  },[step,bpGrid,bpShots,bpFlying,bpGameOver,bpWon,paused]);
+  },[step,bpGrid,bpShots,bpFlying,bpGameOver,bpWon,paused,bpPlayLayout.height,BP_ROW_H]);
 
   // Save bubble pop score on game end
   useEffect(()=>{
@@ -8658,6 +9031,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
 
   const bbStartDrag = useCallback((pieceIdx:number,e:any)=>{
     e?.stopPropagation?.();
+    e?.preventDefault?.();
     bbMeasureGrid();
     bbSetDragAnchor(pieceIdx,e);
     const point = bbGetPoint(e);
@@ -8754,9 +9128,14 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
       updateProgress(true,wordleWords[wordleRound]?.conceptId);
       setTimeout(()=>setWordleQuizStep('quiz'),1200);
     } else if(ng.length>=WORDLE_MAX_GUESSES){
+      // Failed to guess the word — game over (core mechanic lose)
       setWordleDone(true);
       updateProgress(false,wordleWords[wordleRound]?.conceptId);
-      setTimeout(()=>setWordleQuizStep('quiz'),1200);
+      setWordleRoundScores(prev=>[...prev,{word:wordleTarget,guesses:ng.length,won:false,quizCorrect:false}]);
+      setTimeout(()=>{
+        saveHighScore('wordle',gameScore);
+        setStep('results');
+      },1800);
     }
   },[wordleCurrent,wordleTarget,wordleGuesses,wordleDone,wordleKeyColors,getWordleState,wordleRound,wordleWords,updateProgress]);
 
@@ -8956,6 +9335,16 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
               ))}
             </View>
           ))}
+          {/* Danger line — bubbles past here = game over */}
+          {(()=>{
+            const maxSafeRows = Math.max(10, Math.floor((bpPlayLayout.height * 0.55) / BP_ROW_H));
+            const dangerY = maxSafeRows * BP_ROW_H + 8;
+            return (
+              <View style={{position:'absolute',top:dangerY,left:boardLeft,width:boardWidth,height:2,backgroundColor:'rgba(239,68,68,0.35)',zIndex:5}}>
+                <Text style={{position:'absolute',right:4,top:-14,color:'rgba(239,68,68,0.5)',fontSize:9,fontWeight:'700'}}>DANGER</Text>
+              </View>
+            );
+          })()}
           {/* Flying bubble */}
           {bpFlying&&(
             <View style={{position:'absolute',left:bpFlying.x-BP_BUBBLE_R,top:bpFlying.y-BP_BUBBLE_R,width:BP_BUBBLE_D,height:BP_BUBBLE_D,borderRadius:BP_BUBBLE_R,backgroundColor:BP_COLORS[(bpFlying.color-1)%6],borderWidth:2,borderColor:'rgba(255,255,255,0.3)'}}>
@@ -8996,6 +9385,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:'rgba(0,0,0,0.8)',justifyContent:'center',alignItems:'center',zIndex:90}}>
             <Text style={{fontSize:48,marginBottom:8}}>💥</Text>
             <Text style={{color:'#EF4444',fontSize:28,fontWeight:'800'}}>Game Over!</Text>
+            <Text style={{color:'#94A3B8',fontSize:14,marginTop:4}}>{bpShots<=0?'Out of shots!':'Bubbles reached the danger line!'}</Text>
             <Text style={{color:'#94A3B8',fontSize:16,marginTop:4}}>Score: {bpScore}</Text>
             {isNewHigh&&<Text style={{color:'#F59E0B',fontSize:18,fontWeight:'700',marginTop:8}}>🏆 NEW HIGH SCORE!</Text>}
             <View style={{flexDirection:'row',gap:12,marginTop:24}}>
@@ -9021,12 +9411,12 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
     const activeDragPiece = bbDragIdx>=0 ? bbPieces[bbDragIdx] : null;
     const activeDragBounds = activeDragPiece ? bbGetShapeBounds(activeDragPiece.shape) : null;
     const blockWebHandlers:any = Platform.OS==='web' ? {
-      onMouseMove: bbHandleTouchMove,
+      onMouseMove: (e:any)=>{e.preventDefault();bbHandleTouchMove(e);},
       onMouseUp: bbHandleTouchEnd,
       onMouseLeave: bbHandleTouchEnd,
     } : {};
     return (
-      <View style={[st.screen,{backgroundColor:theme.background}]}
+      <View style={[st.screen,{backgroundColor:theme.background,...(Platform.OS==='web'?{userSelect:'none' as any,WebkitUserSelect:'none' as any}:{})}]}
         onTouchMove={bbHandleTouchMove}
         onTouchEnd={bbHandleTouchEnd}
         onTouchCancel={bbHandleTouchEnd}
@@ -9075,7 +9465,7 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                   if(width>0&&height>0) bbPieceLayoutRef.current[pi]={width,height};
                 }}
                 onTouchStart={(e)=>bbStartDrag(pi,e)}
-                {...(Platform.OS==='web' ? {onMouseDown:(e:any)=>bbStartDrag(pi,e)} as any : {})}
+                {...(Platform.OS==='web' ? {onMouseDown:(e:any)=>{e.preventDefault();bbStartDrag(pi,e);}} as any : {})}
                 style={{
                   padding:8,borderRadius:12,
                   borderWidth:2,borderColor:pi===bbDragIdx&&bbTouchActive.current?theme.primary:'rgba(128,128,128,0.15)',
@@ -9170,7 +9560,12 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
                   if(ok){setQCorrect(c=>c+1);setGameScore(s=>s+30);updateProgress(true,wordleWords[wordleRound]?.conceptId);}
                   else updateProgress(false,wordleWords[wordleRound]?.conceptId);
                   setWordleRoundScores(prev=>[...prev,{word:wordleTarget,guesses:wordleGuesses.length,won:wordleWon,quizCorrect:ok}]);
-                  Alert.alert(ok?'Correct! ✅':'Not quite ❌',ok?'Great job!':safeStr(`Answer: ${wordleQuizQ.answer}`),[{text:'Continue',onPress:wordleNextRound}]);
+                  if(!ok){
+                    // Wrong quiz answer ends the game
+                    Alert.alert('Game Over ❌',safeStr(`Answer: ${wordleQuizQ.answer}\n\nWrong answers end your run!`),[{text:'See Results',onPress:()=>{saveHighScore('wordle',gameScore);setStep('results');}}]);
+                  } else {
+                    Alert.alert('Correct! ✅','Great job!',[{text:'Continue',onPress:wordleNextRound}]);
+                  }
                 }}>
                   <Text style={{color:theme.text,fontSize:15}}>{safeStr(o)}</Text>
                 </TouchableOpacity>
@@ -9337,31 +9732,8 @@ const GamesScreen = ({topics,onUpdateTopic,onUpdateProfile,profile,theme}:{topic
           )}
         </View>
 
-        {/* Question overlay */}
-        {showQ&&gameQ&&(
-          <View style={{position:'absolute',top:0,left:0,right:0,bottom:0,backgroundColor:'rgba(0,0,0,0.92)',justifyContent:'center',padding:24,zIndex:100}}>
-            {gameQ.teachText&&<Text style={{color:'#A78BFA',fontSize:12,fontWeight:'600',marginBottom:12,textAlign:'center'}}>{gameQ.teachText}</Text>}
-            <Text style={{color:'white',fontSize:18,fontWeight:'600',textAlign:'center',lineHeight:26,marginBottom:20}}>{gameQ.question}</Text>
-            {(gameQ.options||[]).map((o,i)=>(
-              <TouchableOpacity key={i} style={{backgroundColor:'rgba(128,128,128,0.15)',padding:14,borderRadius:12,marginBottom:10}} onPress={()=>{
-                const correct=safeStr(o).trim().toLowerCase()===safeStr(gameQ.answer).trim().toLowerCase();
-                setQAnswered(a=>a+1);
-                if(correct){
-                  setQCorrect(c=>c+1); setXpEarned(x=>x+5); updateProgress(true,gameQ.conceptId);
-                  setShowQ(false); setPaused(false);
-                } else {
-                  // Wrong answer ends the game
-                  setSlGameOver(true);
-                  saveHighScore('slider',slScore);
-                  setShowQ(false); setPaused(false);
-                  setStep('results');
-                }
-              }}>
-                <Text style={{color:'white',fontSize:15,textAlign:'center'}}>{o}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
+        {/* Shared LEARN-snippet quiz overlay (same pattern as Grid Master) */}
+        <QOverlay/>
       </View>
     );
   }
@@ -9918,18 +10290,30 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
       : '';
     // System instruction matches the Auto podcast character spec
     return (
-      `Your name is Auto. You are an expert podcast guest and brilliant teacher. ` +
-      `IMPORTANT: Always address the listener as "Host" — never use real names, nicknames, ` +
-      `or made-up names. Say "Host" when speaking to or about the listener.\n\n` +
+      `Your name is Auto. You are an expert podcast guest and brilliant teacher.\n\n` +
+      `HOW TO ADDRESS THE LISTENER:\n` +
+      `- Use "Host" ONLY at the very beginning of the conversation, or when resuming after a pause or interruption.\n` +
+      `- Do NOT say "Host" in every response. In the flow of natural conversation, avoid addressing them by any name — just speak to them like a friend.\n` +
+      `- NEVER invent or guess a real name, nickname, or made-up name for the listener.\n` +
+      `- When you must address them, "Host" is the only acceptable term.\n\n` +
+      `DEPTH AND DETAIL:\n` +
+      `When the listener asks a question or requests an explanation, provide COMPREHENSIVE, detail-heavy responses that demonstrate deep expertise. Include:\n` +
+      `- Specific examples, case studies, and real-world applications\n` +
+      `- Key principles, frameworks, and underlying logic\n` +
+      `- Nuanced distinctions between related concepts\n` +
+      `- Historical context or evolution of the idea\n` +
+      `- Do NOT say things are "key and important" without explaining WHY they matter and WHAT they accomplish. Be specific.\n` +
+      `Speak naturally and avoid jargon, but never sacrifice substantive detail for brevity.\n\n` +
       `You are enthusiastic, warm, conversational, and deeply knowledgeable on whatever topic ` +
-      `the Host brings to you. Speak naturally — use transitions, show genuine curiosity, and keep ` +
+      `the listener brings to you. Speak naturally — use transitions, show genuine curiosity, and keep ` +
       `the conversation flowing. After making a point or answering a question, naturally continue ` +
       `to the next insight or angle on the topic — you are the expert guest sharing your knowledge. ` +
-      `If the Host speaks or interrupts, respond to them warmly. If the Host says "one second", ` +
+      `If the listener speaks or interrupts, respond to them warmly. If they say "one second", ` +
       `"hold on", or anything indicating they are temporarily busy, stop talking and wait until ` +
       `they speak again. Never break character. ` +
-      `Your goal is to make the Host feel like they are having a real, flowing conversation with the ` +
-      `world's most knowledgeable and engaging friend — not a turn-based Q&A.\n\n` +
+      `Your goal is to make the listener feel like they are having a real, flowing conversation with the ` +
+      `world's most knowledgeable and engaging friend — not a turn-based Q&A, and not someone who says "Host" every 10 seconds.\n\n` +
+      `AVOID REPETITION: Never repeat an insight, example, or analogy you have already shared in this conversation. If you find yourself about to cover ground you already covered, pivot to a fresh angle instead.\n\n` +
       `The current topic is "${topicTitle}".\n\n` +
       summaryBlock
     );
@@ -10788,12 +11172,14 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
     if(!sessionRef.current || pausedRef.current || contextPausedRef.current) return;
     if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
 
-    // Monologue mode (muted): immediately send continuation prompt so AI keeps talking
-    if(muteSelfRef.current) {
+    // Monologue mode: immediately send continuation prompt so AI keeps talking.
+    // Decoupled from mute state — monologue keeps flowing even after user unmutes,
+    // until the user actually speaks (handleUserSpeech flips mode back to 'interactive').
+    if(conversationModeRef.current === 'monologue') {
       setTimeout(()=>{
         if(!sessionRef.current || pausedRef.current || contextPausedRef.current) return;
-        if(!muteSelfRef.current) return; // user unmuted during timeout
-        void sendLivePrompt('Continue your lecture on this topic. Move to the next key insight.', { markLoading: false });
+        if(conversationModeRef.current !== 'monologue') return; // switched to interactive during timeout
+        void sendLivePrompt('Continue your monologue on this topic. Move forward to a NEW insight you have not yet covered — do not repeat earlier points.', { markLoading: false });
       }, 300);
       return;
     }
@@ -10986,6 +11372,12 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
     }
     lastUserSpeechAtRef.current = Date.now();
     if(silenceTimerRef.current){ clearTimeout(silenceTimerRef.current); silenceTimerRef.current=null; }
+
+    // Real user utterance — exit monologue mode (if we were in it) and go interactive.
+    // This is where the monologue-keeps-flowing-after-unmute loop naturally ends.
+    if(conversationModeRef.current === 'monologue' && !muteSelfRef.current) {
+      setConversationMode('interactive');
+    }
 
     if(detectEndSessionCue(normalized)) {
       cancelInFlightAI();
@@ -11182,7 +11574,8 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
         }
       }
       setMuteSelf(false);
-      setConversationMode('interactive');
+      // Stay in monologue mode after unmute — AI keeps flowing until user actually speaks.
+      // handleUserSpeech will flip mode to 'interactive' when it detects a real user utterance.
       if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
       // Reuse existing live session — just restart mic streaming (no reconnection needed)
       if(useMicCaptureRef.current && liveSessionRef.current) {
@@ -11238,9 +11631,10 @@ const PodcastScreen = ({topics,theme}:{topics:Topic[];theme:ThemeColors}) => {
         setTimeout(()=>startListening(), 140);
         if(silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current=null; }
       }
-      // In monologue mode, AI needs a prompt to resume lecturing since mic is muted
+      // In monologue mode, AI needs a prompt to resume lecturing since mic is muted.
+      // Signal to the AI that this is a RESUME so it briefly greets "Host" before continuing.
       if(muteSelfRef.current && liveSessionRef.current) {
-        void sendLivePrompt('Continue your lecture on this topic. Pick up from where you left off and share the next key insight.', { markLoading: false });
+        void sendLivePrompt('Host just resumed the podcast after a pause. Briefly say "Welcome back, Host" in one short sentence, then continue the monologue with a NEW insight you have not yet covered.', { markLoading: false });
       }
     } else {
       // Pause via UI button — also clear contextual pause state
@@ -12511,7 +12905,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
   const [tempColor,setTempColor] = useState('');
   // API keys state
   const [showApiKeys,setShowApiKeys] = useState(false);
-  const [cerebrasKey,setCerebrasKey] = useState('');
+  const [groqKey,setGroqKey] = useState('');
   const [geminiKey,setGeminiKey] = useState('');
   const [customKey,setCustomKey] = useState('');
   const [customUrl,setCustomUrl] = useState('');
@@ -12552,7 +12946,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
 
   useEffect(()=>{
     (async()=>{
-      try { const g = await SecretStore.getItem(SK.CEREBRAS_KEY); setCerebrasKey(_cleanStored(g)); } catch(_){ setCerebrasKey(''); }
+      try { const g = await SecretStore.getItem(SK.GROQ_KEY); setGroqKey(_cleanStored(g)); } catch(_){ setGroqKey(''); }
       try { const m = await SecretStore.getItem(SK.GEMINI_KEY); setGeminiKey(_cleanStored(m)); } catch(_){ setGeminiKey(''); }
       try {
         const cp = await Store.load<{key:string;url:string;model:string;name:string}>(SK.CUSTOM_PROVIDER,{key:'',url:'',model:'',name:''});
@@ -12844,11 +13238,11 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
         </View>
         <Text style={{color:theme.text,fontSize:24,fontWeight:'800',marginBottom:4}}>{accountHealthScore}/100</Text>
         <Text style={{color:'#94A3B8',fontSize:13,lineHeight:20,marginBottom:10}}>
-          {ApiKeys.hasAnyTextKey() ? (ApiKeys.hasCustomProvider() ? `${_customProviderName||'Custom'} provider configured.` : 'Cerebras key configured.') : 'Add an AI provider key for Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
+          {ApiKeys.hasAnyTextKey() ? (ApiKeys.hasCustomProvider() ? `${_customProviderName||'Custom'} provider configured.` : 'Groq key configured.') : 'Add an AI provider key for Learn/Quiz/Game generation.'} {ApiKeys.hasGeminiKey() ? 'Gemini key configured.' : 'Add a Gemini key for live podcast voice mode.'}
         </Text>
         <View style={{flexDirection:'row',flexWrap:'wrap',gap:8}}>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(hasPassword?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:hasPassword?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{hasPassword?'Password set':'Password missing'}</Text></View>
-          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasAnyTextKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasAnyTextKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasAnyTextKey()?(ApiKeys.hasCustomProvider()?`${_customProviderName||'Custom'} ready`:'Cerebras ready'):'AI key missing'}</Text></View>
+          <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasAnyTextKey()?'rgba(16,185,129,0.14)':'rgba(239,68,68,0.14)')}}><Text style={{color:ApiKeys.hasAnyTextKey()?'#34D399':'#F87171',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasAnyTextKey()?(ApiKeys.hasCustomProvider()?`${_customProviderName||'Custom'} ready`:'Groq ready'):'AI key missing'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:(ApiKeys.hasGeminiKey()?'rgba(16,185,129,0.14)':'rgba(245,158,11,0.14)')}}><Text style={{color:ApiKeys.hasGeminiKey()?'#34D399':'#F59E0B',fontSize:11,fontWeight:'700'}}>{ApiKeys.hasGeminiKey()?'Gemini ready':'Gemini optional'}</Text></View>
           <View style={{paddingHorizontal:9,paddingVertical:5,borderRadius:999,backgroundColor:'rgba(99,102,241,0.14)'}}><Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700'}}>Mastery {conceptMasteryPct}%</Text></View>
         </View>
@@ -13148,7 +13542,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
           <View style={{flex:1}}>
             <Text style={{color:theme.text,fontSize:15}}>Manage API Keys</Text>
             <Text style={{color:ApiKeys.hasAnyTextKey()&&ApiKeys.hasGeminiKey()?'#10B981':ApiKeys.hasAnyTextKey()?'#F59E0B':'#EF4444',fontSize:12,marginTop:2}}>
-              AI: {ApiKeys.hasAnyTextKey()?`✓ ${ApiKeys.hasCustomProvider()?(_customProviderName||'Custom'):'Cerebras'}`:'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}{ApiKeys.hasCustomProvider()&&ApiKeys.hasCerebrasKey()?'  ·  Cerebras: ✓':''}
+              AI: {ApiKeys.hasAnyTextKey()?`✓ ${ApiKeys.hasCustomProvider()?(_customProviderName||'Custom'):'Groq'}`:'✗ Not set'}  ·  Gemini: {ApiKeys.hasGeminiKey()?'✓ Set':'✗ Not set'}{ApiKeys.hasCustomProvider()&&ApiKeys.hasGroqKey()?'  ·  Groq: ✓':''}
             </Text>
           </View>
           <I.Right s={20} c="#64748B"/>
@@ -13305,13 +13699,13 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
             <Text style={{color:theme.text,fontSize:20,fontWeight:'700',marginBottom:4,textAlign:'center'}}>AI Providers</Text>
             <Text style={{color:'#64748B',fontSize:13,textAlign:'center',marginBottom:20}}>All keys are stored securely on your device</Text>
 
-            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Cerebras API Key <Text style={{color:showCustomProvider?'#64748B':'#EF4444'}}>{showCustomProvider?'(recommended free option)':'(required unless custom set)'}</Text></Text>
+            <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Groq API Key <Text style={{color:showCustomProvider?'#64748B':'#EF4444'}}>{showCustomProvider?'(recommended free option)':'(required unless custom set)'}</Text></Text>
             <TextInput
               style={{borderWidth:1,borderColor:'rgba(128,128,128,0.2)',borderRadius:12,padding:14,fontSize:14,color:theme.text,marginBottom:4,backgroundColor:'rgba(0,0,0,0.2)'}}
-              placeholder="csk-..." placeholderTextColor="#475569"
-              value={cerebrasKey} onChangeText={setCerebrasKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
+              placeholder="gsk_..." placeholderTextColor="#475569"
+              value={groqKey} onChangeText={setGroqKey} autoCapitalize="none" autoCorrect={false} secureTextEntry
             />
-            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at cloud.cerebras.ai → API Keys → Create</Text>
+            <Text style={{color:'#64748B',fontSize:11,marginBottom:16}}>Free at console.groq.com → API Keys → Create</Text>
 
             <Text style={{color:'#94A3B8',fontSize:13,fontWeight:'600',marginBottom:6}}>Gemini API Key <Text style={{color:'#F59E0B'}}>(for podcast live voice only)</Text></Text>
             <TextInput
@@ -13368,7 +13762,7 @@ const ProfileScreen = ({profile,topics,onUpdate,onShowTutorial,onLogout,theme}:{
                 <Text style={{color:'#94A3B8',fontWeight:'600'}}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={async()=>{
-                await ApiKeys.saveCerebrasKey(cerebrasKey);
+                await ApiKeys.saveGroqKey(groqKey);
                 await ApiKeys.saveGeminiKey(geminiKey);
                 if(showCustomProvider && customKey.trim() && customUrl.trim() && customModel.trim()) {
                   await ApiKeys.saveCustomProvider(customKey,customUrl,customModel,customName||'Custom');
@@ -13791,6 +14185,20 @@ const AuthScreen = ({onAuth}:{onAuth:(auth:AuthState,profileUpdates:Partial<User
             </LinearGradient>
           </TouchableOpacity>
 
+          {_supabaseConfigured() && (
+            <>
+              <View style={{flexDirection:'row',alignItems:'center',marginVertical:10}}>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+                <Text style={{color:'#64748B',fontSize:13,marginHorizontal:12}}>or</Text>
+                <View style={{flex:1,height:1,backgroundColor:'rgba(128,128,128,0.2)'}}/>
+              </View>
+              <TouchableOpacity onPress={handleGoogleSignIn} disabled={loading} style={{flexDirection:'row',paddingVertical:14,borderRadius:14,alignItems:'center',justifyContent:'center',gap:10,backgroundColor:'#fff',opacity:loading?0.7:1}}>
+                <Text style={{fontSize:20,fontWeight:'700',color:'#4285F4'}}>G</Text>
+                <Text style={{color:'#1F2937',fontSize:16,fontWeight:'600'}}>Continue with Google</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
           {mode==='login'&&(
             <TouchableOpacity onPress={handleForgotPassword} style={{alignItems:'center',paddingVertical:10}}>
               <Text style={{color:'#A5B4FC',fontSize:13,fontWeight:'600'}}>Forgot Password?</Text>
@@ -13807,41 +14215,329 @@ const AuthScreen = ({onAuth}:{onAuth:(auth:AuthState,profileUpdates:Partial<User
 };
 
 // ========== TUTORIAL ==========
+// Two-phase design per UX spec:
+//   Phase 1 (MANDATORY): API key setup — can't be skipped. Users are walked through
+//           getting their free Groq key (and optional Gemini key) step-by-step,
+//           with clickable "Open in browser" buttons and paste fields right there.
+//   Phase 2 (OPTIONAL): Feature tour — skippable. Shows what each tab does.
 const TutorialModal = ({visible,onComplete}:{visible:boolean;onComplete:()=>void}) => {
   const [step,setStep] = useState(0);
-  const steps = [
-    {e:'📚',t:'Welcome to Auto Learn!',d:'The smarter way to study. Upload your notes or type any topic — Auto Learn builds lessons, quizzes, games, podcasts, and study guides around your material using AI.'},
-    {e:'🔑',t:'Quick Setup',d:'You need one free API key to get started:\n\n• Cerebras — powers all AI features (lessons, quizzes, games)\n  Get it free at cloud.cerebras.ai\n\n• Gemini — optional, enables live podcast voice chat\n  Free at aistudio.google.com\n\nGo to Profile → API Keys to add them after this tutorial.'},
+  // Key inputs live in tutorial state (mirrors what's saved to SecretStore once valid)
+  const [groqInput,setGroqInput] = useState('');
+  const [geminiInput,setGeminiInput] = useState('');
+  const [groqSaved,setGroqSaved] = useState(false);
+  const [geminiSaved,setGeminiSaved] = useState(false);
+  const [savingKey,setSavingKey] = useState<'groq'|'gemini'|null>(null);
+  const [keyError,setKeyError] = useState('');
+
+  // On open, detect if user already has a Groq key (e.g. returning user, or set via signup flow)
+  // If so, skip straight to the feature tour so we don't hassle them.
+  useEffect(()=>{
+    if(!visible) return;
+    (async ()=>{
+      await ApiKeys.loadAll();
+      if(_groqApiKey && _groqApiKey.length > 10) setGroqSaved(true);
+      if(_geminiApiKey && _geminiApiKey.length > 10) setGeminiSaved(true);
+      // If Groq is already set, user has completed Phase 1 — jump to Phase 2
+      if(_groqApiKey && _groqApiKey.length > 10) setStep(4);
+    })();
+  },[visible]);
+
+  const openUrl = (url:string) => {
+    try {
+      if(Platform.OS==='web' && typeof window !== 'undefined') {
+        window.open(url,'_blank','noopener,noreferrer');
+      } else {
+        Linking.openURL(url).catch(()=>{});
+      }
+    } catch(_){}
+  };
+
+  const saveGroq = async () => {
+    setKeyError('');
+    const k = groqInput.trim();
+    if(!k) { setKeyError('Please paste your Groq API key.'); return; }
+    if(!k.toLowerCase().startsWith('gsk_')) { setKeyError('That doesn\'t look like a Groq key. It should start with "gsk_".'); return; }
+    setSavingKey('groq');
+    try {
+      await ApiKeys.saveGroqKey(k);
+      setGroqSaved(true);
+      setGroqInput('');
+      setStep(2); // advance to Gemini step
+    } catch(e:any) {
+      setKeyError(e?.message || 'Failed to save the key. Please try again.');
+    }
+    setSavingKey(null);
+  };
+
+  const saveGemini = async () => {
+    setKeyError('');
+    const k = geminiInput.trim();
+    if(!k) { setKeyError('Please paste your Gemini key, or tap "Skip for now".'); return; }
+    setSavingKey('gemini');
+    try {
+      await ApiKeys.saveGeminiKey(k);
+      setGeminiSaved(true);
+      setGeminiInput('');
+      setStep(3);
+    } catch(e:any) {
+      setKeyError(e?.message || 'Failed to save the key. Please try again.');
+    }
+    setSavingKey(null);
+  };
+
+  // ──────────────────────────────────────────────────────────
+  // PHASE 1 STEPS (mandatory — user cannot dismiss the modal)
+  // ──────────────────────────────────────────────────────────
+  // step 0: Welcome & explain setup
+  // step 1: Get Groq key (required)
+  // step 2: Get Gemini key (optional — can skip)
+  // step 3: All set! → branch into feature tour or finish
+  // ──────────────────────────────────────────────────────────
+  // PHASE 2 STEPS (optional — step 4+)
+  // ──────────────────────────────────────────────────────────
+  const tourSteps = [
     {e:'📖',t:'Learn',d:'Upload PDF/TXT notes or describe what you want to learn. Auto Learn generates structured lessons broken into sections with detailed explanations, examples, and key concepts. Read through lessons or have them read aloud with the built-in audiobook narrator.'},
     {e:'📝',t:'Study Guides',d:'Generate concise, segmented study guides from your topics. Each guide breaks material into focused, bite-sized segments with bullet points. Mark sections as "Familiar" or "Know it" to track your review progress.'},
     {e:'✍️',t:'Quizzes & Tests',d:'Take fully customizable quizzes with multiple choice, fill-in-blank, short response, and scenario questions. Set your question count (10, 20, 30, or 60+) and the AI generates unique, challenging questions every time. Earn XP for correct answers.'},
     {e:'🎮',t:'Learning Games',d:'Three games that make studying fun:\n\n• Concept Clash — shoot and match bubbles with AI quizzes\n• Grid Master — clear rows and columns on a puzzle grid\n• Word Lab — guess topic-related words in 6 tries\n\nAI interrupts with questions to keep you sharp. Wrong answers end your run!'},
     {e:'🎙️',t:'Podcast',d:'Turn any topic into a conversation. You\'re the host, AI is the expert. Ask questions, get detailed answers, and listen with natural AI voice. Perfect for learning while cooking, exercising, or commuting.'},
     {e:'👥',t:'Friends & Organizations',d:'Connect with real users by username. View friends\' profiles, see their level and study progress, send nudges, and create XP challenges with deadlines. Create or join organizations for group accountability with study streaks and leaderboards.'},
-    {e:'🏅',t:'Leveling & Medals',d:'Every topic earns medals as you progress:\n\n🥉 Bronze at 25% → 🥈 Silver at 50%\n🥇 Gold at 75% → 🏆 Trait at 100%\n\nMedals award XP that levels you up. Your level scales progressively — easy at first, more prestigious as you climb. Track your traits, concepts learned, and legacy tree in your Profile.'},
-    {e:'🎨',t:'Make It Yours',d:'Customize your experience in Profile:\n\n• Choose from preset themes or create your own color scheme\n• Save custom themes for quick switching\n• Set your profile picture and username\n• Choose your podcast and audiobook voice\n\nLight and dark themes available!'},
-    {e:'🚀',t:'You\'re All Set!',d:'Here\'s how to start:\n\n1. Go to Profile → API Keys and add your AI provider key (Cerebras is free, or bring your own)\n2. Head to Learn and create your first topic\n3. Study your way — lessons, quizzes, games, or podcast\n\nEverything you need to learn effectively, all in one place. Let\'s go!'},
+    {e:'🏅',t:'Leveling & Medals',d:'Every topic earns medals as you progress:\n\n🥉 Bronze at 25% → 🥈 Silver at 50%\n🥇 Gold at 75% → 🏆 Trait at 100%\n\nMedals award XP that levels you up. Your level scales progressively — easy at first, more prestigious as you climb.'},
+    {e:'🎨',t:'Make It Yours',d:'Customize your experience in Profile:\n\n• Choose from preset themes or create your own color scheme\n• Save custom themes for quick switching\n• Set your profile picture and username\n• Choose your podcast and audiobook voice'},
+    {e:'🚀',t:'You\'re All Set!',d:'You\'re ready to go. Head to the Learn tab and create your first topic — upload notes or just type what you want to learn. Let\'s go!'},
   ];
-  const s = steps[step];
-  return (
-    <Modal visible={visible} transparent animationType="fade">
-      <View style={st.overlay}>
-        <View style={{backgroundColor:'#1A1A2E',borderRadius:24,padding:32,alignItems:'center',marginHorizontal:20,maxWidth:360}}>
-          <Text style={{fontSize:64,marginBottom:16}}>{s.e}</Text>
-          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>{s.t}</Text>
-          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:24}}>{s.d}</Text>
-          <View style={{flexDirection:'row',gap:8,marginBottom:24}}>
-            {steps.map((_,i)=>(<View key={i} style={{width:i===step?20:8,height:8,borderRadius:4,backgroundColor:i===step?'#6366F1':'rgba(128,128,128,0.3)'}}/>))}
+
+  const inPhase1 = step < 4;
+  const totalSteps = 4 + tourSteps.length; // 4 setup steps + tour
+  const tourIndex = step - 4;
+
+  // Render the current step
+  const renderContent = () => {
+    // Phase 1 — Step 0: Welcome
+    if(step === 0) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>👋</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Welcome to Auto Learn</Text>
+          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:16}}>Let's get you set up. It takes <Text style={{color:'#E2E8F0',fontWeight:'700'}}>30 seconds to 2 minutes</Text>.</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:24}}>Auto Learn uses AI to build your lessons, quizzes, games, and study guides. To keep the app free for you, you plug in your own <Text style={{color:'#E2E8F0',fontWeight:'700'}}>free AI API key</Text> from Groq. I'll walk you through it.</Text>
+        </>
+      );
+    }
+    // Phase 1 — Step 1: Groq (required)
+    if(step === 1) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🔑</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Step 1: Get your free Groq key</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:12}}>Groq powers all AI features. It's 100% free — no credit card.</Text>
+          <View style={{alignSelf:'stretch',backgroundColor:'rgba(99,102,241,0.08)',borderRadius:12,padding:14,marginBottom:14,borderWidth:1,borderColor:'rgba(99,102,241,0.2)'}}>
+            <Text style={{color:'#E2E8F0',fontSize:13,lineHeight:20}}>
+              <Text style={{fontWeight:'700'}}>1.</Text> Tap <Text style={{fontWeight:'700'}}>Open Groq</Text> below{'\n'}
+              <Text style={{fontWeight:'700'}}>2.</Text> Sign up with Google (fastest){'\n'}
+              <Text style={{fontWeight:'700'}}>3.</Text> Click <Text style={{fontWeight:'700'}}>"API Keys"</Text> in the sidebar{'\n'}
+              <Text style={{fontWeight:'700'}}>4.</Text> Click <Text style={{fontWeight:'700'}}>"Create API Key"</Text> and copy it{'\n'}
+              <Text style={{fontWeight:'700'}}>5.</Text> Come back here and paste it below
+            </Text>
           </View>
-          <View style={{flexDirection:'row',gap:12}}>
-            {step>0&&<TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}><Text style={{color:'#94A3B8',fontSize:15}}>Back</Text></TouchableOpacity>}
-            <TouchableOpacity onPress={()=>step<steps.length-1?setStep(step+1):onComplete()}>
-              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
-                <Text style={{color:'white',fontSize:15,fontWeight:'600'}}>{step<steps.length-1?'Next':'Get Started!'}</Text>
+          <TouchableOpacity onPress={()=>openUrl('https://console.groq.com/keys')} style={{alignSelf:'stretch',marginBottom:14}}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>🌐 Open Groq in a new tab</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+          <TextInput
+            value={groqInput}
+            onChangeText={setGroqInput}
+            placeholder="Paste your gsk_... key here"
+            placeholderTextColor="#64748B"
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry={false}
+            style={{alignSelf:'stretch',backgroundColor:'rgba(128,128,128,0.12)',color:'#E2E8F0',borderRadius:12,paddingVertical:12,paddingHorizontal:14,fontSize:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8}}
+          />
+          {groqSaved && <Text style={{color:'#34D399',fontSize:13,marginBottom:8,fontWeight:'600'}}>✓ Groq key saved</Text>}
+          {!!keyError && <Text style={{color:'#EF4444',fontSize:13,marginBottom:8,textAlign:'center'}}>{keyError}</Text>}
+        </>
+      );
+    }
+    // Phase 1 — Step 2: Gemini (optional)
+    if(step === 2) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🎙️</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>Step 2: Gemini (optional)</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:12}}>Gemini enables the <Text style={{color:'#E2E8F0',fontWeight:'700'}}>live voice podcast</Text>. Also free. Skip if you don't care about the podcast tab.</Text>
+          <View style={{alignSelf:'stretch',backgroundColor:'rgba(99,102,241,0.08)',borderRadius:12,padding:14,marginBottom:14,borderWidth:1,borderColor:'rgba(99,102,241,0.2)'}}>
+            <Text style={{color:'#E2E8F0',fontSize:13,lineHeight:20}}>
+              <Text style={{fontWeight:'700'}}>1.</Text> Tap <Text style={{fontWeight:'700'}}>Open Google AI Studio</Text>{'\n'}
+              <Text style={{fontWeight:'700'}}>2.</Text> Sign in with your Google account{'\n'}
+              <Text style={{fontWeight:'700'}}>3.</Text> Click <Text style={{fontWeight:'700'}}>"Create API Key"</Text>{'\n'}
+              <Text style={{fontWeight:'700'}}>4.</Text> Copy the key and paste it below
+            </Text>
+          </View>
+          <TouchableOpacity onPress={()=>openUrl('https://aistudio.google.com/app/apikey')} style={{alignSelf:'stretch',marginBottom:14}}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,borderRadius:12,alignItems:'center'}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>🌐 Open Google AI Studio</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+          <TextInput
+            value={geminiInput}
+            onChangeText={setGeminiInput}
+            placeholder="Paste your AIzaSy... key here"
+            placeholderTextColor="#64748B"
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry={false}
+            style={{alignSelf:'stretch',backgroundColor:'rgba(128,128,128,0.12)',color:'#E2E8F0',borderRadius:12,paddingVertical:12,paddingHorizontal:14,fontSize:14,borderWidth:1,borderColor:'rgba(128,128,128,0.2)',marginBottom:8}}
+          />
+          {geminiSaved && <Text style={{color:'#34D399',fontSize:13,marginBottom:8,fontWeight:'600'}}>✓ Gemini key saved</Text>}
+          {!!keyError && <Text style={{color:'#EF4444',fontSize:13,marginBottom:8,textAlign:'center'}}>{keyError}</Text>}
+        </>
+      );
+    }
+    // Phase 1 — Step 3: Ready, branch into tour or skip
+    if(step === 3) {
+      return (
+        <>
+          <Text style={{fontSize:64,marginBottom:16}}>🎉</Text>
+          <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>You're ready to learn!</Text>
+          <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:14}}>Your API key is saved securely on your device. You can always change it in <Text style={{color:'#E2E8F0',fontWeight:'700'}}>Profile → API Keys</Text>.</Text>
+          <Text style={{fontSize:14,color:'#94A3B8',textAlign:'center',lineHeight:20,marginBottom:20}}>Want a quick tour of what each tab does? (Takes 30 seconds.)</Text>
+        </>
+      );
+    }
+    // Phase 2 — feature tour
+    const ts = tourSteps[tourIndex];
+    if(!ts) return null;
+    return (
+      <>
+        <Text style={{fontSize:64,marginBottom:16}}>{ts.e}</Text>
+        <Text style={{fontSize:22,fontWeight:'700',color:'#E2E8F0',marginBottom:12,textAlign:'center'}}>{ts.t}</Text>
+        <Text style={{fontSize:15,color:'#94A3B8',textAlign:'center',lineHeight:22,marginBottom:24}}>{ts.d}</Text>
+      </>
+    );
+  };
+
+  // Footer buttons per-step
+  const renderFooter = () => {
+    if(step === 0) {
+      return (
+        <TouchableOpacity onPress={()=>setStep(1)}>
+          <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:32,borderRadius:12}}>
+            <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Let's go →</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      );
+    }
+    if(step === 1) {
+      // Required — can only advance after saving
+      return (
+        <>
+          {groqSaved ? (
+            <TouchableOpacity onPress={()=>setStep(2)}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:28,borderRadius:12}}>
+                <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Next →</Text>
               </LinearGradient>
             </TouchableOpacity>
-          </View>
+          ) : (
+            <TouchableOpacity onPress={saveGroq} disabled={savingKey==='groq'}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:28,borderRadius:12,opacity:savingKey==='groq'?0.6:1}}>
+                {savingKey==='groq' ? <ActivityIndicator color="white"/> : <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Save & Continue</Text>}
+              </LinearGradient>
+            </TouchableOpacity>
+          )}
+        </>
+      );
+    }
+    if(step === 2) {
+      return (
+        <View style={{flexDirection:'row',gap:10}}>
+          <TouchableOpacity onPress={()=>setStep(3)} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip for now</Text>
+          </TouchableOpacity>
+          {geminiSaved ? (
+            <TouchableOpacity onPress={()=>setStep(3)}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+                <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Next →</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity onPress={saveGemini} disabled={savingKey==='gemini'}>
+              <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12,opacity:savingKey==='gemini'?0.6:1}}>
+                {savingKey==='gemini' ? <ActivityIndicator color="white"/> : <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Save & Next</Text>}
+              </LinearGradient>
+            </TouchableOpacity>
+          )}
         </View>
+      );
+    }
+    if(step === 3) {
+      return (
+        <View style={{flexDirection:'row',gap:10}}>
+          <TouchableOpacity onPress={onComplete} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip tour</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={()=>setStep(4)}>
+            <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Show me around →</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    // Tour footer
+    const isLastTour = tourIndex >= tourSteps.length - 1;
+    return (
+      <View style={{flexDirection:'row',gap:10}}>
+        {step > 4 && (
+          <TouchableOpacity onPress={()=>setStep(step-1)} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Back</Text>
+          </TouchableOpacity>
+        )}
+        {!isLastTour && (
+          <TouchableOpacity onPress={onComplete} style={{paddingVertical:14,paddingHorizontal:20,borderRadius:12,borderWidth:1,borderColor:'rgba(128,128,128,0.3)'}}>
+            <Text style={{color:'#94A3B8',fontSize:14}}>Skip rest</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity onPress={()=>isLastTour?onComplete():setStep(step+1)}>
+          <LinearGradient colors={['#6366F1','#8B5CF6']} style={{paddingVertical:14,paddingHorizontal:24,borderRadius:12}}>
+            <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>{isLastTour?'Get Started!':'Next'}</Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
+  // Dots: highlight position, visually separate Phase 1 (first 4) from Phase 2 (rest)
+  const renderDots = () => (
+    <View style={{flexDirection:'row',gap:6,marginBottom:20,flexWrap:'wrap',justifyContent:'center',maxWidth:260}}>
+      {Array.from({length: totalSteps}).map((_,i)=>{
+        const isPhase1 = i < 4;
+        const isCurrent = i === step;
+        return <View key={i} style={{width:isCurrent?18:6,height:6,borderRadius:3,backgroundColor:isCurrent?(isPhase1?'#F59E0B':'#6366F1'):'rgba(128,128,128,0.25)'}}/>;
+      })}
+    </View>
+  );
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={()=>{
+      // Block hardware back dismissal during Phase 1 (mandatory)
+      if(!inPhase1) onComplete();
+    }}>
+      <View style={st.overlay}>
+        <ScrollView contentContainerStyle={{flexGrow:1,justifyContent:'center',alignItems:'center',padding:20}} keyboardShouldPersistTaps="handled">
+          <View style={{backgroundColor:'#1A1A2E',borderRadius:24,padding:28,alignItems:'center',width:'100%',maxWidth:420}}>
+            {inPhase1 && (
+              <View style={{alignSelf:'flex-start',marginBottom:10,paddingHorizontal:10,paddingVertical:4,borderRadius:999,backgroundColor:'rgba(245,158,11,0.15)'}}>
+                <Text style={{color:'#F59E0B',fontSize:11,fontWeight:'700',letterSpacing:0.5}}>SETUP • {Math.min(step+1,4)} of 4</Text>
+              </View>
+            )}
+            {renderContent()}
+            {renderDots()}
+            {renderFooter()}
+          </View>
+        </ScrollView>
       </View>
     </Modal>
   );
@@ -13857,6 +14553,9 @@ export default function App() {
   const [isLoading,setIsLoading] = useState(true);
   const [authState,setAuthState] = useState<AuthState|null>(null);
   const [authChecked,setAuthChecked] = useState(false);
+  // One-time notice for users migrating from the legacy Cerebras provider to Groq.
+  // Shown when a stale `@al_cerebras_key` is detected in storage and no `@al_groq_key` is set.
+  const [showGroqMigration,setShowGroqMigration] = useState(false);
   const theme = profile.themeColors;
 
   useEffect(()=>{ checkAuth(); setupAudioSession(); },[]);
@@ -13922,7 +14621,7 @@ export default function App() {
     }
     await Store.save(SK.AUTH,null);
     _supabaseUserId = null;
-    _cerebrasApiKey = '';
+    _groqApiKey = '';
     _geminiApiKey = '';
     _customProviderKey = ''; _customProviderUrl = ''; _customProviderModel = ''; _customProviderName = '';
     setAuthState(null);
@@ -13940,6 +14639,20 @@ export default function App() {
   const loadData = async () => {
     setIsLoading(true);
     await ApiKeys.loadAll();
+    // ── One-time migration notice: Cerebras → Groq ──
+    // Existing users had `@al_cerebras_key` in storage. The app no longer uses Cerebras —
+    // they need a Groq key (or a custom OpenAI-compatible provider) to keep generating lessons.
+    try {
+      const legacyKey = await SecretStore.getItem('@al_cerebras_key');
+      const migrationSeen = await AsyncStorage.getItem('@al_groq_migration_seen');
+      const hasNewKey = ApiKeys.hasGroqKey() || ApiKeys.hasCustomProvider();
+      if(legacyKey && legacyKey.trim().length > 0 && !migrationSeen) {
+        // Clear the old key — it's never used again. The notice still shows so the user knows why.
+        try { await SecretStore.removeItem('@al_cerebras_key'); } catch(_){}
+        if(!hasNewKey) setShowGroqMigration(true);
+        else await AsyncStorage.setItem('@al_groq_migration_seen','1');
+      }
+    } catch(_){}
     const [t,p,pr,tut] = await Promise.all([
       Store.load<Topic[]>(SK.TOPICS,[]),
       Store.load<UserProfile>(SK.PROFILE,defaultProfile),
@@ -14041,10 +14754,49 @@ export default function App() {
 
   const adaptive = _themeAdaptive(theme);
 
+  const dismissGroqMigration = async () => {
+    try { await AsyncStorage.setItem('@al_groq_migration_seen','1'); } catch(_){}
+    setShowGroqMigration(false);
+  };
+  const openGroqConsole = () => {
+    const url = 'https://console.groq.com/keys';
+    if(Platform.OS==='web') {
+      try { (globalThis as any).window?.open(url,'_blank','noopener,noreferrer'); } catch(_){}
+    } else {
+      Linking.openURL(url).catch(()=>{});
+    }
+  };
+
   return (
     <View style={{flex:1,backgroundColor:theme.background}}>
       <StatusBar style={adaptive.statusBar}/>
       <TutorialModal visible={showTutorial} onComplete={handleTutorialComplete}/>
+      {/* ── Cerebras → Groq migration notice (one-time, for existing users) ── */}
+      <Modal visible={showGroqMigration} transparent animationType="fade" onRequestClose={dismissGroqMigration}>
+        <View style={{flex:1,backgroundColor:'rgba(0,0,0,0.7)',justifyContent:'center',padding:24}}>
+          <View style={{backgroundColor:theme.card,borderRadius:18,padding:24,borderWidth:1,borderColor:'rgba(99,102,241,0.4)'}}>
+            <Text style={{fontSize:42,textAlign:'center',marginBottom:8}}>🔑</Text>
+            <Text style={{color:theme.text,fontSize:20,fontWeight:'800',textAlign:'center',marginBottom:6}}>Action Required: Update Your AI Key</Text>
+            <Text style={{color:'#F59E0B',fontSize:12,fontWeight:'700',textAlign:'center',letterSpacing:1,marginBottom:14}}>WE SWITCHED PROVIDERS</Text>
+            <Text style={{color:theme.text,fontSize:14,lineHeight:21,opacity:0.92,marginBottom:14}}>
+              AutoLearn has moved its built-in text generation from <Text style={{fontWeight:'700'}}>Cerebras</Text> to <Text style={{fontWeight:'700',color:theme.primary}}>Groq</Text>. Groq has a much better free tier — faster lessons, fewer rate limits, and a higher daily quota.
+            </Text>
+            <Text style={{color:theme.text,fontSize:14,lineHeight:21,opacity:0.92,marginBottom:14}}>
+              Your old Cerebras key won't work anymore. To keep generating lessons, quizzes, and study guides, grab a free Groq API key (takes about 30 seconds) and paste it in <Text style={{fontWeight:'700'}}>Profile → API Keys</Text>.
+            </Text>
+            <View style={{backgroundColor:'rgba(99,102,241,0.10)',borderRadius:10,padding:12,marginBottom:18}}>
+              <Text style={{color:'#A5B4FC',fontSize:11,fontWeight:'700',letterSpacing:0.8,marginBottom:4}}>STILL AI-AGNOSTIC</Text>
+              <Text style={{color:theme.text,fontSize:13,lineHeight:19,opacity:0.9}}>Prefer a different provider? You can also add any OpenAI-compatible custom provider in Profile → API Keys.</Text>
+            </View>
+            <TouchableOpacity onPress={openGroqConsole} style={{backgroundColor:theme.primary,paddingVertical:14,borderRadius:12,alignItems:'center',marginBottom:10}}>
+              <Text style={{color:'white',fontSize:15,fontWeight:'700'}}>Get a Free Groq Key →</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={dismissGroqMigration} style={{paddingVertical:12,borderRadius:12,alignItems:'center',backgroundColor:'rgba(128,128,128,0.12)'}}>
+              <Text style={{color:theme.text,fontSize:14,fontWeight:'600',opacity:0.85}}>I'll do this later</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
       {renderScreen()}
       <View style={{flexDirection:'row',paddingTop:6,paddingBottom:28,paddingHorizontal:4,borderTopWidth:1,borderTopColor:adaptive.tabBorder,backgroundColor:adaptive.tabBar}}>
         {tabs.map(tab=>{
